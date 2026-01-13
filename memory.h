@@ -4,7 +4,7 @@
 #include <vector>
 
 struct ModuleInfo {
-  unsigned long base;
+  uint64_t base;
   size_t size;
   std::string name;
   std::string perms;
@@ -25,7 +25,7 @@ struct ElfString {
 class Memory {
 public:
   static std::vector<ModuleInfo> get_maps(int pid);
-  static std::vector<uint8_t> dump(int pid, unsigned long addr, size_t size);
+  static std::vector<uint8_t> dump(int pid, uint64_t addr, size_t size);
 };
 
 class Utils {
@@ -44,6 +44,32 @@ public:
   static std::vector<ElfSymbol> get_symbols(const std::vector<uint8_t> &data);
   static std::vector<ElfString> get_strings(const std::vector<uint8_t> &data,
                                             size_t min_len);
+
+  struct PltEntry {
+    uint64_t offset;
+    uint64_t got_offset;
+    std::string symbol_name;
+    uint32_t symbol_index;
+  };
+  static std::vector<PltEntry>
+  get_plt_entries(const std::vector<uint8_t> &data);
+  static uint64_t resolve_plt_symbol(int pid, const std::vector<uint8_t> &data,
+                                     const std::string &symbol_name);
+
+  static std::string demangle_symbol(const std::string &mangled);
+  static bool is_objc_method(const std::string &symbol);
+  static std::pair<std::string, std::string>
+  parse_objc_method(const std::string &sym);
+
+  static std::vector<std::string>
+  find_encrypted_strings(const std::vector<uint8_t> &data);
+
+  static bool has_relro(const std::vector<uint8_t> &data);
+  static bool has_full_relro(const std::vector<uint8_t> &data);
+  static std::pair<uint64_t, uint64_t>
+  get_tls_range(const std::vector<uint8_t> &data);
+  static std::vector<uint64_t> get_init_array(const std::vector<uint8_t> &data);
+  static std::vector<uint64_t> get_fini_array(const std::vector<uint8_t> &data);
 };
 
 class SoFixer {

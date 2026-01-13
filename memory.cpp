@@ -76,7 +76,10 @@ int Utils::get_pid(const std::string &pkg) {
     std::ifstream f("/proc/" + std::string(ent->d_name) + "/cmdline");
     std::string cmd;
     std::getline(f, cmd);
-    if (cmd.find(pkg) != std::string::npos) {
+    size_t null_pos = cmd.find('\0');
+    if (null_pos != std::string::npos)
+      cmd = cmd.substr(0, null_pos);
+    if (cmd == pkg) {
       closedir(dir);
       return pid;
     }
@@ -1054,4 +1057,461 @@ std::vector<uint8_t> SoFixer::repair(const std::vector<uint8_t> &data,
     return repair_elf32(data, base_addr);
   else
     return repair_elf64(data, base_addr);
+}
+
+static std::string get_string_at(const std::vector<uint8_t> &data,
+                                 size_t offset) {
+  if (offset >= data.size())
+    return "";
+  std::string s;
+  while (offset < data.size() && data[offset] != 0) {
+    s += (char)data[offset++];
+  }
+  return s;
+}
+
+std::vector<ElfParser::PltEntry>
+ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
+  std::vector<ElfParser::PltEntry> entries;
+  if (data.size() < sizeof(Elf64_Ehdr))
+    return entries;
+
+  bool is32 = is_elf32(data);
+
+  if (!is32) {
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0)
+      return entries;
+
+    const Elf64_Shdr *shdrs = (const Elf64_Shdr *)(data.data() + ehdr->e_shoff);
+    const Elf64_Shdr *shstrtab = nullptr;
+    if (ehdr->e_shstrndx < ehdr->e_shnum)
+      shstrtab = &shdrs[ehdr->e_shstrndx];
+
+    const Elf64_Shdr *dynsym = nullptr;
+    const Elf64_Shdr *dynstr = nullptr;
+    const Elf64_Shdr *relaplt = nullptr;
+    const Elf64_Shdr *plt = nullptr;
+
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+      std::string name;
+      if (shstrtab && shdrs[i].sh_name < data.size() - ehdr->e_shoff)
+        name = get_string_at(data, shstrtab->sh_offset + shdrs[i].sh_name);
+
+      if (shdrs[i].sh_type == SHT_DYNSYM)
+        dynsym = &shdrs[i];
+      else if (shdrs[i].sh_type == SHT_STRTAB && name == ".dynstr")
+        dynstr = &shdrs[i];
+      else if (shdrs[i].sh_type == SHT_RELA &&
+               (name == ".rela.plt" || name == ".rela.dyn"))
+        relaplt = &shdrs[i];
+      else if (name == ".plt" || name == ".plt.got")
+        plt = &shdrs[i];
+    }
+
+    if (!dynsym || !dynstr || !relaplt)
+      return entries;
+
+    size_t rela_count = relaplt->sh_size / sizeof(Elf64_Rela);
+    const Elf64_Rela *relas =
+        (const Elf64_Rela *)(data.data() + relaplt->sh_offset);
+    const Elf64_Sym *syms =
+        (const Elf64_Sym *)(data.data() + dynsym->sh_offset);
+
+    for (size_t i = 0; i < rela_count; i++) {
+      uint32_t sym_idx = ELF64_R_SYM(relas[i].r_info);
+      uint32_t type = ELF64_R_TYPE(relas[i].r_info);
+
+      if (type == R_AARCH64_JUMP_SLOT || type == 1026) {
+        ElfParser::PltEntry e;
+        e.offset = relas[i].r_offset;
+        e.got_offset = relas[i].r_offset;
+        e.symbol_index = sym_idx;
+
+        if (sym_idx > 0 && dynsym->sh_size / sizeof(Elf64_Sym) > sym_idx) {
+          uint32_t str_off = syms[sym_idx].st_name;
+          if (str_off < dynstr->sh_size)
+            e.symbol_name = get_string_at(data, dynstr->sh_offset + str_off);
+        }
+        entries.push_back(e);
+      }
+    }
+  } else {
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0)
+      return entries;
+
+    const Elf32_Shdr *shdrs = (const Elf32_Shdr *)(data.data() + ehdr->e_shoff);
+    const Elf32_Shdr *dynsym = nullptr;
+    const Elf32_Shdr *dynstr = nullptr;
+    const Elf32_Shdr *relplt = nullptr;
+
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+      if (shdrs[i].sh_type == SHT_DYNSYM)
+        dynsym = &shdrs[i];
+      else if (shdrs[i].sh_type == SHT_STRTAB && i != ehdr->e_shstrndx)
+        dynstr = &shdrs[i];
+      else if (shdrs[i].sh_type == SHT_REL)
+        relplt = &shdrs[i];
+    }
+
+    if (!dynsym || !dynstr || !relplt)
+      return entries;
+
+    size_t rel_count = relplt->sh_size / sizeof(Elf32_Rel);
+    const Elf32_Rel *rels =
+        (const Elf32_Rel *)(data.data() + relplt->sh_offset);
+    const Elf32_Sym *syms =
+        (const Elf32_Sym *)(data.data() + dynsym->sh_offset);
+
+    for (size_t i = 0; i < rel_count; i++) {
+      uint32_t sym_idx = ELF32_R_SYM(rels[i].r_info);
+      uint32_t type = ELF32_R_TYPE(rels[i].r_info);
+
+      if (type == R_ARM_JUMP_SLOT) {
+        ElfParser::PltEntry e;
+        e.offset = rels[i].r_offset;
+        e.got_offset = rels[i].r_offset;
+        e.symbol_index = sym_idx;
+
+        if (sym_idx > 0) {
+          uint32_t str_off = syms[sym_idx].st_name;
+          e.symbol_name = get_string_at(data, dynstr->sh_offset + str_off);
+        }
+        entries.push_back(e);
+      }
+    }
+  }
+  return entries;
+}
+
+std::string ElfParser::demangle_symbol(const std::string &mangled) {
+  if (mangled.empty() || mangled[0] != '_')
+    return mangled;
+  if (mangled.size() < 3 || mangled[1] != 'Z')
+    return mangled;
+
+  std::string result;
+  size_t pos = 2;
+  bool is_nested = false;
+
+  if (pos < mangled.size() && mangled[pos] == 'N') {
+    is_nested = true;
+    pos++;
+  }
+
+  while (pos < mangled.size()) {
+    if (mangled[pos] == 'E')
+      break;
+    if (!isdigit(mangled[pos]))
+      break;
+
+    size_t len = 0;
+    while (pos < mangled.size() && isdigit(mangled[pos])) {
+      len = len * 10 + (mangled[pos] - '0');
+      pos++;
+    }
+
+    if (pos + len > mangled.size())
+      break;
+
+    if (!result.empty())
+      result += "::";
+    result += mangled.substr(pos, len);
+    pos += len;
+  }
+
+  if (pos < mangled.size() && mangled[pos] == 'E')
+    pos++;
+
+  std::string params;
+  while (pos < mangled.size()) {
+    char c = mangled[pos++];
+    switch (c) {
+    case 'v':
+      break;
+    case 'i':
+      params += params.empty() ? "int" : ", int";
+      break;
+    case 'f':
+      params += params.empty() ? "float" : ", float";
+      break;
+    case 'd':
+      params += params.empty() ? "double" : ", double";
+      break;
+    case 'b':
+      params += params.empty() ? "bool" : ", bool";
+      break;
+    case 'c':
+      params += params.empty() ? "char" : ", char";
+      break;
+    case 'P':
+      params += params.empty() ? "*" : ", *";
+      break;
+    case 'R':
+      params += params.empty() ? "&" : ", &";
+      break;
+    case 'K':
+      break;
+    default:
+      break;
+    }
+  }
+
+  if (!result.empty())
+    result += "(" + params + ")";
+  return result.empty() ? mangled : result;
+}
+
+bool ElfParser::is_objc_method(const std::string &symbol) {
+  if (symbol.size() < 4)
+    return false;
+  if (symbol[0] == '-' || symbol[0] == '+') {
+    if (symbol[1] == '[')
+      return true;
+  }
+  if (symbol.find("_OBJC_") == 0)
+    return true;
+  if (symbol.find("objc_") == 0)
+    return true;
+  return false;
+}
+
+std::pair<std::string, std::string>
+ElfParser::parse_objc_method(const std::string &sym) {
+  if (sym.size() < 5)
+    return {"", ""};
+  if ((sym[0] == '-' || sym[0] == '+') && sym[1] == '[') {
+    size_t space = sym.find(' ', 2);
+    if (space != std::string::npos) {
+      std::string cls = sym.substr(2, space - 2);
+      size_t end = sym.find(']', space);
+      if (end != std::string::npos) {
+        std::string method = sym.substr(space + 1, end - space - 1);
+        return {cls, method};
+      }
+    }
+  }
+  return {"", ""};
+}
+
+std::vector<std::string>
+ElfParser::find_encrypted_strings(const std::vector<uint8_t> &data) {
+  std::vector<std::string> results;
+
+  for (size_t i = 0; i + 16 < data.size(); i++) {
+    bool high_entropy = true;
+    int printable = 0;
+    for (size_t j = 0; j < 16; j++) {
+      uint8_t b = data[i + j];
+      if (b >= 0x20 && b <= 0x7E)
+        printable++;
+    }
+
+    if (printable >= 12)
+      continue;
+
+    for (uint8_t key = 1; key < 255; key++) {
+      std::string decoded;
+      bool valid = true;
+      for (size_t j = 0; j < 16 && valid; j++) {
+        char c = data[i + j] ^ key;
+        if (c >= 0x20 && c <= 0x7E)
+          decoded += c;
+        else if (c == 0)
+          break;
+        else
+          valid = false;
+      }
+      if (valid && decoded.size() >= 4) {
+        results.push_back("XOR(" + std::to_string(key) + "): " + decoded);
+        break;
+      }
+    }
+  }
+  return results;
+}
+
+static uint64_t find_dynamic_entry(const std::vector<uint8_t> &data,
+                                   int64_t tag, bool is32) {
+  if (is32) {
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
+    const Elf32_Phdr *phdrs = (const Elf32_Phdr *)(data.data() + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+      if (phdrs[i].p_type == PT_DYNAMIC) {
+        const Elf32_Dyn *dyn =
+            (const Elf32_Dyn *)(data.data() + phdrs[i].p_offset);
+        while (dyn->d_tag != DT_NULL) {
+          if (dyn->d_tag == tag)
+            return dyn->d_un.d_val;
+          dyn++;
+        }
+      }
+    }
+  } else {
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
+    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(data.data() + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+      if (phdrs[i].p_type == PT_DYNAMIC) {
+        const Elf64_Dyn *dyn =
+            (const Elf64_Dyn *)(data.data() + phdrs[i].p_offset);
+        while (dyn->d_tag != DT_NULL) {
+          if (dyn->d_tag == tag)
+            return dyn->d_un.d_val;
+          dyn++;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+bool ElfParser::has_relro(const std::vector<uint8_t> &data) {
+  if (data.size() < sizeof(Elf64_Ehdr))
+    return false;
+  bool is32 = is_elf32(data);
+
+  if (is32) {
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
+    const Elf32_Phdr *phdrs = (const Elf32_Phdr *)(data.data() + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+      if (phdrs[i].p_type == 0x6474E552)
+        return true;
+    }
+  } else {
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
+    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(data.data() + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+      if (phdrs[i].p_type == 0x6474E552)
+        return true;
+    }
+  }
+  return false;
+}
+
+bool ElfParser::has_full_relro(const std::vector<uint8_t> &data) {
+  if (!has_relro(data))
+    return false;
+  uint64_t flags = find_dynamic_entry(data, DT_FLAGS, is_elf32(data));
+  return (flags & 0x8) != 0;
+}
+
+std::pair<uint64_t, uint64_t>
+ElfParser::get_tls_range(const std::vector<uint8_t> &data) {
+  if (data.size() < sizeof(Elf64_Ehdr))
+    return {0, 0};
+  bool is32 = is_elf32(data);
+
+  if (is32) {
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
+    const Elf32_Phdr *phdrs = (const Elf32_Phdr *)(data.data() + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+      if (phdrs[i].p_type == PT_TLS) {
+        return {phdrs[i].p_vaddr, phdrs[i].p_memsz};
+      }
+    }
+  } else {
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
+    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(data.data() + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+      if (phdrs[i].p_type == PT_TLS) {
+        return {phdrs[i].p_vaddr, phdrs[i].p_memsz};
+      }
+    }
+  }
+  return {0, 0};
+}
+
+std::vector<uint64_t>
+ElfParser::get_init_array(const std::vector<uint8_t> &data) {
+  std::vector<uint64_t> funcs;
+  bool is32 = is_elf32(data);
+
+  uint64_t init_arr = find_dynamic_entry(data, 25, is32);
+  uint64_t init_sz = find_dynamic_entry(data, 27, is32);
+
+  if (init_arr == 0 || init_sz == 0)
+    return funcs;
+
+  if (is32) {
+    size_t count = init_sz / 4;
+    if (init_arr < data.size()) {
+      const uint32_t *arr = (const uint32_t *)(data.data() + init_arr);
+      for (size_t i = 0; i < count && init_arr + i * 4 < data.size(); i++) {
+        if (arr[i] != 0)
+          funcs.push_back(arr[i]);
+      }
+    }
+  } else {
+    size_t count = init_sz / 8;
+    if (init_arr < data.size()) {
+      const uint64_t *arr = (const uint64_t *)(data.data() + init_arr);
+      for (size_t i = 0; i < count && init_arr + i * 8 < data.size(); i++) {
+        if (arr[i] != 0)
+          funcs.push_back(arr[i]);
+      }
+    }
+  }
+  return funcs;
+}
+
+std::vector<uint64_t>
+ElfParser::get_fini_array(const std::vector<uint8_t> &data) {
+  std::vector<uint64_t> funcs;
+  bool is32 = is_elf32(data);
+
+  uint64_t fini_arr = find_dynamic_entry(data, 26, is32);
+  uint64_t fini_sz = find_dynamic_entry(data, 28, is32);
+
+  if (fini_arr == 0 || fini_sz == 0)
+    return funcs;
+
+  if (is32) {
+    size_t count = fini_sz / 4;
+    if (fini_arr < data.size()) {
+      const uint32_t *arr = (const uint32_t *)(data.data() + fini_arr);
+      for (size_t i = 0; i < count && fini_arr + i * 4 < data.size(); i++) {
+        if (arr[i] != 0)
+          funcs.push_back(arr[i]);
+      }
+    }
+  } else {
+    size_t count = fini_sz / 8;
+    if (fini_arr < data.size()) {
+      const uint64_t *arr = (const uint64_t *)(data.data() + fini_arr);
+      for (size_t i = 0; i < count && fini_arr + i * 8 < data.size(); i++) {
+        if (arr[i] != 0)
+          funcs.push_back(arr[i]);
+      }
+    }
+  }
+  return funcs;
+}
+
+uint64_t ElfParser::resolve_plt_symbol(int pid,
+                                       const std::vector<uint8_t> &data,
+                                       const std::string &symbol_name) {
+  if (symbol_name.empty())
+    return 0;
+
+  auto lib_ranges = ProcessTracer::get_library_ranges(pid);
+
+  for (const auto &r : lib_ranges) {
+    if (r.name.empty())
+      continue;
+    if (r.name.find(".so") == std::string::npos)
+      continue;
+
+    std::string lib_base = r.name;
+    size_t slash = lib_base.rfind('/');
+    if (slash != std::string::npos)
+      lib_base = lib_base.substr(slash + 1);
+
+    uint64_t addr =
+        FunctionHooker::find_remote_symbol(pid, lib_base, symbol_name);
+    if (addr != 0)
+      return addr;
+  }
+
+  return 0;
 }

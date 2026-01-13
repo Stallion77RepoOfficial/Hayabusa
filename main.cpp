@@ -9,7 +9,9 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <sys/ptrace.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -85,8 +87,30 @@ void analyze_elf(const std::vector<uint8_t> &data, const std::string &path) {
   std::ofstream f(path);
   if (!f)
     return;
+
+  f << "=== ELF INFO ===\n";
+  f << "RELRO: "
+    << (ElfParser::has_full_relro(data)
+            ? "Full"
+            : (ElfParser::has_relro(data) ? "Partial" : "None"))
+    << "\n";
+  auto tls = ElfParser::get_tls_range(data);
+  if (tls.second > 0)
+    f << "TLS: 0x" << std::hex << tls.first << " size=" << std::dec
+      << tls.second << "\n";
+  auto init = ElfParser::get_init_array(data);
+  if (!init.empty()) {
+    f << "Init Array: " << init.size() << " functions\n";
+    for (auto addr : init)
+      f << "  0x" << std::hex << addr << "\n";
+  }
+  auto fini = ElfParser::get_fini_array(data);
+  if (!fini.empty())
+    f << "Fini Array: " << fini.size() << " functions\n";
+
   auto symbols = ElfParser::get_symbols(data);
-  f << "=== SYMBOLS (" << symbols.size() << ") ===\n";
+  f << "\n=== SYMBOLS (" << std::dec << symbols.size() << ") ===\n";
+  int objc_count = 0;
   for (const auto &s : symbols) {
     if (s.name.empty() || s.name.size() > 256)
       continue;
@@ -98,11 +122,30 @@ void analyze_elf(const std::vector<uint8_t> &data, const std::string &path) {
       }
     if (!ok)
       continue;
+    std::string display = ElfParser::demangle_symbol(s.name);
+    if (ElfParser::is_objc_method(s.name)) {
+      objc_count++;
+      auto parsed = ElfParser::parse_objc_method(s.name);
+      if (!parsed.first.empty())
+        display = "[" + parsed.first + " " + parsed.second + "]";
+    }
     f << "0x" << std::hex << std::setw(8) << std::setfill('0') << s.offset
-      << " " << s.type << " " << s.name << "\n";
+      << " " << s.type << " " << display << "\n";
   }
+  if (objc_count > 0)
+    f << "\n[Objective-C methods: " << std::dec << objc_count << "]\n";
+
+  auto plt = ElfParser::get_plt_entries(data);
+  if (!plt.empty()) {
+    f << "\n=== PLT ENTRIES (" << plt.size() << ") ===\n";
+    for (const auto &p : plt) {
+      f << "GOT 0x" << std::hex << p.got_offset << " -> " << p.symbol_name
+        << "\n";
+    }
+  }
+
   auto strings = ElfParser::get_strings(data, 6);
-  f << "\n=== STRINGS (" << strings.size() << ") ===\n";
+  f << "\n=== STRINGS (" << std::dec << strings.size() << ") ===\n";
   size_t cnt = 0;
   for (const auto &s : strings) {
     if (cnt++ > 50000)
@@ -168,15 +211,18 @@ void process(const std::string &name, const std::vector<uint8_t> &data,
     mkdir_p(out + "/so");
     write_file(out + "/so/" + oname, fixed);
     if (g_pid > 0 && base > 0) {
-      std::cout << "    [RELINK] Static relinking...\n";
+      std::cout << "    [RELINK] Static relinking...";
       std::cout.flush();
       auto relinked = StaticRelinker::relink(fixed, g_pid, base);
       if (relinked.size() > fixed.size()) {
         mkdir_p(out + "/relinked");
         write_file(out + "/relinked/" + oname, relinked);
-        std::cout << "    [RELINK] Added "
+        std::cout << " Added "
                   << Utils::format_size(relinked.size() - fixed.size())
                   << " embedded code\n";
+        std::cout.flush();
+      } else {
+        std::cout << " No external calls found\n";
         std::cout.flush();
       }
     }
@@ -384,44 +430,58 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
   for (auto &[name, buf] : accumulated) {
     if (is_garbage(buf))
       continue;
-    std::string mout = out + "/memory";
-    mkdir_p(mout);
-    process(name, buf, mout, bases[name]);
+    process(name, buf, out, bases[name]);
   }
 }
 
 void cmd_dump(const std::string &pkg, ArchMode arch) {
   ProcessTracer::set_arch(arch);
   std::string arch_str = (arch == ArchMode::ARM64) ? "ARM64" : "ARM32";
-  std::cout << "================================================\n";
+  std::cout << "\n================================================\n";
   std::cout << "  HAYABUSA - Android Memory Dumper\n";
   std::cout << "  Architecture: " << arch_str << "\n";
   std::cout << "================================================\n";
-  std::cout << "Target: " << pkg << "\n";
-  std::cout << "Status: Waiting for process...\n";
+  std::cout << "Target: " << pkg << "\n\n";
+
+  std::cout << "[1] Waiting for process...\n";
   std::cout.flush();
-  int pid = -1;
-  int wait_count = 0;
-  while (pid <= 0) {
-    pid = Utils::get_pid(pkg);
-    if (pid <= 0) {
-      if (wait_count % 4 == 0)
-        std::cout << "." << std::flush;
-      wait_count++;
-      usleep(250000);
-    }
+
+  int zygote_pid = ZygoteTracer::find_zygote_pid();
+  if (zygote_pid <= 0) {
+    std::cout << "    [!] System error: Zygote not found\n";
+    return;
   }
-  g_pid = pid;
-  std::cout << "\n\n[+] Process detected!\n";
-  std::cout << "    PID: " << pid << "\n";
+
+  if (!ZygoteTracer::attach_zygote(zygote_pid)) {
+    std::cout << "    [!] Failed to initialize - run as root\n";
+    return;
+  }
+
+  std::cout << "    [+] Ready! Launch the app NOW on the device\n";
+  std::cout.flush();
+
+  int child_pid = ZygoteTracer::wait_for_fork(zygote_pid, pkg);
+  if (child_pid <= 0) {
+    std::cout << "    [!] Process not detected\n";
+    return;
+  }
+
+  std::cout << "\n[2] Process captured! PID: " << child_pid << "\n";
   std::cout << "    Waiting 3s for initialization...\n";
   std::cout.flush();
   sleep(3);
+  std::cout << "[3] Analyzing memory...\n";
+  std::cout.flush();
+
+  g_pid = child_pid;
   std::string base = "/data/local/tmp/" + pkg;
   std::string out = base + "_output";
   mkdir_p(out);
   g_processed.clear();
-  std::cout << "\n[PHASE 1] APK Extraction\n";
+
+  dump_memory(child_pid, pkg, out);
+
+  std::cout << "\n[4] Extracting resources...\n";
   std::cout.flush();
   auto apks = Utils::get_apk_paths(pkg);
   if (!apks.empty()) {
@@ -441,10 +501,7 @@ void cmd_dump(const std::string &pkg, ArchMode arch) {
   } else {
     std::cout << "    No APK found\n";
   }
-  std::cout.flush();
-  std::cout << "\n[PHASE 2] Memory Dump\n";
-  std::cout.flush();
-  dump_memory(pid, pkg, out);
+
   g_pid = -1;
   rmdir(base.c_str());
   std::cout << "\n================================================\n";
@@ -455,9 +512,8 @@ void cmd_dump(const std::string &pkg, ArchMode arch) {
 }
 
 int main(int argc, char *argv[]) {
-  if (argc < 4) {
-    std::cout << "HAYABUSA - Android Memory Dumper\n\n";
-    std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64>\n\n";
+  if (argc < 3) {
+    std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64>\n";
     return 1;
   }
   std::string cmd = argv[1];
