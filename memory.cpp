@@ -1,13 +1,17 @@
 #include "memory.h"
 #include "tracer.h"
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <dirent.h>
 #include <elf.h>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <unistd.h>
 
@@ -1186,7 +1190,55 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
 }
 
 std::string ElfParser::demangle_symbol(const std::string &mangled) {
-  if (mangled.empty() || mangled[0] != '_')
+  if (mangled.empty())
+    return mangled;
+
+  if (mangled.find("_GLOBAL__") == 0) {
+    if (mangled.find("_GLOBAL__I_") == 0)
+      return "[global constructor] " + mangled.substr(11);
+    if (mangled.find("_GLOBAL__D_") == 0)
+      return "[global destructor] " + mangled.substr(11);
+    if (mangled.find("_GLOBAL__sub_I_") == 0)
+      return "[static init] " + mangled.substr(15);
+    return mangled;
+  }
+
+  if (mangled.find("_ZGV") == 0) {
+    std::string inner = demangle_symbol("_Z" + mangled.substr(4));
+    return "[guard variable] " + inner;
+  }
+
+  if (mangled.find("_ZTV") == 0) {
+    std::string inner = demangle_symbol("_Z" + mangled.substr(4));
+    return "[vtable] " + inner;
+  }
+
+  if (mangled.find("_ZTI") == 0) {
+    std::string inner = demangle_symbol("_Z" + mangled.substr(4));
+    return "[typeinfo] " + inner;
+  }
+
+  if (mangled.find("_ZTS") == 0) {
+    std::string inner = demangle_symbol("_Z" + mangled.substr(4));
+    return "[typeinfo name] " + inner;
+  }
+
+  if (mangled.find("_ZTh") == 0 || mangled.find("_ZTv") == 0) {
+    size_t pos = 4;
+    while (pos < mangled.size() && (isdigit(mangled[pos]) ||
+                                    mangled[pos] == 'n' || mangled[pos] == '_'))
+      pos++;
+    if (pos < mangled.size()) {
+      std::string inner = demangle_symbol("_Z" + mangled.substr(pos));
+      return "[virtual thunk] " + inner;
+    }
+  }
+
+  if (mangled.find("_ZTc") == 0) {
+    return "[covariant thunk] " + mangled;
+  }
+
+  if (mangled[0] != '_')
     return mangled;
   if (mangled.size() < 3 || mangled[1] != 'Z')
     return mangled;
@@ -1194,17 +1246,218 @@ std::string ElfParser::demangle_symbol(const std::string &mangled) {
   std::string result;
   size_t pos = 2;
   bool is_nested = false;
+  bool is_const_method = false;
+  bool is_volatile_method = false;
+  std::vector<std::string> components;
+
+  while (pos < mangled.size()) {
+    if (mangled[pos] == 'K') {
+      is_const_method = true;
+      pos++;
+    } else if (mangled[pos] == 'V') {
+      is_volatile_method = true;
+      pos++;
+    } else {
+      break;
+    }
+  }
 
   if (pos < mangled.size() && mangled[pos] == 'N') {
     is_nested = true;
     pos++;
+    while (
+        pos < mangled.size() &&
+        (mangled[pos] == 'K' || mangled[pos] == 'V' || mangled[pos] == 'r')) {
+      if (mangled[pos] == 'K')
+        is_const_method = true;
+      pos++;
+    }
   }
 
-  while (pos < mangled.size()) {
-    if (mangled[pos] == 'E')
-      break;
+  auto parse_operator = [](const std::string &m, size_t &p) -> std::string {
+    if (p + 2 > m.size())
+      return "";
+    std::string op = m.substr(p, 2);
+    p += 2;
+    if (op == "nw")
+      return "operator new";
+    if (op == "na")
+      return "operator new[]";
+    if (op == "dl")
+      return "operator delete";
+    if (op == "da")
+      return "operator delete[]";
+    if (op == "ps")
+      return "operator+";
+    if (op == "ng")
+      return "operator-";
+    if (op == "ad")
+      return "operator&";
+    if (op == "de")
+      return "operator*";
+    if (op == "co")
+      return "operator~";
+    if (op == "pl")
+      return "operator+";
+    if (op == "mi")
+      return "operator-";
+    if (op == "ml")
+      return "operator*";
+    if (op == "dv")
+      return "operator/";
+    if (op == "rm")
+      return "operator%";
+    if (op == "an")
+      return "operator&";
+    if (op == "or")
+      return "operator|";
+    if (op == "eo")
+      return "operator^";
+    if (op == "aS")
+      return "operator=";
+    if (op == "pL")
+      return "operator+=";
+    if (op == "mI")
+      return "operator-=";
+    if (op == "mL")
+      return "operator*=";
+    if (op == "dV")
+      return "operator/=";
+    if (op == "rM")
+      return "operator%=";
+    if (op == "aN")
+      return "operator&=";
+    if (op == "oR")
+      return "operator|=";
+    if (op == "eO")
+      return "operator^=";
+    if (op == "ls")
+      return "operator<<";
+    if (op == "rs")
+      return "operator>>";
+    if (op == "lS")
+      return "operator<<=";
+    if (op == "rS")
+      return "operator>>=";
+    if (op == "eq")
+      return "operator==";
+    if (op == "ne")
+      return "operator!=";
+    if (op == "lt")
+      return "operator<";
+    if (op == "gt")
+      return "operator>";
+    if (op == "le")
+      return "operator<=";
+    if (op == "ge")
+      return "operator>=";
+    if (op == "ss")
+      return "operator<=>";
+    if (op == "nt")
+      return "operator!";
+    if (op == "aa")
+      return "operator&&";
+    if (op == "oo")
+      return "operator||";
+    if (op == "pp")
+      return "operator++";
+    if (op == "mm")
+      return "operator--";
+    if (op == "cm")
+      return "operator,";
+    if (op == "pm")
+      return "operator->*";
+    if (op == "pt")
+      return "operator->";
+    if (op == "cl")
+      return "operator()";
+    if (op == "ix")
+      return "operator[]";
+    if (op == "qu")
+      return "operator?";
+    if (op == "cv")
+      return "operator (type)";
+    if (op == "li")
+      return "operator \"\"";
+    p -= 2;
+    return "";
+  };
+
+  std::function<std::string(void)> parse_name = [&]() -> std::string {
+    if (pos >= mangled.size())
+      return "";
+
+    if (mangled[pos] == 'C' && pos + 1 < mangled.size() &&
+        isdigit(mangled[pos + 1])) {
+      pos += 2;
+      if (!components.empty())
+        return components.back();
+      return "[constructor]";
+    }
+
+    if (mangled[pos] == 'D' && pos + 1 < mangled.size() &&
+        isdigit(mangled[pos + 1])) {
+      pos += 2;
+      if (!components.empty())
+        return "~" + components.back();
+      return "[destructor]";
+    }
+
+    if (pos + 2 <= mangled.size()) {
+      std::string op = parse_operator(mangled, pos);
+      if (!op.empty())
+        return op;
+    }
+
+    if (mangled[pos] == 'S') {
+      pos++;
+      if (pos < mangled.size()) {
+        char c = mangled[pos];
+        if (c == 't') {
+          pos++;
+          return "std";
+        }
+        if (c == 'a') {
+          pos++;
+          return "std::allocator";
+        }
+        if (c == 'b') {
+          pos++;
+          return "std::basic_string";
+        }
+        if (c == 's') {
+          pos++;
+          return "std::string";
+        }
+        if (c == 'i') {
+          pos++;
+          return "std::istream";
+        }
+        if (c == 'o') {
+          pos++;
+          return "std::ostream";
+        }
+        if (c == 'd') {
+          pos++;
+          return "std::iostream";
+        }
+        if (c == '_') {
+          pos++;
+          return "[subst]";
+        }
+        if (isdigit(c) || isupper(c)) {
+          while (pos < mangled.size() && mangled[pos] != '_')
+            pos++;
+          if (pos < mangled.size())
+            pos++;
+          return "[subst]";
+        }
+      }
+      return "";
+    }
+
     if (!isdigit(mangled[pos]))
-      break;
+      return "";
 
     size_t len = 0;
     while (pos < mangled.size() && isdigit(mangled[pos])) {
@@ -1213,53 +1466,258 @@ std::string ElfParser::demangle_symbol(const std::string &mangled) {
     }
 
     if (pos + len > mangled.size())
-      break;
+      return "";
 
-    if (!result.empty())
-      result += "::";
-    result += mangled.substr(pos, len);
+    std::string name = mangled.substr(pos, len);
     pos += len;
-  }
 
-  if (pos < mangled.size() && mangled[pos] == 'E')
-    pos++;
+    if (pos < mangled.size() && mangled[pos] == 'I') {
+      pos++;
+      std::string targs;
+      int depth = 1;
+      while (pos < mangled.size() && depth > 0) {
+        if (mangled[pos] == 'I')
+          depth++;
+        else if (mangled[pos] == 'E')
+          depth--;
+        if (depth > 0) {
+          char c = mangled[pos];
+          if (c == 'i') {
+            targs += targs.empty() ? "int" : ", int";
+            pos++;
+          } else if (c == 'f') {
+            targs += targs.empty() ? "float" : ", float";
+            pos++;
+          } else if (c == 'd') {
+            targs += targs.empty() ? "double" : ", double";
+            pos++;
+          } else if (c == 'b') {
+            targs += targs.empty() ? "bool" : ", bool";
+            pos++;
+          } else if (c == 'c') {
+            targs += targs.empty() ? "char" : ", char";
+            pos++;
+          } else if (c == 'v') {
+            pos++;
+          } else if (c == 'P' || c == 'R' || c == 'K') {
+            pos++;
+          } else if (isdigit(c)) {
+            size_t tlen = 0;
+            while (pos < mangled.size() && isdigit(mangled[pos])) {
+              tlen = tlen * 10 + (mangled[pos] - '0');
+              pos++;
+            }
+            if (pos + tlen <= mangled.size()) {
+              std::string tname = mangled.substr(pos, tlen);
+              targs += targs.empty() ? tname : ", " + tname;
+              pos += tlen;
+            }
+          } else {
+            pos++;
+          }
+        }
+      }
+      if (pos < mangled.size() && mangled[pos] == 'E')
+        pos++;
+      if (!targs.empty())
+        name += "<" + targs + ">";
+      else
+        name += "<...>";
+    }
 
-  std::string params;
+    return name;
+  };
+
   while (pos < mangled.size()) {
-    char c = mangled[pos++];
-    switch (c) {
-    case 'v':
-      break;
-    case 'i':
-      params += params.empty() ? "int" : ", int";
-      break;
-    case 'f':
-      params += params.empty() ? "float" : ", float";
-      break;
-    case 'd':
-      params += params.empty() ? "double" : ", double";
-      break;
-    case 'b':
-      params += params.empty() ? "bool" : ", bool";
-      break;
-    case 'c':
-      params += params.empty() ? "char" : ", char";
-      break;
-    case 'P':
-      params += params.empty() ? "*" : ", *";
-      break;
-    case 'R':
-      params += params.empty() ? "&" : ", &";
-      break;
-    case 'K':
-      break;
-    default:
+    if (mangled[pos] == 'E') {
+      pos++;
       break;
     }
+    if (!isdigit(mangled[pos]) && mangled[pos] != 'C' && mangled[pos] != 'D' &&
+        mangled[pos] != 'S' &&
+        !(pos + 2 <= mangled.size() && islower(mangled[pos]) &&
+          islower(mangled[pos + 1]))) {
+      break;
+    }
+    std::string comp = parse_name();
+    if (comp.empty())
+      break;
+    if (comp != "[subst]")
+      components.push_back(comp);
   }
 
-  if (!result.empty())
+  for (size_t i = 0; i < components.size(); i++) {
+    if (i > 0)
+      result += "::";
+    result += components[i];
+  }
+
+  std::string params;
+  auto parse_type = [&]() -> std::string {
+    if (pos >= mangled.size())
+      return "";
+    std::string prefix;
+    while (pos < mangled.size()) {
+      char c = mangled[pos];
+      if (c == 'P') {
+        prefix += "*";
+        pos++;
+      } else if (c == 'R') {
+        prefix += "&";
+        pos++;
+      } else if (c == 'O') {
+        prefix += "&&";
+        pos++;
+      } else if (c == 'K') {
+        prefix = "const " + prefix;
+        pos++;
+      } else if (c == 'V') {
+        prefix = "volatile " + prefix;
+        pos++;
+      } else if (c == 'r') {
+        prefix = "restrict " + prefix;
+        pos++;
+      } else
+        break;
+    }
+    if (pos >= mangled.size())
+      return prefix;
+    char c = mangled[pos++];
+    std::string base;
+    switch (c) {
+    case 'v':
+      base = "void";
+      break;
+    case 'w':
+      base = "wchar_t";
+      break;
+    case 'b':
+      base = "bool";
+      break;
+    case 'c':
+      base = "char";
+      break;
+    case 'a':
+      base = "signed char";
+      break;
+    case 'h':
+      base = "unsigned char";
+      break;
+    case 's':
+      base = "short";
+      break;
+    case 't':
+      base = "unsigned short";
+      break;
+    case 'i':
+      base = "int";
+      break;
+    case 'j':
+      base = "unsigned int";
+      break;
+    case 'l':
+      base = "long";
+      break;
+    case 'm':
+      base = "unsigned long";
+      break;
+    case 'x':
+      base = "long long";
+      break;
+    case 'y':
+      base = "unsigned long long";
+      break;
+    case 'n':
+      base = "__int128";
+      break;
+    case 'o':
+      base = "unsigned __int128";
+      break;
+    case 'f':
+      base = "float";
+      break;
+    case 'd':
+      base = "double";
+      break;
+    case 'e':
+      base = "long double";
+      break;
+    case 'g':
+      base = "__float128";
+      break;
+    case 'z':
+      base = "...";
+      break;
+    case 'D':
+      if (pos < mangled.size()) {
+        char d = mangled[pos++];
+        if (d == 'n')
+          base = "decltype(nullptr)";
+        else if (d == 'a')
+          base = "auto";
+        else if (d == 'c')
+          base = "decltype(auto)";
+        else if (d == 'i')
+          base = "char32_t";
+        else if (d == 's')
+          base = "char16_t";
+        else if (d == 'u')
+          base = "char8_t";
+        else
+          base = "D" + std::string(1, d);
+      }
+      break;
+    case 'u': {
+      if (pos < mangled.size() && isdigit(mangled[pos])) {
+        size_t len = 0;
+        while (pos < mangled.size() && isdigit(mangled[pos])) {
+          len = len * 10 + (mangled[pos] - '0');
+          pos++;
+        }
+        if (pos + len <= mangled.size()) {
+          base = mangled.substr(pos, len);
+          pos += len;
+        }
+      }
+      break;
+    }
+    default:
+      if (isdigit(c)) {
+        pos--;
+        size_t len = 0;
+        while (pos < mangled.size() && isdigit(mangled[pos])) {
+          len = len * 10 + (mangled[pos] - '0');
+          pos++;
+        }
+        if (pos + len <= mangled.size()) {
+          base = mangled.substr(pos, len);
+          pos += len;
+        }
+      } else {
+        base = std::string(1, c);
+      }
+      break;
+    }
+    return prefix.empty() ? base : base + " " + prefix;
+  };
+
+  while (pos < mangled.size() && mangled[pos] != 'E') {
+    std::string ptype = parse_type();
+    if (ptype.empty())
+      break;
+    if (ptype == "void" && params.empty())
+      break;
+    params += params.empty() ? ptype : ", " + ptype;
+  }
+
+  if (!result.empty()) {
     result += "(" + params + ")";
+    if (is_const_method)
+      result += " const";
+    if (is_volatile_method)
+      result += " volatile";
+  }
+
   return result.empty() ? mangled : result;
 }
 
@@ -1514,4 +1972,1317 @@ uint64_t ElfParser::resolve_plt_symbol(int pid,
   }
 
   return 0;
+}
+
+static bool parse_pattern(const std::string &pattern,
+                          std::vector<uint8_t> &bytes,
+                          std::vector<bool> &mask) {
+  bytes.clear();
+  mask.clear();
+  std::istringstream iss(pattern);
+  std::string token;
+  while (iss >> token) {
+    if (token == "?" || token == "??" || token == "**") {
+      bytes.push_back(0);
+      mask.push_back(false);
+    } else {
+      try {
+        uint8_t b = (uint8_t)std::stoul(token, nullptr, 16);
+        bytes.push_back(b);
+        mask.push_back(true);
+      } catch (...) {
+        return false;
+      }
+    }
+  }
+  return !bytes.empty();
+}
+
+std::vector<PatternMatch>
+ElfParser::pattern_scan(const std::vector<uint8_t> &data,
+                        const std::string &pattern) {
+  std::vector<PatternMatch> results;
+  std::vector<uint8_t> pat_bytes;
+  std::vector<bool> pat_mask;
+
+  if (!parse_pattern(pattern, pat_bytes, pat_mask))
+    return results;
+
+  size_t pat_len = pat_bytes.size();
+  if (pat_len == 0 || data.size() < pat_len)
+    return results;
+
+  for (size_t i = 0; i <= data.size() - pat_len; i++) {
+    bool match = true;
+    for (size_t j = 0; j < pat_len && match; j++) {
+      if (pat_mask[j] && data[i + j] != pat_bytes[j])
+        match = false;
+    }
+    if (match) {
+      PatternMatch m;
+      m.offset = i;
+      m.pattern = pattern;
+      size_t ctx_start = (i >= 8) ? i - 8 : 0;
+      size_t ctx_end = std::min(i + pat_len + 8, data.size());
+      std::ostringstream ctx;
+      for (size_t k = ctx_start; k < ctx_end; k++) {
+        ctx << std::hex << std::setw(2) << std::setfill('0') << (int)data[k]
+            << " ";
+      }
+      m.context = ctx.str();
+      results.push_back(m);
+    }
+  }
+  return results;
+}
+
+std::vector<PatternMatch>
+ElfParser::pattern_scan_multi(const std::vector<uint8_t> &data,
+                              const std::vector<std::string> &patterns) {
+  std::vector<PatternMatch> all_results;
+  for (const auto &pat : patterns) {
+    auto matches = pattern_scan(data, pat);
+    all_results.insert(all_results.end(), matches.begin(), matches.end());
+  }
+  return all_results;
+}
+
+std::string ElfParser::generate_signature(const std::vector<uint8_t> &data,
+                                          uint64_t offset, size_t length) {
+  if (offset + length > data.size())
+    length = data.size() - offset;
+
+  std::ostringstream sig;
+  bool is32 = is_elf32(data);
+
+  for (size_t i = 0; i < length; i += 4) {
+    if (offset + i + 4 > data.size())
+      break;
+
+    uint32_t inst = *(uint32_t *)(data.data() + offset + i);
+
+    bool has_addr = false;
+
+    if (!is32) {
+      if ((inst & 0x9F000000) == 0x90000000)
+        has_addr = true;
+      if ((inst & 0xFC000000) == 0x94000000)
+        has_addr = true;
+      if ((inst & 0xFC000000) == 0x14000000)
+        has_addr = true;
+    } else {
+      if ((inst & 0x0F000000) == 0x0A000000)
+        has_addr = true;
+      if ((inst & 0x0F000000) == 0x0B000000)
+        has_addr = true;
+    }
+
+    if (has_addr) {
+      sig << "?? ?? ?? ?? ";
+    } else {
+      for (int j = 0; j < 4; j++) {
+        sig << std::hex << std::setw(2) << std::setfill('0')
+            << (int)data[offset + i + j] << " ";
+      }
+    }
+  }
+
+  return sig.str();
+}
+
+std::vector<RTTIInfo> ElfParser::scan_rtti(const std::vector<uint8_t> &data,
+                                           uint64_t base_addr) {
+  std::vector<RTTIInfo> results;
+  if (data.size() < 64)
+    return results;
+
+  bool is32 = is_elf32(data);
+  size_t ptr_size = is32 ? 4 : 8;
+
+  auto symbols = get_symbols(data);
+  std::map<uint64_t, std::string> typeinfo_map;
+
+  for (const auto &s : symbols) {
+    if (s.name.find("_ZTI") == 0) {
+      typeinfo_map[s.offset] = s.name;
+    }
+  }
+
+  for (const auto &s : symbols) {
+    if (s.name.find("_ZTV") != 0)
+      continue;
+
+    RTTIInfo info;
+    info.vtable_addr = base_addr + s.offset;
+    info.class_name = s.name;
+    info.demangled_name = demangle_symbol(s.name);
+    info.base_class_typeinfo = 0;
+
+    if (s.offset >= ptr_size * 2) {
+      if (is32) {
+        info.typeinfo_addr =
+            *(uint32_t *)(data.data() + s.offset - ptr_size * 2);
+      } else {
+        info.typeinfo_addr =
+            *(uint64_t *)(data.data() + s.offset - ptr_size * 2);
+      }
+    }
+
+    info.virtual_functions = get_vtable_functions(data, s.offset, base_addr);
+
+    results.push_back(info);
+  }
+
+  auto strings = get_strings(data, 4);
+  std::map<uint64_t, std::string> string_map;
+  for (const auto &s : strings) {
+    if (!s.value.empty() &&
+        (isdigit(s.value[0]) || (isupper(s.value[0]) && isalpha(s.value[1])))) {
+      string_map[s.offset] = s.value;
+    }
+  }
+
+  return results;
+}
+
+RTTIInfo ElfParser::find_vtable_by_name(const std::vector<uint8_t> &data,
+                                        const std::string &class_name,
+                                        uint64_t base_addr) {
+  auto all_rtti = scan_rtti(data, base_addr);
+
+  for (const auto &r : all_rtti) {
+    if (r.class_name.find(class_name) != std::string::npos ||
+        r.demangled_name.find(class_name) != std::string::npos) {
+      return r;
+    }
+  }
+
+  return RTTIInfo{};
+}
+
+std::vector<uint64_t>
+ElfParser::get_vtable_functions(const std::vector<uint8_t> &data,
+                                uint64_t vtable_offset, uint64_t base_addr) {
+  std::vector<uint64_t> funcs;
+  if (vtable_offset >= data.size())
+    return funcs;
+
+  bool is32 = is_elf32(data);
+  size_t ptr_size = is32 ? 4 : 8;
+
+  size_t start = vtable_offset;
+
+  for (size_t i = 0; i < 200; i++) {
+    size_t off = start + i * ptr_size;
+    if (off + ptr_size > data.size())
+      break;
+
+    uint64_t func_ptr;
+    if (is32) {
+      func_ptr = *(uint32_t *)(data.data() + off);
+    } else {
+      func_ptr = *(uint64_t *)(data.data() + off);
+    }
+
+    if (func_ptr == 0)
+      break;
+
+    uint64_t relative = func_ptr - base_addr;
+    if (relative < data.size()) {
+      funcs.push_back(func_ptr);
+    } else if (func_ptr < 0x1000) {
+      break;
+    }
+  }
+
+  return funcs;
+}
+
+StringXref ElfParser::find_string_xrefs(const std::vector<uint8_t> &data,
+                                        const std::string &str,
+                                        uint64_t base_addr) {
+  StringXref result;
+  result.string_value = str;
+
+  for (size_t i = 0; i + str.size() <= data.size(); i++) {
+    if (memcmp(data.data() + i, str.c_str(), str.size()) == 0) {
+      result.string_offset = i;
+      break;
+    }
+  }
+
+  if (result.string_offset == 0 && str != std::string(1, data[0]))
+    return result;
+
+  bool is32 = is_elf32(data);
+  uint64_t str_addr = base_addr + result.string_offset;
+
+  if (!is32) {
+    for (size_t i = 0; i + 8 <= data.size(); i += 4) {
+      uint32_t inst0 = *(uint32_t *)(data.data() + i);
+      uint32_t inst1 = *(uint32_t *)(data.data() + i + 4);
+
+      if ((inst0 & 0x9F000000) == 0x90000000) {
+        if ((inst1 & 0xFF000000) == 0x91000000) {
+          uint8_t rd0 = inst0 & 0x1F;
+          uint8_t rd1 = inst1 & 0x1F;
+          uint8_t rn1 = (inst1 >> 5) & 0x1F;
+
+          if (rd0 == rn1) {
+            int32_t immhi = ((inst0 >> 5) & 0x7FFFF) << 2;
+            int32_t immlo = (inst0 >> 29) & 0x3;
+            int32_t imm = immhi | immlo;
+            if (imm & 0x100000)
+              imm |= 0xFFE00000;
+            int64_t page_offset = (int64_t)imm << 12;
+
+            uint64_t pc = base_addr + i;
+            uint64_t page = (pc & ~0xFFFULL) + page_offset;
+
+            uint32_t add_imm = (inst1 >> 10) & 0xFFF;
+            if ((inst1 >> 22) & 1)
+              add_imm <<= 12;
+
+            uint64_t target = page + add_imm;
+
+            if (target == str_addr) {
+              result.references.push_back(i);
+              result.ref_type = "ADRP+ADD";
+            }
+          }
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i + 4 <= data.size(); i += 4) {
+      uint32_t inst = *(uint32_t *)(data.data() + i);
+
+      if ((inst & 0x0F7F0000) == 0x051F0000) {
+        uint32_t offset = inst & 0xFFF;
+        bool add = (inst >> 23) & 1;
+        uint64_t pc = base_addr + i + 8;
+
+        uint64_t target = add ? (pc + offset) : (pc - offset);
+        if (target >= base_addr && target - base_addr + 4 <= data.size()) {
+          uint32_t ptr_val = *(uint32_t *)(data.data() + target - base_addr);
+          if (ptr_val == str_addr) {
+            result.references.push_back(i);
+            result.ref_type = "LDR";
+          }
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+std::vector<StringXref>
+ElfParser::find_string_xrefs_pattern(const std::vector<uint8_t> &data,
+                                     const std::string &pattern,
+                                     uint64_t base_addr) {
+  std::vector<StringXref> results;
+
+  auto strings = get_strings(data, 4);
+  for (const auto &s : strings) {
+    bool match = false;
+    if (pattern.find('*') != std::string::npos) {
+      if (pattern[0] == '*') {
+        match = s.value.find(pattern.substr(1)) != std::string::npos;
+      } else if (pattern.back() == '*') {
+        match = s.value.find(pattern.substr(0, pattern.size() - 1)) == 0;
+      } else {
+        match = s.value.find(pattern) != std::string::npos;
+      }
+    } else {
+      match = s.value == pattern;
+    }
+
+    if (match) {
+      auto xref = find_string_xrefs(data, s.value, base_addr);
+      if (!xref.references.empty()) {
+        results.push_back(xref);
+      }
+    }
+  }
+
+  return results;
+}
+
+std::map<uint64_t, std::vector<uint64_t>>
+ElfParser::build_string_xref_map(const std::vector<uint8_t> &data,
+                                 uint64_t base_addr) {
+  std::map<uint64_t, std::vector<uint64_t>> xref_map;
+
+  auto strings = get_strings(data, 6);
+  for (const auto &s : strings) {
+    auto xref = find_string_xrefs(data, s.value, base_addr);
+    if (!xref.references.empty()) {
+      xref_map[s.offset] = xref.references;
+    }
+  }
+
+  return xref_map;
+}
+
+std::vector<DecryptResult>
+ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
+                       size_t length) {
+  std::vector<DecryptResult> results;
+
+  if (offset + length > data.size())
+    return results;
+
+  std::vector<uint8_t> encrypted(data.begin() + offset,
+                                 data.begin() + offset + length);
+
+  // Helper: calculate printable ratio
+  auto calc_printable_ratio = [](const std::vector<uint8_t> &buf) -> double {
+    if (buf.empty())
+      return 0.0;
+    int printable = 0;
+    for (uint8_t b : buf) {
+      if ((b >= 0x20 && b <= 0x7E) || b == 0 || b == '\n' || b == '\r' ||
+          b == '\t')
+        printable++;
+    }
+    return (double)printable / buf.size();
+  };
+
+  // Helper: check for known string patterns (URLs, paths, class names)
+  auto has_known_patterns = [](const std::vector<uint8_t> &buf) -> bool {
+    std::string s(buf.begin(), buf.end());
+    // Common patterns in Android apps
+    if (s.find("http") != std::string::npos)
+      return true;
+    if (s.find("android") != std::string::npos)
+      return true;
+    if (s.find("java/") != std::string::npos)
+      return true;
+    if (s.find("com/") != std::string::npos)
+      return true;
+    if (s.find(".json") != std::string::npos)
+      return true;
+    if (s.find(".xml") != std::string::npos)
+      return true;
+    if (s.find("api") != std::string::npos)
+      return true;
+    if (s.find("key") != std::string::npos)
+      return true;
+    if (s.find("token") != std::string::npos)
+      return true;
+    return false;
+  };
+
+  // 1. Check if it's Base64 encoded
+  auto is_base64_char = [](uint8_t c) -> bool {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
+  };
+
+  int base64_count = 0;
+  for (uint8_t b : encrypted) {
+    if (is_base64_char(b))
+      base64_count++;
+  }
+
+  if (base64_count > (int)(length * 0.9) && length >= 4) {
+    // Try Base64 decode
+    static const uint8_t b64_table[256] = {
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63, 52, 53, 54, 55, 56, 57,
+        58, 59, 60, 61, 64, 64, 64, 64, 64, 64, 64, 0,  1,  2,  3,  4,  5,  6,
+        7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 64, 64, 64, 64, 64, 64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+        37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64};
+
+    std::vector<uint8_t> decoded;
+    decoded.reserve(length * 3 / 4);
+    uint32_t accum = 0;
+    int bits = 0;
+    for (uint8_t c : encrypted) {
+      if (c == '=')
+        break;
+      uint8_t v = b64_table[c];
+      if (v == 64)
+        continue;
+      accum = (accum << 6) | v;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        decoded.push_back((accum >> bits) & 0xFF);
+      }
+    }
+
+    if (!decoded.empty() && calc_printable_ratio(decoded) > 0.7) {
+      DecryptResult r;
+      r.offset = offset;
+      r.original = encrypted;
+      r.decrypted = decoded;
+      r.method = "BASE64";
+      r.key_size = 0;
+      results.push_back(r);
+    }
+  }
+
+  // 2. Single-byte XOR with improved scoring
+  for (uint8_t key = 1; key < 255; key++) {
+    std::vector<uint8_t> decrypted = encrypted;
+    for (auto &b : decrypted)
+      b ^= key;
+
+    double ratio = calc_printable_ratio(decrypted);
+    bool has_patterns = has_known_patterns(decrypted);
+
+    if (ratio > 0.8 || (ratio > 0.6 && has_patterns)) {
+      DecryptResult r;
+      r.offset = offset;
+      r.original = encrypted;
+      r.decrypted = decrypted;
+      r.method = "XOR-BYTE";
+      r.key_or_info[0] = key;
+      r.key_size = 1;
+      results.push_back(r);
+      break;
+    }
+  }
+
+  // 3. Multi-byte XOR with Kasiski-based key length detection
+  if (length >= 16 && results.empty()) {
+    // Find repeated sequences (simplified Kasiski)
+    std::map<int, int> distance_counts;
+    for (size_t win = 3; win <= 5; win++) {
+      for (size_t i = 0; i + win < length; i++) {
+        for (size_t j = i + win; j + win <= length; j++) {
+          if (memcmp(encrypted.data() + i, encrypted.data() + j, win) == 0) {
+            int dist = j - i;
+            for (int d = 2; d <= 16; d++) {
+              if (dist % d == 0)
+                distance_counts[d]++;
+            }
+          }
+        }
+      }
+    }
+
+    // Try most likely key lengths
+    std::vector<int> key_lengths = {4, 8, 16, 2, 3, 6};
+    for (auto &[len, count] : distance_counts) {
+      if (count > 2 && len >= 2 && len <= 16) {
+        bool found = false;
+        for (int kl : key_lengths)
+          if (kl == len)
+            found = true;
+        if (!found)
+          key_lengths.push_back(len);
+      }
+    }
+
+    for (int key_len : key_lengths) {
+      if (key_len > (int)length / 2)
+        continue;
+
+      // Try to find key by frequency analysis
+      std::vector<uint8_t> key(key_len, 0);
+      bool key_found = true;
+
+      for (int k = 0; k < key_len; k++) {
+        std::vector<int> freq(256, 0);
+        for (size_t i = k; i < length; i += key_len) {
+          freq[encrypted[i]]++;
+        }
+
+        // Assume space (0x20) or 'e' (0x65) is most common
+        int max_idx = 0;
+        for (int i = 0; i < 256; i++) {
+          if (freq[i] > freq[max_idx])
+            max_idx = i;
+        }
+
+        // Try XOR with common chars
+        uint8_t best_key = 0;
+        double best_ratio = 0;
+        for (uint8_t common : {' ', 'e', 'a', 't', 'o', '\0'}) {
+          uint8_t try_key = max_idx ^ common;
+          std::vector<uint8_t> test;
+          for (size_t i = k; i < length; i += key_len) {
+            test.push_back(encrypted[i] ^ try_key);
+          }
+          double ratio = calc_printable_ratio(test);
+          if (ratio > best_ratio) {
+            best_ratio = ratio;
+            best_key = try_key;
+          }
+        }
+
+        if (best_ratio < 0.5) {
+          key_found = false;
+          break;
+        }
+        key[k] = best_key;
+      }
+
+      if (key_found) {
+        std::vector<uint8_t> decrypted = encrypted;
+        for (size_t i = 0; i < length; i++) {
+          decrypted[i] ^= key[i % key_len];
+        }
+
+        double ratio = calc_printable_ratio(decrypted);
+        if (ratio > 0.7 || (ratio > 0.5 && has_known_patterns(decrypted))) {
+          DecryptResult r;
+          r.offset = offset;
+          r.original = encrypted;
+          r.decrypted = decrypted;
+          r.method = "XOR-MULTI-" + std::to_string(key_len);
+          memcpy(r.key_or_info, key.data(), std::min(key.size(), (size_t)32));
+          r.key_size = key_len;
+          results.push_back(r);
+          break;
+        }
+      }
+    }
+  }
+
+  // 4. DWORD XOR (improved)
+  if (length >= 4 && results.empty()) {
+    for (uint32_t key = 0x01010101; key < 0x10101010; key += 0x01010101) {
+      std::vector<uint8_t> decrypted = encrypted;
+      for (size_t i = 0; i + 4 <= decrypted.size(); i += 4) {
+        *(uint32_t *)(decrypted.data() + i) ^= key;
+      }
+
+      double ratio = calc_printable_ratio(decrypted);
+      if (ratio > 0.8 || (ratio > 0.6 && has_known_patterns(decrypted))) {
+        DecryptResult r;
+        r.offset = offset;
+        r.original = encrypted;
+        r.decrypted = decrypted;
+        r.method = "XOR-DWORD";
+        *(uint32_t *)r.key_or_info = key;
+        r.key_size = 4;
+        results.push_back(r);
+        break;
+      }
+    }
+  }
+
+  // 5. ADD/SUB cipher (improved)
+  if (results.empty()) {
+    for (int delta = -128; delta <= 127; delta++) {
+      if (delta == 0)
+        continue;
+      std::vector<uint8_t> decrypted = encrypted;
+      for (auto &b : decrypted)
+        b = (uint8_t)(b + delta);
+
+      double ratio = calc_printable_ratio(decrypted);
+      if (ratio > 0.8 || (ratio > 0.6 && has_known_patterns(decrypted))) {
+        DecryptResult r;
+        r.offset = offset;
+        r.original = encrypted;
+        r.decrypted = decrypted;
+        r.method = (delta > 0) ? "ADD" : "SUB";
+        r.key_or_info[0] = (uint8_t)std::abs(delta);
+        r.key_size = 1;
+        results.push_back(r);
+        break;
+      }
+    }
+  }
+
+  return results;
+}
+
+std::vector<uint8_t> ElfParser::decrypt_xor(const std::vector<uint8_t> &data,
+                                            const std::vector<uint8_t> &key) {
+  if (key.empty())
+    return data;
+  std::vector<uint8_t> result = data;
+  for (size_t i = 0; i < result.size(); i++) {
+    result[i] ^= key[i % key.size()];
+  }
+  return result;
+}
+
+std::vector<uint8_t> ElfParser::decrypt_rc4(const std::vector<uint8_t> &data,
+                                            const std::vector<uint8_t> &key) {
+  if (key.empty())
+    return data;
+
+  uint8_t S[256];
+  for (int i = 0; i < 256; i++)
+    S[i] = i;
+
+  int j = 0;
+  for (int i = 0; i < 256; i++) {
+    j = (j + S[i] + key[i % key.size()]) & 0xFF;
+    std::swap(S[i], S[j]);
+  }
+
+  std::vector<uint8_t> result = data;
+  int i = 0;
+  j = 0;
+  for (size_t k = 0; k < result.size(); k++) {
+    i = (i + 1) & 0xFF;
+    j = (j + S[i]) & 0xFF;
+    std::swap(S[i], S[j]);
+    result[k] ^= S[(S[i] + S[j]) & 0xFF];
+  }
+
+  return result;
+}
+
+std::vector<DecryptResult>
+ElfParser::auto_decrypt_strings(const std::vector<uint8_t> &data) {
+  std::vector<DecryptResult> results;
+
+  for (size_t i = 0; i + 16 < data.size(); i++) {
+    int printable = 0;
+    bool all_zero = true;
+    for (size_t j = 0; j < 16; j++) {
+      if (data[i + j] >= 0x20 && data[i + j] <= 0x7E)
+        printable++;
+      if (data[i + j] != 0)
+        all_zero = false;
+    }
+
+    if (printable >= 12 || all_zero)
+      continue;
+
+    auto decrypted = try_decrypt(data, i, 64);
+    if (!decrypted.empty()) {
+      results.insert(results.end(), decrypted.begin(), decrypted.end());
+      i += 64;
+    }
+  }
+
+  return results;
+}
+
+std::vector<uint8_t>
+ElfParser::find_encryption_key(const std::vector<uint8_t> &data) {
+  auto init_funcs = get_init_array(data);
+
+  std::vector<uint8_t> potential_key;
+
+  for (uint64_t func_addr : init_funcs) {
+    if (func_addr >= data.size())
+      continue;
+
+    for (size_t i = 0; i < 64 && func_addr + i + 4 <= data.size(); i += 4) {
+      uint32_t inst = *(uint32_t *)(data.data() + func_addr + i);
+
+      if ((inst & 0x7F800000) == 0x52800000) {
+        uint16_t imm = (inst >> 5) & 0xFFFF;
+        if (imm > 0 && imm != 0xFFFF) {
+          potential_key.push_back(imm & 0xFF);
+          if (potential_key.size() >= 16)
+            break;
+        }
+      }
+    }
+  }
+
+  return potential_key;
+}
+
+std::vector<uint8_t> RuntimeAnalyzer::read_decrypted(int pid, uint64_t addr,
+                                                     size_t size) {
+  return Memory::dump(pid, addr, size);
+}
+
+std::vector<std::pair<uint64_t, size_t>>
+RuntimeAnalyzer::find_decrypted_regions(int pid, uint64_t base,
+                                        const std::vector<uint8_t> &disk_data) {
+  std::vector<std::pair<uint64_t, size_t>> regions;
+
+  auto runtime_data = Memory::dump(pid, base, disk_data.size());
+  if (runtime_data.size() != disk_data.size())
+    return regions;
+
+  size_t start = 0;
+  bool in_diff = false;
+
+  for (size_t i = 0; i < disk_data.size(); i++) {
+    bool differs = (runtime_data[i] != disk_data[i]) && (disk_data[i] != 0);
+
+    if (differs && !in_diff) {
+      start = i;
+      in_diff = true;
+    } else if (!differs && in_diff) {
+      if (i - start >= 16) {
+        regions.push_back({base + start, i - start});
+      }
+      in_diff = false;
+    }
+  }
+
+  if (in_diff && disk_data.size() - start >= 16) {
+    regions.push_back({base + start, disk_data.size() - start});
+  }
+
+  return regions;
+}
+
+bool RuntimeAnalyzer::trace_init_array(
+    int pid, uint64_t base, const std::vector<uint64_t> &init_funcs) {
+  if (!ProcessTracer::attach(pid))
+    return false;
+
+  std::map<uint64_t, uint32_t> original_instructions;
+
+  for (uint64_t func : init_funcs) {
+    uint32_t orig;
+    if (ProcessTracer::read_memory(pid, func, &orig, 4)) {
+      original_instructions[func] = orig;
+      uint32_t brk = 0xD4200000;
+      ProcessTracer::write_memory(pid, func, &brk, 4);
+    }
+  }
+
+  ProcessTracer::continue_process(pid);
+
+  int status;
+  for (int i = 0; i < (int)init_funcs.size() * 2; i++) {
+    if (!ProcessTracer::wait_for_stop(pid, &status))
+      break;
+
+    uint64_t pc = ProcessTracer::get_pc(pid);
+
+    auto it = original_instructions.find(pc);
+    if (it != original_instructions.end()) {
+      ProcessTracer::write_memory(pid, pc, &it->second, 4);
+    }
+
+    ProcessTracer::continue_process(pid);
+  }
+
+  for (const auto &pair : original_instructions) {
+    ProcessTracer::write_memory(pid, pair.first, &pair.second, 4);
+  }
+
+  ProcessTracer::detach(pid);
+  return true;
+}
+
+std::vector<uint8_t> RuntimeAnalyzer::dump_after_function(int pid,
+                                                          uint64_t func_addr,
+                                                          uint64_t target_addr,
+                                                          size_t size) {
+  if (!ProcessTracer::attach(pid))
+    return {};
+
+  uint64_t ret_addr = func_addr;
+  for (int i = 0; i < 1000; i++) {
+    uint32_t inst;
+    if (!ProcessTracer::read_memory(pid, func_addr + i * 4, &inst, 4))
+      break;
+    if ((inst & 0xFFFFFC1F) == 0xD65F0000) {
+      ret_addr = func_addr + i * 4;
+      break;
+    }
+  }
+
+  uint32_t orig;
+  ProcessTracer::read_memory(pid, ret_addr, &orig, 4);
+  uint32_t brk = 0xD4200000;
+  ProcessTracer::write_memory(pid, ret_addr, &brk, 4);
+
+  ProcessTracer::continue_process(pid);
+
+  int status;
+  ProcessTracer::wait_for_stop(pid, &status);
+
+  ProcessTracer::write_memory(pid, ret_addr, &orig, 4);
+
+  std::vector<uint8_t> result(size);
+  ProcessTracer::read_memory(pid, target_addr, result.data(), size);
+
+  ProcessTracer::detach(pid);
+  return result;
+}
+
+std::vector<uint64_t>
+RuntimeAnalyzer::find_instances_by_vtable(int pid, uint64_t vtable_addr) {
+  std::vector<uint64_t> instances;
+
+  auto maps = Memory::get_maps(pid);
+
+  for (const auto &m : maps) {
+    if (m.name.find("[heap]") == std::string::npos &&
+        m.name.find("[anon:") == std::string::npos)
+      continue;
+
+    if (m.perms.find('r') == std::string::npos)
+      continue;
+
+    std::vector<uint8_t> region = Memory::dump(pid, m.base, m.size);
+
+    for (size_t i = 0; i + 8 <= region.size(); i += 8) {
+      uint64_t ptr = *(uint64_t *)(region.data() + i);
+      if (ptr == vtable_addr) {
+        instances.push_back(m.base + i);
+      }
+    }
+  }
+
+  return instances;
+}
+
+double ElfParser::calculate_entropy(const uint8_t *data, size_t size) {
+  if (size == 0)
+    return 0.0;
+
+  size_t freq[256] = {0};
+  for (size_t i = 0; i < size; i++) {
+    freq[data[i]]++;
+  }
+
+  double entropy = 0.0;
+  for (int i = 0; i < 256; i++) {
+    if (freq[i] > 0) {
+      double p = (double)freq[i] / size;
+      entropy -= p * log2(p);
+    }
+  }
+
+  return entropy;
+}
+
+std::vector<EntropyInfo>
+ElfParser::find_high_entropy_regions(const std::vector<uint8_t> &data,
+                                     size_t block_size, double threshold) {
+  std::vector<EntropyInfo> results;
+
+  if (data.size() < block_size)
+    return results;
+
+  size_t step = block_size / 2;
+  uint64_t region_start = 0;
+  bool in_high_entropy = false;
+  double max_entropy = 0;
+
+  for (size_t i = 0; i + block_size <= data.size(); i += step) {
+    double entropy = calculate_entropy(data.data() + i, block_size);
+
+    if (entropy >= threshold) {
+      if (!in_high_entropy) {
+        region_start = i;
+        in_high_entropy = true;
+        max_entropy = entropy;
+      } else {
+        max_entropy = std::max(max_entropy, entropy);
+      }
+    } else if (in_high_entropy) {
+      EntropyInfo info;
+      info.offset = region_start;
+      info.size = i - region_start;
+      info.entropy = max_entropy;
+      info.likely_encrypted = (max_entropy > 7.5);
+      info.likely_compressed = (max_entropy > 7.0 && max_entropy <= 7.5);
+      results.push_back(info);
+      in_high_entropy = false;
+    }
+  }
+
+  if (in_high_entropy) {
+    EntropyInfo info;
+    info.offset = region_start;
+    info.size = data.size() - region_start;
+    info.entropy = max_entropy;
+    info.likely_encrypted = (max_entropy > 7.5);
+    info.likely_compressed = (max_entropy > 7.0 && max_entropy <= 7.5);
+    results.push_back(info);
+  }
+
+  return results;
+}
+
+static const uint8_t AES_SBOX[256] = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b,
+    0xfe, 0xd7, 0xab, 0x76, 0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
+    0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0, 0xb7, 0xfd, 0x93, 0x26,
+    0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2,
+    0xeb, 0x27, 0xb2, 0x75, 0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0,
+    0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84, 0x53, 0xd1, 0x00, 0xed,
+    0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f,
+    0x50, 0x3c, 0x9f, 0xa8, 0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5,
+    0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2, 0xcd, 0x0c, 0x13, 0xec,
+    0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14,
+    0xde, 0x5e, 0x0b, 0xdb, 0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c,
+    0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79, 0xe7, 0xc8, 0x37, 0x6d,
+    0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f,
+    0x4b, 0xbd, 0x8b, 0x8a, 0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e,
+    0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e, 0xe1, 0xf8, 0x98, 0x11,
+    0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f,
+    0xb0, 0x54, 0xbb, 0x16};
+
+static const uint8_t AES_RCON[11] = {0x00, 0x01, 0x02, 0x04, 0x08, 0x10,
+                                     0x20, 0x40, 0x80, 0x1b, 0x36};
+
+std::vector<AESKeyInfo>
+ElfParser::detect_aes_keys(const std::vector<uint8_t> &data) {
+  std::vector<AESKeyInfo> results;
+
+  for (size_t i = 0; i + 256 <= data.size(); i++) {
+    int sbox_match = 0;
+    for (int j = 0; j < 256; j++) {
+      if (data[i + j] == AES_SBOX[j])
+        sbox_match++;
+    }
+    if (sbox_match >= 250) {
+      AESKeyInfo info;
+      info.offset = i;
+      info.key_size = 0;
+      info.detection_method = "S-BOX";
+      info.confidence = (double)sbox_match / 256.0;
+      results.push_back(info);
+      i += 255;
+      continue;
+    }
+  }
+
+  for (size_t i = 0; i + 176 <= data.size(); i += 4) {
+    bool valid_schedule = true;
+    int rcon_matches = 0;
+
+    for (int round = 1; round <= 10 && valid_schedule; round++) {
+      size_t prev_key = i + (round - 1) * 16;
+      size_t curr_key = i + round * 16;
+
+      if (curr_key + 16 > data.size()) {
+        valid_schedule = false;
+        break;
+      }
+
+      uint8_t temp[4];
+      for (int j = 0; j < 4; j++) {
+        temp[j] = data[prev_key + 12 + ((j + 1) % 4)];
+      }
+      for (int j = 0; j < 4; j++) {
+        temp[j] = AES_SBOX[temp[j]];
+      }
+      temp[0] ^= AES_RCON[round];
+
+      uint8_t expected[4];
+      for (int j = 0; j < 4; j++) {
+        expected[j] = data[prev_key + j] ^ temp[j];
+      }
+
+      int match = 0;
+      for (int j = 0; j < 4; j++) {
+        if (data[curr_key + j] == expected[j])
+          match++;
+      }
+      if (match >= 3)
+        rcon_matches++;
+    }
+
+    if (rcon_matches >= 8) {
+      AESKeyInfo info;
+      info.offset = i;
+      memcpy(info.key, data.data() + i, 16);
+      info.key_size = 16;
+      info.detection_method = "KEY-SCHEDULE-128";
+      info.confidence = (double)rcon_matches / 10.0;
+      results.push_back(info);
+    }
+  }
+
+  return results;
+}
+
+std::vector<HeuristicFunction>
+ElfParser::find_functions_stripped(const std::vector<uint8_t> &data,
+                                   uint64_t base_addr) {
+  std::vector<HeuristicFunction> results;
+  bool is32 = is_elf32(data);
+
+  if (!is32) {
+    for (size_t i = 0; i + 8 <= data.size(); i += 4) {
+      uint32_t inst = *(const uint32_t *)(data.data() + i);
+
+      bool is_stp_prologue = false;
+      int stack_size = 0;
+
+      if ((inst & 0xFFC003E0) == 0xA98003E0) {
+        is_stp_prologue = true;
+        int imm = ((inst >> 15) & 0x7F);
+        if (imm & 0x40)
+          imm |= 0xFFFFFF80;
+        stack_size = -imm * 8;
+      }
+
+      if ((inst & 0xFF0003FF) == 0xD10003FF) {
+        stack_size = ((inst >> 10) & 0xFFF);
+        if (stack_size > 0)
+          is_stp_prologue = true;
+      }
+
+      if (is_stp_prologue && stack_size >= 16 && stack_size <= 4096) {
+        HeuristicFunction func;
+        func.start_addr = base_addr + i;
+        func.has_prologue = true;
+        func.stack_frame_size = stack_size;
+        func.has_epilogue = false;
+
+        for (size_t j = i + 4; j < i + 65536 && j + 4 <= data.size(); j += 4) {
+          uint32_t inst2 = *(const uint32_t *)(data.data() + j);
+
+          if ((inst2 & 0xFFFFFC1F) == 0xD65F0000) {
+            func.end_addr = base_addr + j + 4;
+            func.size = func.end_addr - func.start_addr;
+            func.has_epilogue = true;
+            break;
+          }
+
+          if ((inst2 & 0xFFC003E0) == 0xA8C003E0) {
+            func.end_addr = base_addr + j + 4;
+            func.size = func.end_addr - func.start_addr;
+            func.has_epilogue = true;
+            break;
+          }
+
+          if ((inst2 & 0xFC000000) == 0x94000000) {
+            int32_t offset = inst2 & 0x03FFFFFF;
+            if (offset & 0x02000000)
+              offset |= 0xFC000000;
+            uint64_t target = base_addr + j + (int64_t)offset * 4;
+            func.call_targets.push_back(target);
+          }
+        }
+
+        if (func.has_epilogue && func.size >= 16 && func.size <= 1024 * 1024) {
+          results.push_back(func);
+          i = (func.end_addr - base_addr) - 4;
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i + 4 <= data.size(); i += 4) {
+      uint32_t inst = *(const uint32_t *)(data.data() + i);
+
+      bool is_push_prologue = ((inst & 0xFFFF0000) == 0xE92D0000);
+      int stack_size = 0;
+
+      if ((inst & 0xFFFFF000) == 0xE24DD000) {
+        stack_size = inst & 0xFFF;
+        is_push_prologue = true;
+      }
+
+      if (is_push_prologue) {
+        HeuristicFunction func;
+        func.start_addr = base_addr + i;
+        func.has_prologue = true;
+        func.stack_frame_size = stack_size;
+        func.has_epilogue = false;
+
+        for (size_t j = i + 4; j < i + 65536 && j + 4 <= data.size(); j += 4) {
+          uint32_t inst2 = *(const uint32_t *)(data.data() + j);
+
+          if ((inst2 & 0x0FFF8000) == 0x08BD8000) {
+            func.end_addr = base_addr + j + 4;
+            func.size = func.end_addr - func.start_addr;
+            func.has_epilogue = true;
+            break;
+          }
+
+          if ((inst2 & 0x0FFFFFF0) == 0x012FFF10 && (inst2 & 0xF) == 14) {
+            func.end_addr = base_addr + j + 4;
+            func.size = func.end_addr - func.start_addr;
+            func.has_epilogue = true;
+            break;
+          }
+
+          if ((inst2 & 0x0F000000) == 0x0B000000) {
+            int32_t offset = inst2 & 0x00FFFFFF;
+            if (offset & 0x00800000)
+              offset |= 0xFF000000;
+            uint64_t target = base_addr + j + 8 + offset * 4;
+            func.call_targets.push_back(target);
+          }
+        }
+
+        if (func.has_epilogue && func.size >= 8 && func.size <= 1024 * 1024) {
+          results.push_back(func);
+          i = (func.end_addr - base_addr) - 4;
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
+std::vector<RTTIInfo>
+ElfParser::scan_vtables_stripped(const std::vector<uint8_t> &data,
+                                 uint64_t base_addr) {
+  std::vector<RTTIInfo> results;
+  bool is32 = is_elf32(data);
+  size_t ptr_size = is32 ? 4 : 8;
+
+  auto funcs = find_functions_stripped(data, base_addr);
+  std::set<uint64_t> func_addrs;
+  for (const auto &f : funcs) {
+    func_addrs.insert(f.start_addr);
+  }
+
+  for (size_t i = ptr_size * 2; i + ptr_size * 4 <= data.size();
+       i += ptr_size) {
+    int valid_ptrs = 0;
+    std::vector<uint64_t> potential_funcs;
+
+    for (int j = 0; j < 20 && i + (j + 1) * ptr_size <= data.size(); j++) {
+      uint64_t ptr;
+      if (is32) {
+        ptr = *(uint32_t *)(data.data() + i + j * ptr_size);
+      } else {
+        ptr = *(uint64_t *)(data.data() + i + j * ptr_size);
+      }
+
+      if (ptr == 0)
+        break;
+
+      uint64_t relative = ptr - base_addr;
+      if (relative < data.size()) {
+        if (func_addrs.count(ptr) || relative % 4 == 0) {
+          valid_ptrs++;
+          potential_funcs.push_back(ptr);
+        }
+      } else {
+        break;
+      }
+    }
+
+    if (valid_ptrs >= 3) {
+      RTTIInfo info;
+      info.vtable_addr = base_addr + i;
+      info.virtual_functions = potential_funcs;
+      info.class_name = "<unknown_" + std::to_string(i) + ">";
+      info.demangled_name = info.class_name;
+
+      if (i >= ptr_size) {
+        uint64_t typeinfo_ptr;
+        if (is32) {
+          typeinfo_ptr = *(uint32_t *)(data.data() + i - ptr_size);
+        } else {
+          typeinfo_ptr = *(uint64_t *)(data.data() + i - ptr_size);
+        }
+        info.typeinfo_addr = typeinfo_ptr;
+      }
+
+      results.push_back(info);
+      i += valid_ptrs * ptr_size - ptr_size;
+    }
+  }
+
+  return results;
+}
+
+std::vector<StringXref>
+ElfParser::find_all_string_xrefs(const std::vector<uint8_t> &data,
+                                 uint64_t base_addr) {
+  std::vector<StringXref> results;
+  bool is32 = is_elf32(data);
+
+  auto strings = get_strings(data, 4);
+  std::map<uint64_t, std::string> str_map;
+  for (const auto &s : strings) {
+    str_map[s.offset] = s.value;
+  }
+
+  if (!is32) {
+    for (size_t i = 0; i + 4 <= data.size(); i += 4) {
+      uint32_t inst = *(uint32_t *)(data.data() + i);
+
+      if ((inst & 0x9F000000) == 0x10000000) {
+        int32_t immhi = ((inst >> 5) & 0x7FFFF) << 2;
+        int32_t immlo = (inst >> 29) & 0x3;
+        int32_t imm = immhi | immlo;
+        if (imm & 0x100000)
+          imm |= 0xFFE00000;
+
+        uint64_t target = base_addr + i + imm;
+        uint64_t relative = target - base_addr;
+
+        if (relative < data.size()) {
+          auto it = str_map.find(relative);
+          if (it != str_map.end()) {
+            StringXref xref;
+            xref.string_offset = relative;
+            xref.string_value = it->second;
+            xref.references.push_back(i);
+            xref.ref_type = "ADR";
+            results.push_back(xref);
+          }
+        }
+      }
+
+      if ((inst & 0xBF000000) == 0x18000000) {
+        int32_t imm = ((inst >> 5) & 0x7FFFF) << 2;
+        if (imm & 0x100000)
+          imm |= 0xFFE00000;
+
+        uint64_t target = base_addr + i + imm;
+        uint64_t relative = target - base_addr;
+
+        if (relative < data.size()) {
+          auto it = str_map.find(relative);
+          if (it != str_map.end()) {
+            StringXref xref;
+            xref.string_offset = relative;
+            xref.string_value = it->second;
+            xref.references.push_back(i);
+            xref.ref_type = "LDR-LITERAL";
+            results.push_back(xref);
+          }
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i + 4 <= data.size(); i += 4) {
+      uint32_t inst = *(uint32_t *)(data.data() + i);
+
+      if ((inst & 0x0F7F0000) == 0x051F0000) {
+        uint32_t offset = inst & 0xFFF;
+        bool add = (inst >> 23) & 1;
+        uint64_t pc = base_addr + i + 8;
+        uint64_t target = add ? (pc + offset) : (pc - offset);
+        uint64_t relative = target - base_addr;
+
+        if (relative + 4 <= data.size()) {
+          uint32_t ptr_val = *(uint32_t *)(data.data() + relative);
+          uint64_t str_rel = ptr_val - base_addr;
+          if (str_rel < data.size()) {
+            auto it = str_map.find(str_rel);
+            if (it != str_map.end()) {
+              StringXref xref;
+              xref.string_offset = str_rel;
+              xref.string_value = it->second;
+              xref.references.push_back(i);
+              xref.ref_type = "LDR-INDIRECT";
+              results.push_back(xref);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return results;
 }

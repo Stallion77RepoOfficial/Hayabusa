@@ -1,4 +1,5 @@
 #pragma once
+#include "config.h"
 #include <cstdint>
 #include <elf.h>
 #include <functional>
@@ -202,4 +203,365 @@ public:
   static bool attach_zygote(int zygote_pid);
   static int wait_for_fork(int zygote_pid, const std::string &target_pkg);
   static bool intercept_dlopen(int pid);
+
+  // Cleanup functions for signal handling
+  static void register_attached_pid(int pid);
+  static void unregister_attached_pid(int pid);
+  static void cleanup_all_attached();
+  static std::set<int> &get_attached_pids();
+};
+
+// Memory Injection structures
+struct RemoteCallResult {
+  uint64_t return_value;
+  bool success;
+  int error_code;
+  std::string error_message;
+};
+
+struct HookInfo {
+  uint64_t target_addr;
+  uint64_t hook_addr;
+  uint64_t trampoline_addr;
+  std::vector<uint8_t> original_bytes;
+  size_t patch_size;
+  bool active;
+};
+
+struct ShellcodeInfo {
+  uint64_t code_addr;
+  uint64_t data_addr;
+  size_t code_size;
+  size_t data_size;
+};
+
+struct ARTMethodInfo {
+  uint64_t art_method_addr;
+  uint64_t entry_point;
+  std::string class_name;
+  std::string method_name;
+  std::string signature;
+  uint32_t access_flags;
+};
+
+// Advanced Memory Injection class
+class MemoryInjector {
+public:
+  // Remote memory allocation
+  static uint64_t remote_mmap(int pid, uint64_t addr, size_t size, int prot,
+                              int flags);
+  static bool remote_munmap(int pid, uint64_t addr, size_t size);
+  static bool remote_mprotect(int pid, uint64_t addr, size_t size, int prot);
+
+  // Remote function calls
+  static RemoteCallResult call_remote(int pid, uint64_t func_addr,
+                                      const std::vector<uint64_t> &args);
+  static RemoteCallResult call_remote_void(int pid, uint64_t func_addr,
+                                           const std::vector<uint64_t> &args);
+
+  // Remote dlopen/dlsym/dlclose
+  static uint64_t remote_dlopen(int pid, const std::string &path, int flags);
+  static uint64_t remote_dlsym(int pid, uint64_t handle,
+                               const std::string &symbol);
+  static bool remote_dlclose(int pid, uint64_t handle);
+  static std::string remote_dlerror(int pid);
+
+  // Shellcode injection
+  static bool inject_shellcode(int pid, const std::vector<uint8_t> &shellcode,
+                               uint64_t *exec_addr);
+  static bool inject_and_run_shellcode(int pid,
+                                       const std::vector<uint8_t> &shellcode,
+                                       uint64_t *result);
+  static std::vector<uint8_t>
+  generate_shellcode_arm64(uint64_t func_addr,
+                           const std::vector<uint64_t> &args);
+  static std::vector<uint8_t>
+  generate_shellcode_arm32(uint64_t func_addr,
+                           const std::vector<uint64_t> &args);
+  static std::vector<uint8_t>
+  generate_dlopen_shellcode_arm64(const std::string &lib_path);
+  static std::vector<uint8_t>
+  generate_dlopen_shellcode_arm32(const std::string &lib_path);
+
+  // Advanced hooking
+  static bool install_inline_hook(int pid, uint64_t target, uint64_t hook,
+                                  HookInfo *info);
+  static bool remove_inline_hook(int pid, const HookInfo &info);
+  static bool hook_got_entry(int pid, uint64_t got_addr, uint64_t new_value,
+                             uint64_t *old_value);
+  static bool hook_plt_entry(int pid, uint64_t base, const std::string &symbol,
+                             uint64_t hook);
+
+  // GOT/PLT manipulation
+  static uint64_t find_got_entry(int pid, uint64_t base,
+                                 const std::string &symbol);
+  static std::vector<std::pair<std::string, uint64_t>>
+  dump_got(int pid, uint64_t base, const std::vector<uint8_t> &elf_data);
+
+  // ART specific hooking
+  static uint64_t find_libart_base(int pid);
+  static uint64_t find_art_method(int pid, const std::string &class_name,
+                                  const std::string &method_name,
+                                  const std::string &signature);
+  static bool hook_art_method(int pid, uint64_t art_method, uint64_t hook,
+                              uint64_t *original_entry);
+  static std::vector<ARTMethodInfo>
+  enum_art_methods(int pid, const std::string &class_name);
+
+  // JNI function hooking
+  static std::vector<std::pair<std::string, uint64_t>>
+  find_jni_functions(int pid, const std::string &lib_name);
+  static bool hook_jni_function(int pid, uint64_t jni_func, uint64_t hook,
+                                uint64_t *original);
+
+  // Helper functions
+  static uint64_t find_libc_function(int pid, const std::string &func_name);
+  static uint64_t find_linker_function(int pid, const std::string &func_name);
+  static bool write_string_remote(int pid, uint64_t addr,
+                                  const std::string &str);
+  static std::string read_string_remote(int pid, uint64_t addr, size_t max_len);
+};
+
+// ============================================================================
+// SECCOMP Bypass
+// ============================================================================
+
+struct SeccompInfo {
+  bool seccomp_enabled;
+  int seccomp_mode; // 0=disabled, 1=strict, 2=filter
+  uint64_t filter_count;
+  std::string filter_flags;
+};
+
+class SeccompBypass {
+public:
+  // Status checking
+  static SeccompInfo get_seccomp_status(int pid);
+
+  // Bypass methods
+  static bool disable_seccomp(int pid);
+  static bool patch_seccomp_filter(int pid);
+  static bool use_memfd_workaround(int pid);
+
+  // Process spawning without seccomp
+  static int spawn_without_seccomp(const std::string &cmd);
+  static bool inject_seccomp_disabler(int pid);
+};
+
+// ============================================================================
+// ART Runtime
+// ============================================================================
+
+// Dynamic offset discovery for ART structures
+struct ARTOffsets {
+  size_t runtime_class_linker;        // ClassLinker* in Runtime
+  size_t runtime_heap;                // Heap* in Runtime
+  size_t runtime_jit;                 // Jit* in Runtime
+  size_t classlinker_dex_caches;      // dex_caches_ in ClassLinker
+  size_t classlinker_boot_class_path; // boot_class_path_ in ClassLinker
+  size_t dexcache_dex_file;           // dex_file_ in DexCache
+  size_t jit_code_cache;              // code_cache_ in Jit
+  bool valid;
+  int discovered_sdk; // SDK version when discovery was done
+};
+
+namespace ARTOffsetFinder {
+// Discover offsets dynamically by scanning runtime structures
+ARTOffsets discover_offsets(int pid, uint64_t runtime_addr,
+                            uint64_t libart_base, int sdk_version);
+
+// Validate discovered offsets by reading and checking pointers
+bool validate_offsets(int pid, uint64_t runtime_addr,
+                      const ARTOffsets &offsets);
+
+// Get cached/fallback offsets (tries config first, then hardcoded)
+ARTOffsets get_fallback_offsets(int sdk_version, bool is64bit);
+ARTOffsets get_config_offsets(int sdk_version, bool is64bit);
+} // namespace ARTOffsetFinder
+
+struct ARTRuntimeInfo {
+  uint64_t runtime_addr;
+  uint64_t class_linker_addr;
+  uint64_t heap_addr;
+  uint64_t thread_list_addr;
+  int sdk_version;
+  bool is_debug_build;
+  std::string art_version;
+};
+
+struct ARTClassInfo {
+  uint64_t class_addr;
+  std::string descriptor;
+  uint32_t access_flags;
+  uint64_t super_class;
+  uint64_t methods_ptr;
+  uint32_t num_virtual_methods;
+  uint32_t num_direct_methods;
+};
+
+class ARTHooker {
+public:
+  // Runtime discovery
+  static ARTRuntimeInfo find_art_runtime(int pid);
+  static int get_sdk_version(int pid);
+
+  // Class operations
+  static uint64_t find_class_by_descriptor(int pid,
+                                           const std::string &descriptor);
+  static ARTClassInfo get_class_info(int pid, uint64_t art_class);
+  static std::vector<ARTClassInfo> enumerate_loaded_classes(int pid);
+
+  // Method operations
+  static std::vector<ARTMethodInfo> get_class_methods(int pid,
+                                                      uint64_t art_class);
+  static uint64_t find_method(int pid, const std::string &class_name,
+                              const std::string &method_name,
+                              const std::string &signature);
+
+  // Hooking
+  static bool hook_method_entry(int pid, uint64_t art_method, uint64_t hook,
+                                uint64_t *original);
+  static bool hook_method_native(int pid, uint64_t art_method,
+                                 uint64_t native_func);
+
+  // Interpreter/JIT control
+  static bool force_interpreter_mode(int pid, uint64_t art_method);
+  static bool force_jit_compilation(int pid, uint64_t art_method);
+};
+
+// ============================================================================
+// JIT Analysis
+// ============================================================================
+
+struct JITCodeInfo {
+  uint64_t addr;
+  size_t size;
+  std::string method_name;
+  std::string class_name;
+  std::vector<uint64_t> call_targets;
+  std::vector<uint64_t> string_refs;
+  bool is_osr; // On-Stack Replacement
+  bool is_baseline;
+  bool is_optimized;
+  uint32_t hotness_count;
+};
+
+struct JITHook {
+  uint64_t compile_handler;
+  uint64_t original_handler;
+  uint64_t trampoline;
+  bool active;
+};
+
+struct JITCompileEvent {
+  uint64_t method_addr;
+  uint64_t code_addr;
+  size_t code_size;
+  std::string method_name;
+  time_t timestamp;
+};
+
+class JITAnalyzer {
+public:
+  // Analysis
+  static JITCodeInfo analyze_jit_code(const std::vector<uint8_t> &code,
+                                      uint64_t base_addr, ArchMode arch);
+  static std::vector<JITCodeInfo> analyze_jit_region(const JITRegion &region,
+                                                     int pid);
+
+  // Disassembly
+  static std::string disassemble_arm64(const uint8_t *code, size_t size,
+                                       uint64_t base);
+  static std::string disassemble_arm32(const uint8_t *code, size_t size,
+                                       uint64_t base);
+
+  // JIT hooking
+  static bool hook_jit_compile(int pid, JITHook *hook);
+  static bool unhook_jit_compile(int pid, const JITHook &hook);
+
+  // Real-time capture
+  static std::vector<JITCompileEvent> monitor_jit_compiles(int pid,
+                                                           int duration_sec);
+  static std::vector<JITCodeInfo> capture_jit_with_analysis(int pid,
+                                                            int duration_sec);
+
+  // Code cache operations
+  static std::vector<JITRegion> dump_jit_code_cache(int pid);
+  static bool clear_jit_code_cache(int pid);
+};
+
+// ============================================================================
+// Static Relinking Enhanced
+// ============================================================================
+
+struct RelinkConfig {
+  int max_depth;
+  size_t max_total_size;
+  bool embed_data_refs;
+  bool fix_relocations;
+  bool inline_plt_calls;
+  std::set<std::string> exclude_libs;
+  std::set<std::string> include_only_libs;
+};
+
+class StaticRelinkerEx {
+public:
+  static std::vector<uint8_t> relink_full(const std::vector<uint8_t> &elf_data,
+                                          int pid, uint64_t base_addr,
+                                          const RelinkConfig &config);
+
+  static std::vector<uint8_t> extract_function_with_deps(int pid, uint64_t addr,
+                                                         int max_depth = 8);
+
+  static bool patch_relocations(std::vector<uint8_t> &data,
+                                const std::map<uint64_t, uint64_t> &addr_map);
+};
+
+// ============================================================================
+// Dynamic Key Extraction
+// ============================================================================
+
+struct CryptoKeyInfo {
+  uint64_t key_addr;
+  std::vector<uint8_t> key_data;
+  std::string algorithm; // "AES-128", "AES-256", "RC4", "DES", etc.
+  std::string source;    // Function/location where found
+  double confidence;
+  time_t capture_time;
+};
+
+struct CryptoCallInfo {
+  uint64_t func_addr;
+  std::string func_name;
+  std::vector<uint8_t> input_data;
+  std::vector<uint8_t> output_data;
+  std::vector<uint8_t> key_data;
+  std::vector<uint8_t> iv_data;
+};
+
+class CryptoAnalyzer {
+public:
+  // Static analysis
+  static std::vector<CryptoKeyInfo>
+  scan_for_keys(const std::vector<uint8_t> &data, uint64_t base_addr);
+
+  // Runtime extraction
+  static std::vector<CryptoKeyInfo>
+  extract_runtime_keys(int pid, uint64_t base,
+                       const std::vector<uint8_t> &data);
+  static std::vector<CryptoKeyInfo> trace_key_derivation(int pid,
+                                                         uint64_t crypto_func);
+
+  // Crypto function hooking
+  static std::vector<CryptoCallInfo> monitor_crypto_calls(int pid,
+                                                          int duration_sec);
+
+  // OpenSSL/BoringSSL specific
+  static std::vector<uint8_t> dump_ssl_session_keys(int pid);
+  static std::vector<CryptoKeyInfo> extract_openssl_keys(int pid);
+  static std::vector<CryptoKeyInfo> extract_boringssl_keys(int pid);
+
+  // Common crypto patterns
+  static bool hook_aes_encrypt(int pid, uint64_t *original);
+  static bool hook_aes_decrypt(int pid, uint64_t *original);
 };

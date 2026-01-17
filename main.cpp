@@ -1,8 +1,11 @@
+#include "dex.h"
 #include "memory.h"
 #include "tracer.h"
 #include <algorithm>
+#include <csignal>
 #include <cstring>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <fstream>
 #include <iomanip>
@@ -14,6 +17,34 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+
+// Global cleanup state for signal handling
+static volatile sig_atomic_t g_cleanup_needed = 0;
+
+void cleanup_attached_processes() {
+  // Cleanup all attached zygote processes
+  ZygoteTracer::cleanup_all_attached();
+}
+
+void signal_handler(int sig) {
+  // Use write() instead of cout for async-signal-safety
+  const char *msg =
+      "\n[!] Signal received, cleaning up attached processes...\n";
+  write(STDOUT_FILENO, msg, strlen(msg));
+  cleanup_attached_processes();
+  _exit(1);
+}
+
+void register_signal_handlers() {
+  struct sigaction sa;
+  sa.sa_handler = signal_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
+  sigaction(SIGHUP, &sa, nullptr);
+  atexit(cleanup_attached_processes);
+}
 
 bool is_zip(const std::vector<uint8_t> &data) {
   return data.size() >= 4 && data[0] == 'P' && data[1] == 'K' &&
@@ -83,27 +114,33 @@ bool is_garbage(const std::vector<uint8_t> &data) {
   return (zeros > check * 9 / 10) || (same > check * 9 / 10);
 }
 
-void analyze_elf(const std::vector<uint8_t> &data, const std::string &path) {
+void analyze_elf(const std::vector<uint8_t> &data, const std::string &path,
+                 uint64_t base_addr = 0) {
   std::ofstream f(path);
   if (!f)
     return;
 
   f << "=== ELF INFO ===\n";
+  f << "Base Address: 0x" << std::hex << base_addr << std::dec << "\n";
+  f << "Size: " << Utils::format_size(data.size()) << "\n";
   f << "RELRO: "
     << (ElfParser::has_full_relro(data)
             ? "Full"
             : (ElfParser::has_relro(data) ? "Partial" : "None"))
     << "\n";
+
   auto tls = ElfParser::get_tls_range(data);
   if (tls.second > 0)
     f << "TLS: 0x" << std::hex << tls.first << " size=" << std::dec
       << tls.second << "\n";
+
   auto init = ElfParser::get_init_array(data);
   if (!init.empty()) {
     f << "Init Array: " << init.size() << " functions\n";
     for (auto addr : init)
       f << "  0x" << std::hex << addr << "\n";
   }
+
   auto fini = ElfParser::get_fini_array(data);
   if (!fini.empty())
     f << "Fini Array: " << fini.size() << " functions\n";
@@ -144,12 +181,198 @@ void analyze_elf(const std::vector<uint8_t> &data, const std::string &path) {
     }
   }
 
+  auto rtti_list = ElfParser::scan_rtti(data, base_addr);
+  if (!rtti_list.empty()) {
+    f << "\n=== RTTI / VTABLES (" << std::dec << rtti_list.size() << ") ===\n";
+    for (const auto &r : rtti_list) {
+      f << "VTable: 0x" << std::hex << r.vtable_addr << "\n";
+      f << "  Class: " << r.demangled_name << "\n";
+      f << "  TypeInfo: 0x" << std::hex << r.typeinfo_addr << "\n";
+      if (!r.virtual_functions.empty()) {
+        f << "  Virtual Functions: " << std::dec << r.virtual_functions.size()
+          << "\n";
+        for (size_t i = 0; i < r.virtual_functions.size() && i < 20; i++) {
+          f << "    [" << i << "] 0x" << std::hex << r.virtual_functions[i]
+            << "\n";
+        }
+        if (r.virtual_functions.size() > 20)
+          f << "    ... and " << (r.virtual_functions.size() - 20) << " more\n";
+      }
+      f << "\n";
+    }
+  }
+
+  f << "\n=== STRING CROSS-REFERENCES ===\n";
+  auto xref_map = ElfParser::build_string_xref_map(data, base_addr);
   auto strings = ElfParser::get_strings(data, 6);
+  std::map<uint64_t, std::string> str_map;
+  for (const auto &s : strings) {
+    str_map[s.offset] = s.value;
+  }
+
+  size_t xref_count = 0;
+  for (const auto &[str_off, refs] : xref_map) {
+    if (xref_count++ > 500) {
+      f << "... and more xrefs (limited output)\n";
+      break;
+    }
+    auto it = str_map.find(str_off);
+    std::string str_val = (it != str_map.end()) ? it->second : "<unknown>";
+    if (str_val.size() > 60)
+      str_val = str_val.substr(0, 60) + "...";
+    f << "String @ 0x" << std::hex << str_off << ": \"" << str_val << "\"\n";
+    for (uint64_t ref : refs) {
+      f << "  <- Code @ 0x" << std::hex << ref << "\n";
+    }
+  }
+
+  f << "\n=== FUNCTION SIGNATURES ===\n";
+  size_t sig_count = 0;
+  for (const auto &s : symbols) {
+    if (s.type != "FUNC" || s.offset == 0 || s.offset >= data.size())
+      continue;
+    if (sig_count++ > 200) {
+      f << "... and more functions (limited output)\n";
+      break;
+    }
+    std::string sig = ElfParser::generate_signature(data, s.offset, 24);
+    std::string name = ElfParser::demangle_symbol(s.name);
+    if (name.size() > 60)
+      name = name.substr(0, 60) + "...";
+    f << "0x" << std::hex << std::setw(8) << std::setfill('0') << s.offset
+      << " " << name << "\n";
+    f << "  SIG: " << sig << "\n";
+  }
+
+  auto decrypted = ElfParser::auto_decrypt_strings(data);
+  if (!decrypted.empty()) {
+    f << "\n=== DECRYPTED DATA (" << std::dec << decrypted.size()
+      << " regions) ===\n";
+    for (const auto &d : decrypted) {
+      f << "Offset: 0x" << std::hex << d.offset << "\n";
+      f << "  Method: " << d.method << "\n";
+      f << "  Key: ";
+      for (size_t i = 0; i < d.key_size && i < 16; i++)
+        f << std::hex << std::setw(2) << std::setfill('0')
+          << (int)d.key_or_info[i] << " ";
+      f << "\n";
+
+      std::string dec_str;
+      for (uint8_t b : d.decrypted) {
+        if (b >= 0x20 && b <= 0x7E)
+          dec_str += (char)b;
+        else if (b == 0)
+          break;
+        else
+          dec_str += '.';
+      }
+      if (!dec_str.empty())
+        f << "  Decrypted: \"" << dec_str << "\"\n";
+      f << "\n";
+    }
+  }
+
+  auto potential_keys = ElfParser::find_encryption_key(data);
+  if (!potential_keys.empty()) {
+    f << "\n=== POTENTIAL ENCRYPTION KEYS ===\n";
+    f << "Found in init functions: ";
+    for (uint8_t k : potential_keys)
+      f << std::hex << std::setw(2) << std::setfill('0') << (int)k << " ";
+    f << "\n";
+  }
+
+  auto entropy_regions = ElfParser::find_high_entropy_regions(data, 256, 7.0);
+  if (!entropy_regions.empty()) {
+    f << "\n=== ENTROPY ANALYSIS (" << std::dec << entropy_regions.size()
+      << " high-entropy regions) ===\n";
+    for (const auto &e : entropy_regions) {
+      f << "Offset: 0x" << std::hex << e.offset << " Size: " << std::dec
+        << e.size << " Entropy: " << std::fixed << std::setprecision(2)
+        << e.entropy;
+      if (e.likely_encrypted)
+        f << " [LIKELY ENCRYPTED]";
+      else if (e.likely_compressed)
+        f << " [LIKELY COMPRESSED]";
+      f << "\n";
+    }
+  }
+
+  auto aes_keys = ElfParser::detect_aes_keys(data);
+  if (!aes_keys.empty()) {
+    f << "\n=== AES KEY DETECTION (" << std::dec << aes_keys.size()
+      << " found) ===\n";
+    for (const auto &k : aes_keys) {
+      f << "Offset: 0x" << std::hex << k.offset << "\n";
+      f << "  Method: " << k.detection_method << "\n";
+      f << "  Confidence: " << std::fixed << std::setprecision(1)
+        << (k.confidence * 100) << "%\n";
+      if (k.key_size > 0) {
+        f << "  Key: ";
+        for (size_t i = 0; i < k.key_size; i++)
+          f << std::hex << std::setw(2) << std::setfill('0') << (int)k.key[i]
+            << " ";
+        f << "\n";
+      }
+    }
+  }
+
+  auto stripped_funcs = ElfParser::find_functions_stripped(data, base_addr);
+  if (!stripped_funcs.empty()) {
+    f << "\n=== DISCOVERED FUNCTIONS (" << std::dec << stripped_funcs.size()
+      << " found) ===\n";
+    size_t func_count = 0;
+    for (const auto &fn : stripped_funcs) {
+      if (func_count++ > 100) {
+        f << "... and " << (stripped_funcs.size() - 100) << " more\n";
+        break;
+      }
+      f << "0x" << std::hex << fn.start_addr << " - 0x" << fn.end_addr;
+      f << " (size: " << std::dec << fn.size
+        << ", stack: " << fn.stack_frame_size
+        << ", calls: " << fn.call_targets.size() << ")\n";
+    }
+  }
+
+  auto stripped_vtables = ElfParser::scan_vtables_stripped(data, base_addr);
+  if (!stripped_vtables.empty()) {
+    f << "\n=== DISCOVERED VTABLES (" << std::dec << stripped_vtables.size()
+      << " found) ===\n";
+    size_t vt_count = 0;
+    for (const auto &vt : stripped_vtables) {
+      if (vt_count++ > 50) {
+        f << "... and " << (stripped_vtables.size() - 50) << " more\n";
+        break;
+      }
+      f << "VTable: 0x" << std::hex << vt.vtable_addr << " (" << std::dec
+        << vt.virtual_functions.size() << " entries)\n";
+    }
+  }
+
+  auto all_xrefs = ElfParser::find_all_string_xrefs(data, base_addr);
+  if (!all_xrefs.empty()) {
+    f << "\n=== STRING REFERENCES (" << std::dec << all_xrefs.size()
+      << " found) ===\n";
+    size_t xref_count = 0;
+    for (const auto &x : all_xrefs) {
+      if (xref_count++ > 200) {
+        f << "... and more\n";
+        break;
+      }
+      std::string val = x.string_value;
+      if (val.size() > 50)
+        val = val.substr(0, 50) + "...";
+      f << "[" << x.ref_type << "] 0x" << std::hex << x.references[0]
+        << " -> \"" << val << "\"\n";
+    }
+  }
+
   f << "\n=== STRINGS (" << std::dec << strings.size() << ") ===\n";
   size_t cnt = 0;
   for (const auto &s : strings) {
-    if (cnt++ > 50000)
+    if (cnt++ > 10000) {
+      f << "... and more strings (limited output)\n";
       break;
+    }
     if (s.value.size() > 200)
       continue;
     bool ok = true;
@@ -210,7 +433,37 @@ void process(const std::string &name, const std::vector<uint8_t> &data,
     auto fixed = SoFixer::repair(data, base);
     mkdir_p(out + "/so");
     write_file(out + "/so/" + oname, fixed);
+
     if (g_pid > 0 && base > 0) {
+      std::cout << "    [DECRYPT] Checking runtime decryption...";
+      std::cout.flush();
+      auto decrypted_regions =
+          RuntimeAnalyzer::find_decrypted_regions(g_pid, base, data);
+      if (!decrypted_regions.empty()) {
+        std::cout << " Found " << decrypted_regions.size()
+                  << " decrypted regions\n";
+        std::cout.flush();
+
+        auto runtime_data =
+            RuntimeAnalyzer::read_decrypted(g_pid, base, data.size());
+        if (!runtime_data.empty()) {
+          mkdir_p(out + "/runtime");
+          write_file(out + "/runtime/" + oname, runtime_data);
+
+          auto runtime_fixed = SoFixer::repair(runtime_data, base);
+          write_file(out + "/runtime/" + oname + ".fixed", runtime_fixed);
+
+          if (!is_garbage(runtime_fixed)) {
+            mkdir_p(out + "/analysis");
+            analyze_elf(runtime_fixed,
+                        out + "/analysis/" + oname + ".runtime.txt", base);
+          }
+        }
+      } else {
+        std::cout << " No runtime decryption detected\n";
+        std::cout.flush();
+      }
+
       std::cout << "    [RELINK] Static relinking...";
       std::cout.flush();
       auto relinked = StaticRelinker::relink(fixed, g_pid, base);
@@ -226,9 +479,10 @@ void process(const std::string &name, const std::vector<uint8_t> &data,
         std::cout.flush();
       }
     }
+
     if (!is_garbage(fixed)) {
       mkdir_p(out + "/analysis");
-      analyze_elf(fixed, out + "/analysis/" + oname + ".txt");
+      analyze_elf(fixed, out + "/analysis/" + oname + ".txt", base);
     }
     return;
   }
@@ -425,12 +679,153 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
     std::cout << "      Captured " << jit_regions.size() << " JIT regions\n";
     std::cout.flush();
   }
+
   std::cout << "    Processing captured modules...\n";
   std::cout.flush();
+
+  std::vector<std::pair<std::string, std::vector<RTTIInfo>>> all_rtti;
+
   for (auto &[name, buf] : accumulated) {
     if (is_garbage(buf))
       continue;
     process(name, buf, out, bases[name]);
+
+    if (ElfParser::is_elf(buf)) {
+      auto rtti = ElfParser::scan_rtti(buf, bases[name]);
+      if (!rtti.empty()) {
+        all_rtti.push_back({name, rtti});
+      }
+    }
+  }
+
+  if (!all_rtti.empty()) {
+    std::cout << "    [VTABLE] Scanning for class instances in heap...\n";
+    std::cout.flush();
+
+    mkdir_p(out + "/instances");
+    std::ofstream instances_file(out + "/instances/vtable_instances.txt");
+    instances_file << "=== VTABLE INSTANCE SCANNER ===\n";
+    instances_file
+        << "Scanning heap for object instances by VTable pointer\n\n";
+
+    size_t total_instances = 0;
+    for (const auto &[lib_name, rtti_list] : all_rtti) {
+      instances_file << "--- Library: " << lib_name << " ---\n";
+
+      for (const auto &r : rtti_list) {
+        if (r.vtable_addr == 0)
+          continue;
+
+        auto instances =
+            RuntimeAnalyzer::find_instances_by_vtable(pid, r.vtable_addr);
+        if (!instances.empty()) {
+          total_instances += instances.size();
+          instances_file << "\nClass: " << r.demangled_name << "\n";
+          instances_file << "VTable: 0x" << std::hex << r.vtable_addr << "\n";
+          instances_file << "Instances found: " << std::dec << instances.size()
+                         << "\n";
+
+          for (size_t i = 0; i < instances.size() && i < 10; i++) {
+            instances_file << "  [" << i << "] 0x" << std::hex << instances[i]
+                           << "\n";
+          }
+          if (instances.size() > 10) {
+            instances_file << "  ... and " << std::dec
+                           << (instances.size() - 10) << " more\n";
+          }
+        }
+      }
+      instances_file << "\n";
+    }
+
+    instances_file << "\n=== SUMMARY ===\n";
+    instances_file << "Total classes scanned: " << std::dec;
+    size_t class_count = 0;
+    for (const auto &p : all_rtti)
+      class_count += p.second.size();
+    instances_file << class_count << "\n";
+    instances_file << "Total instances found: " << total_instances << "\n";
+
+    std::cout << "      Found " << total_instances << " object instances\n";
+    std::cout.flush();
+  }
+
+  // DEX Dumping
+  std::cout << "    [DEX] Scanning for DEX files...\n";
+  std::cout.flush();
+
+  auto dex_files = DexDumper::scan_dex_in_memory(pid);
+  if (!dex_files.empty()) {
+    std::cout << "      Found " << dex_files.size() << " DEX files\n";
+    std::cout.flush();
+
+    mkdir_p(out + "/dex");
+    mkdir_p(out + "/dex/raw");
+    mkdir_p(out + "/dex/fixed");
+
+    int dex_count = 0;
+    for (size_t i = 0; i < dex_files.size(); i++) {
+      const auto &dex_info = dex_files[i];
+      std::cout << "      [" << i << "] ";
+      if (dex_info.is_compact)
+        std::cout << "(CompactDex) ";
+      else if (dex_info.is_vdex)
+        std::cout << "(VDEX) ";
+      else if (dex_info.is_oat)
+        std::cout << "(OAT) ";
+      std::cout << "0x" << std::hex << dex_info.base_addr
+                << " size=" << std::dec << dex_info.size << "\n";
+      std::cout.flush();
+
+      // Dump raw DEX
+      auto raw_data =
+          DexParser::dump_dex(pid, dex_info.base_addr, dex_info.size);
+      if (raw_data.empty())
+        continue;
+
+      std::string base_name = "classes";
+      if (!dex_info.location.empty()) {
+        size_t pos = dex_info.location.rfind('/');
+        if (pos != std::string::npos)
+          base_name = dex_info.location.substr(pos + 1);
+        pos = base_name.find(".dex");
+        if (pos != std::string::npos)
+          base_name = base_name.substr(0, pos);
+      }
+      base_name += "_" + std::to_string(dex_count++);
+
+      // Save raw
+      write_file(out + "/dex/raw/" + base_name + ".dex", raw_data);
+
+      // Handle VDEX container
+      if (dex_info.is_vdex) {
+        auto extracted = DexParser::extract_dex_from_vdex(raw_data);
+        for (size_t j = 0; j < extracted.size(); j++) {
+          DexParser::fix_checksum(extracted[j]);
+          std::string vdex_name = base_name + "_v" + std::to_string(j) + ".dex";
+          write_file(out + "/dex/fixed/" + vdex_name, extracted[j]);
+        }
+        continue;
+      }
+
+      // Convert CompactDex if needed
+      std::vector<uint8_t> fixed_data;
+      if (dex_info.is_compact || DexParser::is_compact_dex(raw_data)) {
+        fixed_data = DexParser::convert_compact_dex_to_dex(raw_data);
+      } else {
+        fixed_data = raw_data;
+      }
+
+      // Repair checksum
+      DexParser::fix_checksum(fixed_data);
+      write_file(out + "/dex/fixed/" + base_name + ".dex", fixed_data);
+    }
+
+    std::cout << "      Saved " << dex_count << " DEX files\n";
+    std::cout.flush();
+  } else {
+    std::cout << "      No DEX files found in memory\n";
+    std::cout.flush();
   }
 }
 
@@ -453,7 +848,9 @@ void cmd_dump(const std::string &pkg, ArchMode arch) {
   }
 
   if (!ZygoteTracer::attach_zygote(zygote_pid)) {
-    std::cout << "    [!] Failed to initialize - run as root\n";
+    std::cout << "    [!] Failed to initialize - see error details above\n";
+    std::cout << "    [!] Ensure you are root (su) and the process is not "
+                 "already traced\n";
     return;
   }
 
@@ -512,6 +909,9 @@ void cmd_dump(const std::string &pkg, ArchMode arch) {
 }
 
 int main(int argc, char *argv[]) {
+  // Register signal handlers for cleanup
+  register_signal_handlers();
+
   if (argc < 3) {
     std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64>\n";
     return 1;
@@ -545,6 +945,7 @@ int main(int argc, char *argv[]) {
     cmd_dump(pkg, arch);
   } else {
     std::cout << "Unknown command: " << cmd << "\n";
+    std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64>\n";
     return 1;
   }
   return 0;
