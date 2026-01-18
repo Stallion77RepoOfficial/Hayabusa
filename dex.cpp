@@ -9,38 +9,54 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-// ULEB128 decoding
-uint32_t DexParser::read_uleb128(const uint8_t *data, size_t *bytes_read) {
+
+uint32_t DexParser::read_uleb128(const uint8_t *data, size_t max_len,
+                                 size_t *bytes_read) {
   uint32_t result = 0;
   int shift = 0;
   size_t count = 0;
-  uint8_t byte;
-  do {
+  uint8_t byte = 0;
+  while (count < max_len) {
     byte = data[count];
     result |= (uint32_t)(byte & 0x7F) << shift;
     shift += 7;
     count++;
-  } while (byte & 0x80);
+    if ((byte & 0x80) == 0) {
+      if (bytes_read)
+        *bytes_read = count;
+      return result;
+    }
+    if (shift >= 32)
+      break;
+  }
   if (bytes_read)
-    *bytes_read = count;
+    *bytes_read = 0;
   return result;
 }
 
-int32_t DexParser::read_sleb128(const uint8_t *data, size_t *bytes_read) {
+int32_t DexParser::read_sleb128(const uint8_t *data, size_t max_len,
+                                size_t *bytes_read) {
   int32_t result = 0;
   int shift = 0;
   size_t count = 0;
-  uint8_t byte;
-  do {
+  uint8_t byte = 0;
+  while (count < max_len) {
     byte = data[count];
     result |= (int32_t)(byte & 0x7F) << shift;
     shift += 7;
     count++;
-  } while (byte & 0x80);
-  if ((shift < 32) && (byte & 0x40))
-    result |= -(1 << shift);
+    if ((byte & 0x80) == 0) {
+      if ((shift < 32) && (byte & 0x40))
+        result |= -(1 << shift);
+      if (bytes_read)
+        *bytes_read = count;
+      return result;
+    }
+    if (shift >= 32)
+      break;
+  }
   if (bytes_read)
-    *bytes_read = count;
+    *bytes_read = 0;
   return result;
 }
 
@@ -83,7 +99,7 @@ std::string DexParser::get_dex_version(const std::vector<uint8_t> &data) {
   return std::string(ver);
 }
 
-// Adler32 checksum calculation
+
 uint32_t DexParser::calculate_adler32(const uint8_t *data, size_t len) {
   uint32_t a = 1, b = 0;
   for (size_t i = 0; i < len; i++) {
@@ -93,7 +109,7 @@ uint32_t DexParser::calculate_adler32(const uint8_t *data, size_t len) {
   return (b << 16) | a;
 }
 
-// Simple SHA1 implementation
+
 void DexParser::calculate_sha1(const uint8_t *data, size_t len, uint8_t *out) {
   uint32_t h0 = 0x67452301;
   uint32_t h1 = 0xEFCDAB89;
@@ -171,12 +187,12 @@ bool DexParser::fix_checksum(std::vector<uint8_t> &data) {
 
   DexHeader *hdr = reinterpret_cast<DexHeader *>(data.data());
 
-  // Calculate and set signature (SHA1 of data after signature)
+  
   if (data.size() > 32) {
     calculate_sha1(data.data() + 32, data.size() - 32, hdr->signature);
   }
 
-  // Calculate and set checksum (Adler32 of data after checksum field)
+  
   if (data.size() > 12) {
     hdr->checksum = calculate_adler32(data.data() + 12, data.size() - 12);
   }
@@ -203,7 +219,7 @@ std::vector<DexInfo> DexParser::find_dex_in_memory(int pid) {
 
   std::string line;
   while (std::getline(maps, line)) {
-    // Look for dalvik, app, or dex regions
+    
     bool is_dex_region = false;
     if (line.find("dalvik") != std::string::npos ||
         line.find("/data/app") != std::string::npos ||
@@ -216,7 +232,7 @@ std::vector<DexInfo> DexParser::find_dex_in_memory(int pid) {
       is_dex_region = true;
     }
 
-    // Only scan readable regions
+    
     if (line.find("r-") == std::string::npos &&
         line.find("r--") == std::string::npos)
       continue;
@@ -230,7 +246,7 @@ std::vector<DexInfo> DexParser::find_dex_in_memory(int pid) {
     if (size < sizeof(DexHeader) || size > 512 * 1024 * 1024)
       continue;
 
-    // Scan for DEX magic in this region
+    
     auto addrs = scan_for_dex_magic(pid, start, end);
     for (uint64_t addr : addrs) {
       std::vector<uint8_t> header_buf(sizeof(DexHeader));
@@ -250,10 +266,10 @@ std::vector<DexInfo> DexParser::find_dex_in_memory(int pid) {
         info.size = hdr->file_size;
         info.checksum = hdr->checksum;
       } else if (info.is_vdex) {
-        // Read more for VDEX
+        
         std::vector<uint8_t> vdex_buf(1024);
         if (ProcessTracer::read_memory(pid, addr, vdex_buf.data(), 1024)) {
-          info.size = size; // Use region size for VDEX
+          info.size = size; 
         }
       } else if (is_dex(header_buf)) {
         const DexHeader *hdr =
@@ -265,11 +281,11 @@ std::vector<DexInfo> DexParser::find_dex_in_memory(int pid) {
         continue;
       }
 
-      // Validate size
+      
       if (info.size < sizeof(DexHeader) || info.size > 256 * 1024 * 1024)
         continue;
 
-      // Extract location from maps line
+      
       size_t path_pos = line.find('/');
       if (path_pos != std::string::npos) {
         info.location = line.substr(path_pos);
@@ -288,7 +304,7 @@ std::vector<DexInfo> DexParser::find_dex_in_memory(int pid) {
 std::vector<uint64_t> DexParser::scan_for_dex_magic(int pid, uint64_t start,
                                                     uint64_t end) {
   std::vector<uint64_t> results;
-  size_t chunk_size = 4096 * 16; // 64KB chunks
+  size_t chunk_size = 4096 * 16; 
   std::vector<uint8_t> buf(chunk_size);
 
   for (uint64_t addr = start; addr < end; addr += chunk_size) {
@@ -297,15 +313,15 @@ std::vector<uint64_t> DexParser::scan_for_dex_magic(int pid, uint64_t start,
       continue;
 
     for (size_t i = 0; i + 8 <= to_read; i++) {
-      // Check for DEX magic
+      
       if (memcmp(buf.data() + i, DEX_MAGIC, 4) == 0) {
         results.push_back(addr + i);
       }
-      // Check for CompactDex magic
+      
       else if (memcmp(buf.data() + i, CDEX_MAGIC, 4) == 0) {
         results.push_back(addr + i);
       }
-      // Check for VDEX magic
+      
       else if (memcmp(buf.data() + i, VDEX_MAGIC, 4) == 0) {
         results.push_back(addr + i);
       }
@@ -323,7 +339,7 @@ std::vector<uint8_t> DexParser::dump_dex(int pid, uint64_t addr, size_t size) {
 }
 
 std::vector<uint8_t> DexParser::dump_dex_by_header(int pid, uint64_t addr) {
-  // Read header first
+  
   std::vector<uint8_t> header_buf(sizeof(DexHeader));
   if (!ProcessTracer::read_memory(pid, addr, header_buf.data(),
                                   sizeof(DexHeader)))
@@ -356,12 +372,12 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
   const CompactDexHeader *chdr =
       reinterpret_cast<const CompactDexHeader *>(cdex.data());
 
-  // CDEX uses different encoding - need to convert properly:
-  // 1. String IDs use ULEB128 delta encoding (not absolute offsets)
-  // 2. All offsets need adjustment after conversion
-  // 3. Data section must be copied with offset adjustments
+  
+  
+  
+  
 
-  // First, decode all string ID deltas to get absolute offsets
+  
   std::vector<uint32_t> string_data_offsets;
   if (chdr->string_ids_size > 0 && chdr->string_ids_off < cdex.size()) {
     const uint8_t *ptr = cdex.data() + chdr->string_ids_off;
@@ -370,20 +386,22 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
 
     for (uint32_t i = 0; i < chdr->string_ids_size && ptr < end; i++) {
       size_t bytes_read;
-      uint32_t delta = read_uleb128(ptr, &bytes_read);
+      uint32_t delta = read_uleb128(ptr, end - ptr, &bytes_read);
+      if (bytes_read == 0)
+        break;
       ptr += bytes_read;
       current_offset += delta;
       string_data_offsets.push_back(current_offset);
     }
   }
 
-  // Calculate new DEX layout
-  // Standard DEX structure: Header | String IDs | Type IDs | Proto IDs | Field
-  // IDs | Method IDs | Class Defs | Data
+  
+  
+  
 
   uint32_t new_header_size = sizeof(DexHeader);
 
-  // Calculate where each section will go
+  
   uint32_t string_ids_off = new_header_size;
   uint32_t string_ids_size = chdr->string_ids_size * sizeof(DexStringId);
 
@@ -403,22 +421,22 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
   uint32_t class_defs_size = chdr->class_defs_size * sizeof(DexClassDef);
 
   uint32_t data_off = class_defs_off + class_defs_size;
-  // Align data section to 4 bytes
+  
   data_off = (data_off + 3) & ~3;
 
-  // Calculate offset delta for data section
-  // In CDEX, data starts at chdr->data_off
-  // In new DEX, data starts at data_off
+  
+  
+  
   int32_t data_delta = (int32_t)data_off - (int32_t)chdr->data_off;
 
-  // Calculate total size
+  
   uint32_t data_size = chdr->data_size;
   uint32_t file_size = data_off + data_size;
 
-  // Allocate output buffer
+  
   std::vector<uint8_t> dex(file_size, 0);
 
-  // Build DEX header
+  
   DexHeader *hdr = reinterpret_cast<DexHeader *>(dex.data());
   memcpy(hdr->magic, "dex\n039\0", 8);
   hdr->header_size = 0x70;
@@ -442,12 +460,12 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
   hdr->data_off = data_off;
   hdr->file_size = file_size;
 
-  // Convert string IDs from delta to absolute format
+  
   DexStringId *str_ids =
       reinterpret_cast<DexStringId *>(dex.data() + string_ids_off);
   for (uint32_t i = 0;
        i < chdr->string_ids_size && i < string_data_offsets.size(); i++) {
-    // Adjust offset from CDEX data section to new DEX data section
+    
     uint32_t orig_off = string_data_offsets[i];
     if (orig_off >= chdr->data_off) {
       str_ids[i].string_data_off = orig_off + data_delta;
@@ -456,15 +474,15 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
     }
   }
 
-  // Copy Type IDs (straight copy, no offset adjustment needed - they're
-  // indices)
+  
+  
   if (chdr->type_ids_size > 0 &&
       chdr->type_ids_off + type_ids_size <= cdex.size()) {
     memcpy(dex.data() + type_ids_off, cdex.data() + chdr->type_ids_off,
            type_ids_size);
   }
 
-  // Copy Proto IDs (need to adjust parameters_off)
+  
   if (chdr->proto_ids_size > 0 &&
       chdr->proto_ids_off + proto_ids_size <= cdex.size()) {
     memcpy(dex.data() + proto_ids_off, cdex.data() + chdr->proto_ids_off,
@@ -478,21 +496,21 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
     }
   }
 
-  // Copy Field IDs (straight copy - only indices)
+  
   if (chdr->field_ids_size > 0 &&
       chdr->field_ids_off + field_ids_size <= cdex.size()) {
     memcpy(dex.data() + field_ids_off, cdex.data() + chdr->field_ids_off,
            field_ids_size);
   }
 
-  // Copy Method IDs (straight copy - only indices)
+  
   if (chdr->method_ids_size > 0 &&
       chdr->method_ids_off + method_ids_size <= cdex.size()) {
     memcpy(dex.data() + method_ids_off, cdex.data() + chdr->method_ids_off,
            method_ids_size);
   }
 
-  // Copy Class Defs (need to adjust multiple offsets)
+  
   if (chdr->class_defs_size > 0 &&
       chdr->class_defs_off + class_defs_size <= cdex.size()) {
     memcpy(dex.data() + class_defs_off, cdex.data() + chdr->class_defs_off,
@@ -519,16 +537,16 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
     }
   }
 
-  // Copy data section
+  
   if (chdr->data_off + data_size <= cdex.size()) {
     memcpy(dex.data() + data_off, cdex.data() + chdr->data_off, data_size);
   } else if (chdr->data_off < cdex.size()) {
-    // Partial copy if data_size is larger than remaining file
+    
     size_t available = cdex.size() - chdr->data_off;
     memcpy(dex.data() + data_off, cdex.data() + chdr->data_off, available);
   }
 
-  // Fix map_list offsets if present
+  
   if (hdr->map_off > 0 && hdr->map_off + 4 <= file_size) {
     uint32_t *map_size_ptr =
         reinterpret_cast<uint32_t *>(dex.data() + hdr->map_off);
@@ -538,7 +556,7 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
       DexMapItem *items =
           reinterpret_cast<DexMapItem *>(dex.data() + hdr->map_off + 4);
       for (uint32_t i = 0; i < map_count; i++) {
-        // Adjust offsets in map items
+        
         switch (items[i].type) {
         case kDexTypeHeaderItem:
           items[i].offset = 0;
@@ -562,7 +580,7 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
           items[i].offset = class_defs_off;
           break;
         default:
-          // Data section items
+          
           if (items[i].offset >= chdr->data_off) {
             items[i].offset += data_delta;
           }
@@ -572,7 +590,7 @@ DexParser::convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex) {
     }
   }
 
-  // Fix checksums
+  
   fix_checksum(dex);
   return dex;
 }
@@ -584,8 +602,8 @@ DexParser::extract_dex_from_vdex(const std::vector<uint8_t> &vdex) {
   if (!is_vdex(vdex) || vdex.size() < 8)
     return dex_files;
 
-  // Parse VDEX version to determine format
-  // Version format: "XXX\0" where XXX is 3 digits
+  
+  
   int vdex_version = 0;
   if (vdex[4] >= '0' && vdex[4] <= '9' && vdex[5] >= '0' && vdex[5] <= '9' &&
       vdex[6] >= '0' && vdex[6] <= '9') {
@@ -596,9 +614,9 @@ DexParser::extract_dex_from_vdex(const std::vector<uint8_t> &vdex) {
   size_t dex_section_start = 0;
   uint32_t num_dex_files = 0;
 
-  // Version-specific header parsing
+  
   if (vdex_version >= 21) {
-    // Android 11+ (v021-v027+) uses section-based format
+    
     if (vdex.size() < sizeof(VdexHeader_021))
       return dex_files;
 
@@ -607,9 +625,9 @@ DexParser::extract_dex_from_vdex(const std::vector<uint8_t> &vdex) {
     uint32_t num_sections = hdr->number_of_sections;
 
     if (num_sections > 10)
-      num_sections = 10; // Sanity check
+      num_sections = 10; 
 
-    // Read section headers
+    
     size_t section_headers_off = sizeof(VdexHeader_021);
     for (uint32_t i = 0;
          i < num_sections &&
@@ -622,13 +640,13 @@ DexParser::extract_dex_from_vdex(const std::vector<uint8_t> &vdex) {
 
       if (sec->section_kind == kVdexSectionDexFile) {
         dex_section_start = sec->section_offset;
-        // In v021+ the DEX section contains multiple DEX files
-        // We need to scan for magics within this section
+        
+        
         break;
       }
     }
   } else if (vdex_version >= 19) {
-    // Android 10 (v019-v020)
+    
     if (vdex.size() < sizeof(VdexHeader_019))
       return dex_files;
 
@@ -636,14 +654,14 @@ DexParser::extract_dex_from_vdex(const std::vector<uint8_t> &vdex) {
         reinterpret_cast<const VdexHeader_019 *>(vdex.data());
     num_dex_files = hdr->number_of_dex_files;
 
-    // DEX checksums follow the header
+    
     size_t checksums_off = sizeof(VdexHeader_019);
-    // DEX files start after checksums
+    
     dex_section_start = checksums_off + num_dex_files * sizeof(uint32_t);
-    // Align to 4 bytes
+    
     dex_section_start = (dex_section_start + 3) & ~3;
   } else if (vdex_version >= 6) {
-    // Android 8-9 (v006-v018)
+    
     if (vdex.size() < sizeof(VdexHeader_006))
       return dex_files;
 
@@ -651,18 +669,18 @@ DexParser::extract_dex_from_vdex(const std::vector<uint8_t> &vdex) {
         reinterpret_cast<const VdexHeader_006 *>(vdex.data());
     num_dex_files = hdr->number_of_dex_files;
 
-    // DEX checksums follow the header
+    
     size_t checksums_off = sizeof(VdexHeader_006);
-    // DEX files start after checksums
+    
     dex_section_start = checksums_off + num_dex_files * sizeof(uint32_t);
-    // Align to 4 bytes
+    
     dex_section_start = (dex_section_start + 3) & ~3;
   } else {
-    // Unknown version, fall back to magic scan
+    
     dex_section_start = 16;
   }
 
-  // Scan for DEX/CDEX magics starting from dex_section_start
+  
   for (size_t i = dex_section_start; i + sizeof(DexHeader) < vdex.size(); i++) {
     bool is_dex_magic = (memcmp(vdex.data() + i, DEX_MAGIC, 4) == 0);
     bool is_cdex_magic = (memcmp(vdex.data() + i, CDEX_MAGIC, 4) == 0);
@@ -670,7 +688,7 @@ DexParser::extract_dex_from_vdex(const std::vector<uint8_t> &vdex) {
     if (!is_dex_magic && !is_cdex_magic)
       continue;
 
-    // Read DEX header to get size
+    
     std::vector<uint8_t> dex_buf(vdex.begin() + i, vdex.end());
 
     size_t dex_size = 0;
@@ -684,31 +702,31 @@ DexParser::extract_dex_from_vdex(const std::vector<uint8_t> &vdex) {
       dex_size = dhdr->file_size;
     }
 
-    // Validate size
+    
     if (dex_size < sizeof(DexHeader) || dex_size > 256 * 1024 * 1024)
       continue;
 
     if (dex_size > vdex.size() - i)
-      dex_size = vdex.size() - i; // Truncate to available
+      dex_size = vdex.size() - i; 
 
-    // Extract DEX
+    
     std::vector<uint8_t> dex(vdex.begin() + i, vdex.begin() + i + dex_size);
 
-    // Convert CompactDex if needed
+    
     if (is_cdex_magic) {
       dex = convert_compact_dex_to_dex(dex);
     }
 
-    // Verify and fix checksum
+    
     if (dex.size() >= sizeof(DexHeader)) {
       fix_checksum(dex);
       dex_files.push_back(dex);
     }
 
-    // Skip past this DEX
+    
     i += dex_size - 1;
 
-    // Stop if we've found expected number of DEX files
+    
     if (num_dex_files > 0 && dex_files.size() >= num_dex_files)
       break;
   }
@@ -723,7 +741,7 @@ DexParser::extract_dex_from_oat(const std::vector<uint8_t> &oat) {
   if (!is_oat(oat))
     return dex_files;
 
-  // Scan for DEX magics within OAT
+  
   for (size_t i = sizeof(OatHeader); i + sizeof(DexHeader) < oat.size(); i++) {
     if (memcmp(oat.data() + i, DEX_MAGIC, 4) == 0) {
       const DexHeader *dhdr =
@@ -763,9 +781,13 @@ std::string DexParser::get_string_by_idx(const std::vector<uint8_t> &data,
   if (string_off >= data.size())
     return "";
 
-  // Read ULEB128 length
+  
   size_t len_bytes;
-  uint32_t len = read_uleb128(data.data() + string_off, &len_bytes);
+  uint32_t len =
+      read_uleb128(data.data() + string_off, data.size() - string_off,
+                   &len_bytes);
+  if (len_bytes == 0)
+    return "";
 
   if (string_off + len_bytes + len > data.size())
     return "";
@@ -816,17 +838,31 @@ DexParser::get_classes(const std::vector<uint8_t> &data) {
     info.super_class = get_type_by_idx(data, class_defs[i].superclass_idx);
     info.class_data_off = class_defs[i].class_data_off;
 
-    // Parse class data for method counts
+    
     if (info.class_data_off > 0 && info.class_data_off < data.size()) {
       const uint8_t *class_data = data.data() + info.class_data_off;
-      size_t bytes;
-      uint32_t static_fields = read_uleb128(class_data, &bytes);
-      class_data += bytes;
-      uint32_t instance_fields = read_uleb128(class_data, &bytes);
-      class_data += bytes;
-      info.direct_methods_count = read_uleb128(class_data, &bytes);
-      class_data += bytes;
-      info.virtual_methods_count = read_uleb128(class_data, &bytes);
+      size_t remaining = data.size() - info.class_data_off;
+      auto read_field = [&](uint32_t &out) -> bool {
+        size_t bytes = 0;
+        out = read_uleb128(class_data, remaining, &bytes);
+        if (bytes == 0 || bytes > remaining)
+          return false;
+        class_data += bytes;
+        remaining -= bytes;
+        return true;
+      };
+
+      uint32_t static_fields = 0;
+      uint32_t instance_fields = 0;
+      if (read_field(static_fields) && read_field(instance_fields) &&
+          read_field(info.direct_methods_count) &&
+          read_field(info.virtual_methods_count)) {
+        (void)static_fields;
+        (void)instance_fields;
+      } else {
+        info.direct_methods_count = 0;
+        info.virtual_methods_count = 0;
+      }
     }
 
     classes.push_back(info);
@@ -853,7 +889,7 @@ DexParser::get_strings(const std::vector<uint8_t> &data) {
   return strings;
 }
 
-// DexDumper implementation
+
 
 std::vector<DexInfo> DexDumper::scan_dex_in_memory(int pid) {
   return DexParser::find_dex_in_memory(pid);
@@ -866,19 +902,19 @@ std::vector<uint8_t> DexDumper::dump_dex_file(int pid, const DexInfo &info) {
   if (data.empty())
     return data;
 
-  // Convert CompactDex to standard DEX
+  
   if (info.is_compact || DexParser::is_compact_dex(data)) {
     data = DexParser::convert_compact_dex_to_dex(data);
   }
 
-  // Extract from VDEX container
+  
   if (info.is_vdex || DexParser::is_vdex(data)) {
     auto dex_files = DexParser::extract_dex_from_vdex(data);
     if (!dex_files.empty())
-      return dex_files[0]; // Return first DEX
+      return dex_files[0]; 
   }
 
-  // Repair checksum
+  
   DexParser::fix_checksum(data);
 
   return data;
@@ -893,7 +929,7 @@ int DexDumper::dump_all_dex(int pid, const std::string &output_dir) {
     if (data.empty())
       continue;
 
-    // If VDEX, might have multiple DEX files
+    
     if (dex_files[i].is_vdex) {
       auto vdex_data =
           DexParser::dump_dex(pid, dex_files[i].base_addr, dex_files[i].size);
@@ -929,7 +965,7 @@ bool DexDumper::wait_for_dex_load(int pid, const std::string &dex_name,
       if (dex.location.find(dex_name) != std::string::npos)
         return true;
     }
-    usleep(100000); // 100ms
+    usleep(100000); 
   }
 
   return false;
@@ -937,14 +973,14 @@ bool DexDumper::wait_for_dex_load(int pid, const std::string &dex_name,
 
 std::vector<uint8_t> DexDumper::dump_after_decrypt(int pid, uint64_t dex_addr,
                                                    size_t size) {
-  // Wait a bit for decryption to complete
-  usleep(500000); // 500ms
+  
+  usleep(500000); 
 
   auto data = DexParser::dump_dex(pid, dex_addr, size);
   if (data.empty())
     return data;
 
-  // Repair and return
+  
   return DexParser::repair_dex(data);
 }
 
@@ -963,7 +999,7 @@ std::vector<std::string> DexDumper::find_vdex_files(int pid) {
         if (space_pos != std::string::npos)
           path = path.substr(0, space_pos);
 
-        // Avoid duplicates
+        
         if (std::find(vdex_files.begin(), vdex_files.end(), path) ==
             vdex_files.end()) {
           vdex_files.push_back(path);
@@ -1005,7 +1041,7 @@ std::vector<std::string> DexDumper::find_oat_files(int pid) {
 std::vector<uint64_t> DexDumper::find_dex_file_objects(int pid) {
   std::vector<uint64_t> dex_objects;
 
-  // Use ARTHooker to find runtime and ClassLinker
+  
   auto runtime = ARTHooker::find_art_runtime(pid);
   if (runtime.class_linker_addr == 0)
     return dex_objects;
@@ -1014,7 +1050,7 @@ std::vector<uint64_t> DexDumper::find_dex_file_objects(int pid) {
   size_t ptr_size = is64 ? 8 : 4;
   int sdk = ARTHooker::get_sdk_version(pid);
 
-  // Find libart.so base for offset discovery
+  
   uint64_t libart_base = 0;
   auto ranges = ProcessTracer::get_library_ranges(pid);
   for (const auto &r : ranges) {
@@ -1024,18 +1060,18 @@ std::vector<uint64_t> DexDumper::find_dex_file_objects(int pid) {
     }
   }
 
-  // Get offsets dynamically or from config/fallback
+  
   ARTOffsets offsets = ARTOffsetFinder::discover_offsets(
       pid, runtime.runtime_addr, libart_base, sdk);
 
   if (!offsets.valid) {
-    // If discovery failed completely, we can't proceed safely
-    // But we can try fallback again just in case discover_offsets didn't return
-    // them on failure (it should)
+    
+    
+    
     offsets = ARTOffsetFinder::get_fallback_offsets(sdk, is64);
   }
 
-  // Read dex_caches_
+  
   uint64_t dex_caches_ptr = 0;
   ProcessTracer::read_memory(
       pid, runtime.class_linker_addr + offsets.classlinker_dex_caches,
@@ -1044,8 +1080,8 @@ std::vector<uint64_t> DexDumper::find_dex_file_objects(int pid) {
   if (dex_caches_ptr == 0)
     return dex_objects;
 
-  // dex_caches_ is typically a std::list or std::vector of GcRoot<DexCache>
-  // Read the size and iterate
+  
+  
   uint64_t caches_data = 0;
   uint64_t caches_size = 0;
   ProcessTracer::read_memory(pid, dex_caches_ptr, &caches_data, ptr_size);
@@ -1055,7 +1091,7 @@ std::vector<uint64_t> DexDumper::find_dex_file_objects(int pid) {
   if (caches_data == 0 || caches_size == 0 || caches_size > 10000)
     return dex_objects;
 
-  // Iterate through DexCache entries
+  
   for (uint64_t i = 0; i < caches_size && dex_objects.size() < 1000; i++) {
     uint64_t cache_entry = 0;
     ProcessTracer::read_memory(pid, caches_data + i * ptr_size, &cache_entry,
@@ -1064,19 +1100,19 @@ std::vector<uint64_t> DexDumper::find_dex_file_objects(int pid) {
     if (cache_entry == 0 || cache_entry < 0x1000)
       continue;
 
-    // DexCache has dex_file_ pointer
+    
     uint64_t dex_file = 0;
     ProcessTracer::read_memory(pid, cache_entry + offsets.dexcache_dex_file,
                                &dex_file, ptr_size);
 
     if (dex_file != 0 && dex_file > 0x1000) {
-      // Validate it looks like a DexFile by reading header pointer
-      // DexFile has begin_ pointer to dex header at offset 0
+      
+      
       uint64_t begin_ptr = 0;
       ProcessTracer::read_memory(pid, dex_file, &begin_ptr, ptr_size);
 
       if (begin_ptr != 0) {
-        // Check for DEX magic at begin_
+        
         uint8_t magic[4];
         if (ProcessTracer::read_memory(pid, begin_ptr, magic, 4)) {
           if (memcmp(magic, "dex\n", 4) == 0 || memcmp(magic, "cdex", 4) == 0) {
@@ -1087,7 +1123,7 @@ std::vector<uint64_t> DexDumper::find_dex_file_objects(int pid) {
     }
   }
 
-  // Also scan boot class path for additional DexFiles
+  
   uint64_t bcp_ptr = 0;
   ProcessTracer::read_memory(
       pid, runtime.class_linker_addr + offsets.classlinker_boot_class_path,

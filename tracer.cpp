@@ -9,7 +9,6 @@
 #include <fstream>
 #include <iostream>
 #include <linux/ptrace.h>
-#include <mutex>
 #include <set>
 #include <signal.h>
 #include <sstream>
@@ -38,9 +37,8 @@ ssize_t process_vm_writev(pid_t pid, const struct iovec *local_iov,
 
 static ArchMode g_arch = ArchMode::ARM64;
 
-// Global tracking of attached PIDs for cleanup on signal/exit
+
 static std::set<int> g_attached_zygote_pids;
-static std::mutex g_attached_mutex;
 
 void ZygoteTracer::register_attached_pid(int pid) {
   g_attached_zygote_pids.insert(pid);
@@ -550,7 +548,7 @@ std::vector<FunctionBoundary> linear_sweep(const uint8_t *code, size_t size,
     return linear_sweep_arm32(code, size, base);
 }
 
-} // namespace InstructionDecoder
+} 
 
 int ZygoteTracer::find_zygote_pid() {
   DIR *d = opendir("/proc");
@@ -593,12 +591,12 @@ bool ZygoteTracer::attach_zygote(int zygote_pid) {
               std::cout << "    [!] Found zombie Hayabusa instance (PID: "
                         << tpid << "), killing it...\n";
               kill(tpid, SIGKILL);
-              sleep(1); // Give it a moment to die
-              // Retry attach
+              sleep(1); 
+              
               if (ptrace(PTRACE_ATTACH, zygote_pid, nullptr, nullptr) == 0) {
                 std::cout << "    [+] Successfully recovered and attached to "
                              "Zygote.\n";
-                // CRITICAL: Register immediately for cleanup on signal
+                
                 register_attached_pid(zygote_pid);
                 int status;
                 waitpid(zygote_pid, &status, 0);
@@ -626,7 +624,7 @@ bool ZygoteTracer::attach_zygote(int zygote_pid) {
     return false;
   }
 
-  // CRITICAL: Register immediately for cleanup on signal
+  
   register_attached_pid(zygote_pid);
 
   int status;
@@ -649,14 +647,14 @@ bool ZygoteTracer::attach_zygote(int zygote_pid) {
 }
 
 int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
-  // Note: zygote_pid already registered in attach_zygote()
+  
   ptrace(PTRACE_CONT, zygote_pid, nullptr, nullptr);
 
-  // Track all zygote PIDs (main + children)
+  
   std::set<int> zygote_pids;
   zygote_pids.insert(zygote_pid);
 
-  // Find all zygote processes (zygote, zygote64, webview_zygote, etc.)
+  
   DIR *proc_dir = opendir("/proc");
   if (proc_dir) {
     struct dirent *ent;
@@ -668,7 +666,7 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
       std::string cmdline;
       std::getline(cmdfile, cmdline);
       if (cmdline.find("zygote") != std::string::npos) {
-        // Try to attach to this zygote too
+        
         if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) == 0) {
           int status;
           waitpid(pid, &status, 0);
@@ -677,7 +675,7 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
           ptrace(PTRACE_SETOPTIONS, pid, nullptr, opts);
           ptrace(PTRACE_CONT, pid, nullptr, nullptr);
           zygote_pids.insert(pid);
-          register_attached_pid(pid); // Track for cleanup
+          register_attached_pid(pid); 
           std::cout << "    [DEBUG] Attached to secondary Zygote: " << pid
                     << "\n";
         } else {
@@ -701,7 +699,7 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
     int pid = waitpid(-1, &status, __WALL | WNOHANG);
 
     if (pid > 0) {
-      // Log every event
+      
       if (WIFSTOPPED(status)) {
         std::cout << "    [TRACE] PID: " << pid
                   << " Stopped. Signal: " << WSTOPSIG(status);
@@ -717,7 +715,7 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
       }
 
       if (zygote_pids.count(pid)) {
-        // Zygote Event
+        
         if (WIFSTOPPED(status)) {
           int sig = WSTOPSIG(status);
           int injection_sig = 0;
@@ -737,7 +735,7 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
                 std::cout << "    [DEBUG] Fork detected! Parent: " << pid
                           << " -> New Child: " << child_pid << "\n";
 
-                // Consume initial stop of child and let it run
+                
                 int child_status;
                 waitpid(child_pid, &child_status, __WALL);
                 ptrace(PTRACE_CONT, child_pid, nullptr, nullptr);
@@ -745,10 +743,10 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
               }
             }
           } else if (sig != SIGSTOP) {
-            // Pass signals through!
+            
             injection_sig = sig;
           }
-          // Resume Zygote immediately
+          
           ptrace(PTRACE_CONT, pid, nullptr, (void *)(long)injection_sig);
         } else {
           if (WIFEXITED(status) || WIFSIGNALED(status)) {
@@ -756,31 +754,31 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
           }
         }
       } else if (pending_children.count(pid)) {
-        // Event from pending child
+        
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
           pending_children.erase(pid);
         } else if (WIFSTOPPED(status)) {
-          // Just resume it, we are just watching cmdline
+          
           ptrace(PTRACE_CONT, pid, nullptr,
                  (void *)(long)(WSTOPSIG(status) == SIGTRAP
                                     ? 0
                                     : WSTOPSIG(status)));
         }
       } else {
-        // Unknown PID?
+        
         if (WIFSTOPPED(status))
           ptrace(PTRACE_CONT, pid, nullptr, 0);
       }
     } else {
-      usleep(10000); // 10ms wait if no events
+      usleep(10000); 
     }
 
-    // FALLBACK: Polling for process periodic check (every 1s)
+    
     time_t now = time(nullptr);
     if (now != last_poll) {
       last_poll = now;
 
-      // Manual scan of /proc to see if process appeared (missed fork event?)
+      
       DIR *proc_dir = opendir("/proc");
       if (proc_dir) {
         struct dirent *ent;
@@ -788,7 +786,7 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
           int p = atoi(ent->d_name);
           if (p <= 0)
             continue;
-          // Optimization: don't check known PIDs
+          
           if (zygote_pids.count(p) || pending_children.count(p))
             continue;
 
@@ -803,24 +801,24 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
             std::cout << "    [+] Target found via polling: " << cmd
                       << " (PID: " << p << ")\n";
 
-            // Detach from zygotes
+            
             for (int zpid : zygote_pids) {
               ptrace(PTRACE_DETACH, zpid, nullptr, nullptr);
               unregister_attached_pid(zpid);
             }
-            // Detach from pending
+            
             for (int other : pending_children)
               ptrace(PTRACE_DETACH, other, nullptr, nullptr);
 
-            // We found it via polling, so we are NOT attached to it.
-            // The caller expects to own it?
-            // Currently return p tells caller "here is the PID".
-            // Ideally we should attach to it if we want to control it, but the
-            // caller logic might just use /proc/mem which doesn't strictly need
-            // attachment. HOWEVER, `dump_on_demand` might need ptrace. Let's
-            // attach to it to be consistent with the fork path status
-            // (attached). BUT wait, in fork path we DETACHED before returning
-            // (see logic below). So we should return DETACHED.
+            
+            
+            
+            
+            
+            
+            
+            
+            
             return p;
           }
         }
@@ -828,7 +826,7 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
       }
     }
 
-    // Check pending children cmdlines
+    
     if (now != last_check) {
       last_check = now;
       for (auto it = pending_children.begin(); it != pending_children.end();) {
@@ -840,7 +838,7 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
           f.close();
         }
         if (cmd.empty()) {
-          // Try comm
+          
           std::ifstream fc("/proc/" + std::to_string(child_pid) + "/comm");
           if (fc.is_open()) {
             std::getline(fc, cmd);
@@ -849,54 +847,54 @@ int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
         }
 
         if (!cmd.empty()) {
-          // Filter out obviously wrong ones if needed, or just look for target
+          
           if (cmd.find(target_pkg) != std::string::npos) {
             std::cout << "    [+] Target found: " << cmd
                       << " (PID: " << child_pid << ")\n";
 
-            // Detach from all zygotes
+            
             for (int zpid : zygote_pids) {
               ptrace(PTRACE_DETACH, zpid, nullptr, nullptr);
               unregister_attached_pid(zpid);
             }
-            // Detach from all OTHER pending children
+            
             for (int other : pending_children) {
               if (other != child_pid)
                 ptrace(PTRACE_DETACH, other, nullptr, nullptr);
             }
 
-            // Return the target. It is currently running (we PTRACE_CONT'd it).
-            // The caller expects to attach/control it?
-            // cmd_dump does: `dump_memory(child_pid, ...)` which uses
-            // /proc/mem. But it also calls `ProcessTracer::dump_on_demand`
-            // which might use ptrace? `dump_memory` reads maps. IMPORTANT: The
-            // caller logic: `std::cout << "[3] Analyzing memory...\n";`
-            // `dump_memory(child_pid, ...)`
+            
+            
+            
+            
+            
+            
+            
 
-            // If we return, we are still attached to child_pid (via ptrace).
-            // We should probably detach so `dump_memory` (which uses /proc/mem)
-            // works without ptrace interference OR if subsequent steps usage
-            // ptrace, we keeps it. Looking at `tracer.cpp`, `dump_on_demand`
-            // uses `ProcessTracer::read_memory` which uses `process_vm_readv`.
-            // `process_vm_readv` works fine if ptrace attached?
-            // BUT: `ProcessTracer::capture_jit` sets breakpoints? If so, we
-            // need ptrace.
+            
+            
+            
+            
+            
+            
+            
+            
 
-            // Existing code did: `ptrace(PTRACE_DETACH, child_pid, nullptr,
-            // nullptr);` So we should DETACH.
+            
+            
             ptrace(PTRACE_DETACH, child_pid, nullptr, nullptr);
             return child_pid;
           }
         }
 
-        // Cleanup logic: if cmdline is NOT zygote and NOT target and has been
-        // around? For now just keep them until timeout.
+        
+        
         ++it;
       }
     }
   }
 
-  // Timeout - detach from all
+  
   for (int zpid : zygote_pids) {
     ptrace(PTRACE_DETACH, zpid, nullptr, nullptr);
     unregister_attached_pid(zpid);
@@ -1080,18 +1078,20 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
                                                    size_t size,
                                                    int duration_sec) {
   std::vector<uint8_t> result(size, 0);
-  std::vector<bool> captured(size / 4096, false);
+  size_t page_count = (size + 4095) / 4096;
+  std::vector<bool> captured(page_count, false);
   if (!attach(pid))
     return result;
   read_memory(pid, base, result.data(), size);
-  for (size_t i = 0; i < size / 4096; i++) {
+  for (size_t i = 0; i < page_count; i++) {
     bool has_data = false;
-    for (size_t j = 0; j < 4096 && !has_data; j++) {
+    size_t page_size = std::min<size_t>(4096, size - i * 4096);
+    for (size_t j = 0; j < page_size && !has_data; j++) {
       if (result[i * 4096 + j] != 0)
         has_data = true;
     }
     if (!has_data) {
-      set_protection(pid, base + i * 4096, 4096, PROT_NONE);
+      set_protection(pid, base + i * 4096, page_size, PROT_NONE);
     } else {
       captured[i] = true;
     }
@@ -1107,11 +1107,14 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
         uint64_t fault_addr = get_pc(pid);
         size_t page_idx = (fault_addr - base) / 4096;
         if (page_idx < captured.size() && !captured[page_idx]) {
-          set_protection(pid, base + page_idx * 4096, 4096,
+          size_t page_size =
+              std::min<size_t>(4096, size - page_idx * 4096);
+          set_protection(pid, base + page_idx * 4096, page_size,
                          PROT_READ | PROT_EXEC);
-          std::vector<uint8_t> page_data(4096);
-          read_memory(pid, base + page_idx * 4096, page_data.data(), 4096);
-          memcpy(result.data() + page_idx * 4096, page_data.data(), 4096);
+          std::vector<uint8_t> page_data(page_size);
+          read_memory(pid, base + page_idx * 4096, page_data.data(),
+                      page_size);
+          memcpy(result.data() + page_idx * 4096, page_data.data(), page_size);
           captured[page_idx] = true;
         }
         continue_process(pid);
@@ -1123,7 +1126,9 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
   }
   for (size_t i = 0; i < captured.size(); i++) {
     if (!captured[i])
-      set_protection(pid, base + i * 4096, 4096, PROT_READ | PROT_EXEC);
+      set_protection(pid, base + i * 4096,
+                     std::min<size_t>(4096, size - i * 4096),
+                     PROT_READ | PROT_EXEC);
   }
   detach(pid);
   return result;
@@ -2069,9 +2074,9 @@ void StaticRelinker::recursive_embed(EmbedContext &ctx, uint64_t addr) {
   ctx.total_embedded_size += code.size();
 }
 
-// ============================================================================
-// MemoryInjector Implementation
-// ============================================================================
+
+
+
 
 uint64_t MemoryInjector::remote_mmap(int pid, uint64_t addr, size_t size,
                                      int prot, int flags) {
@@ -2085,19 +2090,19 @@ uint64_t MemoryInjector::remote_mmap(int pid, uint64_t addr, size_t size,
     ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
     regs = orig_regs;
 
-    // mmap syscall: x0=addr, x1=size, x2=prot, x3=flags, x4=fd, x5=offset
+    
     regs.regs[0] = addr;
     regs.regs[1] = size;
     regs.regs[2] = prot;
     regs.regs[3] = flags;
-    regs.regs[4] = (uint64_t)-1; // fd = -1
-    regs.regs[5] = 0;            // offset = 0
-    regs.regs[8] = 222;          // __NR_mmap
+    regs.regs[4] = (uint64_t)-1; 
+    regs.regs[5] = 0;            
+    regs.regs[8] = 222;          
 
     uint64_t pc = regs.pc;
     uint32_t orig_inst;
     ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xD4000001; // svc #0
+    uint32_t svc_inst = 0xD4000001; 
     ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
 
     iov.iov_base = &regs;
@@ -2121,19 +2126,19 @@ uint64_t MemoryInjector::remote_mmap(int pid, uint64_t addr, size_t size,
     ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
     regs = orig_regs;
 
-    // mmap2 syscall for ARM32
+    
     regs.regs[0] = (uint32_t)addr;
     regs.regs[1] = (uint32_t)size;
     regs.regs[2] = (uint32_t)prot;
     regs.regs[3] = (uint32_t)flags;
     regs.regs[4] = (uint32_t)-1;
     regs.regs[5] = 0;
-    regs.regs[7] = 192; // __NR_mmap2
+    regs.regs[7] = 192; 
 
     uint32_t pc = regs.regs[15];
     uint32_t orig_inst;
     ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xEF000000; // svc #0
+    uint32_t svc_inst = 0xEF000000; 
     ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
 
     iov.iov_base = &regs;
@@ -2167,7 +2172,7 @@ bool MemoryInjector::remote_munmap(int pid, uint64_t addr, size_t size) {
 
     regs.regs[0] = addr;
     regs.regs[1] = size;
-    regs.regs[8] = 215; // __NR_munmap
+    regs.regs[8] = 215; 
 
     uint64_t pc = regs.pc;
     uint32_t orig_inst;
@@ -2195,7 +2200,7 @@ bool MemoryInjector::remote_munmap(int pid, uint64_t addr, size_t size) {
 
     regs.regs[0] = (uint32_t)addr;
     regs.regs[1] = (uint32_t)size;
-    regs.regs[7] = 91; // __NR_munmap
+    regs.regs[7] = 91; 
 
     uint32_t pc = regs.regs[15];
     uint32_t orig_inst;
@@ -2246,28 +2251,28 @@ MemoryInjector::call_remote(int pid, uint64_t func_addr,
     }
     regs = orig_regs;
 
-    // Set up arguments (x0-x7)
+    
     for (size_t i = 0; i < args.size() && i < 8; i++) {
       regs.regs[i] = args[i];
     }
 
-    // If more than 8 args, push to stack
+    
     if (args.size() > 8) {
       size_t stack_args = args.size() - 8;
       regs.sp -= stack_args * 8;
-      regs.sp &= ~0xFULL; // Align to 16 bytes
+      regs.sp &= ~0xFULL; 
       for (size_t i = 8; i < args.size(); i++) {
         uint64_t val = args[i];
         ProcessTracer::write_memory(pid, regs.sp + (i - 8) * 8, &val, 8);
       }
     }
 
-    // Set return address to a breakpoint address
+    
     uint64_t pc = regs.pc;
     uint32_t orig_inst;
     ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
 
-    // Create call stub: BLR to function, then BRK
+    
     uint64_t stub_addr = FunctionHooker::allocate_remote(pid, 32);
     if (stub_addr == 0) {
       result.error_message = "Failed to allocate stub";
@@ -2275,22 +2280,22 @@ MemoryInjector::call_remote(int pid, uint64_t func_addr,
       return result;
     }
 
-    // Stub code:
-    // LDR X9, #8       ; Load function address
-    // BLR X9           ; Call function
-    // BRK #0           ; Breakpoint
-    // .quad func_addr  ; Function address
+    
+    
+    
+    
+    
     uint32_t stub_code[] = {
-        0x58000049, // LDR X9, [PC, #8]
-        0xD63F0120, // BLR X9
-        0xD4200000, // BRK #0
-        0x00000000, // Padding
+        0x58000049, 
+        0xD63F0120, 
+        0xD4200000, 
+        0x00000000, 
     };
     ProcessTracer::write_memory(pid, stub_addr, stub_code, 16);
     ProcessTracer::write_memory(pid, stub_addr + 16, &func_addr, 8);
 
-    // Set PC to stub, save return address
-    regs.regs[30] = stub_addr + 8; // LR points after BLR (to BRK)
+    
+    regs.regs[30] = stub_addr + 8; 
     regs.pc = stub_addr;
 
     iov.iov_base = &regs;
@@ -2300,12 +2305,12 @@ MemoryInjector::call_remote(int pid, uint64_t func_addr,
     int status;
     waitpid(pid, &status, 0);
 
-    // Get return value
+    
     ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
     result.return_value = regs.regs[0];
     result.success = true;
 
-    // Restore original state
+    
     iov.iov_base = &orig_regs;
     ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
     FunctionHooker::free_remote(pid, stub_addr, 32);
@@ -2319,7 +2324,7 @@ MemoryInjector::call_remote(int pid, uint64_t func_addr,
     }
     regs = orig_regs;
 
-    // ARM32: first 4 args in r0-r3, rest on stack
+    
     for (size_t i = 0; i < args.size() && i < 4; i++) {
       regs.regs[i] = (uint32_t)args[i];
     }
@@ -2327,7 +2332,7 @@ MemoryInjector::call_remote(int pid, uint64_t func_addr,
     if (args.size() > 4) {
       size_t stack_args = args.size() - 4;
       regs.regs[13] -= stack_args * 4;
-      regs.regs[13] &= ~0x7; // Align to 8 bytes
+      regs.regs[13] &= ~0x7; 
       for (size_t i = 4; i < args.size(); i++) {
         uint32_t val = (uint32_t)args[i];
         ProcessTracer::write_memory(pid, regs.regs[13] + (i - 4) * 4, &val, 4);
@@ -2341,21 +2346,21 @@ MemoryInjector::call_remote(int pid, uint64_t func_addr,
       return result;
     }
 
-    // ARM32 stub:
-    // LDR R12, [PC, #4]  ; Load function address
-    // BLX R12            ; Call function
-    // BKPT #0            ; Breakpoint
-    // .word func_addr
+    
+    
+    
+    
+    
     uint32_t stub_code[] = {
-        0xE59FC004, // LDR R12, [PC, #4]
-        0xE12FFF3C, // BLX R12
-        0xE1200070, // BKPT #0
+        0xE59FC004, 
+        0xE12FFF3C, 
+        0xE1200070, 
         (uint32_t)func_addr,
     };
     ProcessTracer::write_memory(pid, stub_addr, stub_code, 16);
 
-    regs.regs[14] = (uint32_t)(stub_addr + 8); // LR
-    regs.regs[15] = (uint32_t)stub_addr;       // PC
+    regs.regs[14] = (uint32_t)(stub_addr + 8); 
+    regs.regs[15] = (uint32_t)stub_addr;       
 
     iov.iov_base = &regs;
     ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
@@ -2385,7 +2390,7 @@ MemoryInjector::call_remote_void(int pid, uint64_t func_addr,
 
 uint64_t MemoryInjector::remote_dlopen(int pid, const std::string &path,
                                        int flags) {
-  // Find dlopen in target process
+  
   uint64_t dlopen_addr =
       FunctionHooker::find_remote_symbol(pid, "libdl.so", "dlopen");
   if (dlopen_addr == 0)
@@ -2396,7 +2401,7 @@ uint64_t MemoryInjector::remote_dlopen(int pid, const std::string &path,
   if (dlopen_addr == 0)
     return 0;
 
-  // Allocate and write path string
+  
   size_t path_len = path.size() + 1;
   uint64_t path_addr = FunctionHooker::allocate_remote(pid, path_len);
   if (path_addr == 0)
@@ -2404,7 +2409,7 @@ uint64_t MemoryInjector::remote_dlopen(int pid, const std::string &path,
 
   ProcessTracer::write_memory(pid, path_addr, path.c_str(), path_len);
 
-  // Call dlopen(path, flags)
+  
   std::vector<uint64_t> args = {path_addr, (uint64_t)flags};
   auto result = call_remote(pid, dlopen_addr, args);
 
@@ -2471,7 +2476,7 @@ std::string MemoryInjector::remote_dlerror(int pid) {
 bool MemoryInjector::inject_shellcode(int pid,
                                       const std::vector<uint8_t> &shellcode,
                                       uint64_t *exec_addr) {
-  size_t size = (shellcode.size() + 4095) & ~4095; // Page align
+  size_t size = (shellcode.size() + 4095) & ~4095; 
   uint64_t addr = remote_mmap(pid, 0, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                               MAP_PRIVATE | MAP_ANONYMOUS);
   if (addr == 0)
@@ -2512,15 +2517,15 @@ MemoryInjector::generate_shellcode_arm64(uint64_t func_addr,
                                          const std::vector<uint64_t> &args) {
   std::vector<uint8_t> code;
 
-  // Load arguments into x0-x7
+  
   for (size_t i = 0; i < args.size() && i < 8; i++) {
     uint64_t arg = args[i];
-    // MOV Xn, #imm (if small enough) or LDR from literal pool
+    
     if (arg <= 0xFFFF) {
       uint32_t movz = 0xD2800000 | (i & 0x1F) | ((arg & 0xFFFF) << 5);
       code.insert(code.end(), (uint8_t *)&movz, (uint8_t *)&movz + 4);
     } else {
-      // Use LDR from pool - complex, simplified for now
+      
       uint32_t movz = 0xD2800000 | (i & 0x1F) | (((arg >> 0) & 0xFFFF) << 5);
       uint32_t movk1 = 0xF2A00000 | (i & 0x1F) | (((arg >> 16) & 0xFFFF) << 5);
       uint32_t movk2 = 0xF2C00000 | (i & 0x1F) | (((arg >> 32) & 0xFFFF) << 5);
@@ -2532,7 +2537,7 @@ MemoryInjector::generate_shellcode_arm64(uint64_t func_addr,
     }
   }
 
-  // Load function address into X9
+  
   uint32_t mov_x9[] = {
       static_cast<uint32_t>(0xD2800009 | (((func_addr >> 0) & 0xFFFF) << 5)),
       static_cast<uint32_t>(0xF2A00009 | (((func_addr >> 16) & 0xFFFF) << 5)),
@@ -2542,11 +2547,11 @@ MemoryInjector::generate_shellcode_arm64(uint64_t func_addr,
   for (auto inst : mov_x9)
     code.insert(code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
 
-  // BLR X9
+  
   uint32_t blr = 0xD63F0120;
   code.insert(code.end(), (uint8_t *)&blr, (uint8_t *)&blr + 4);
 
-  // RET
+  
   uint32_t ret = 0xD65F03C0;
   code.insert(code.end(), (uint8_t *)&ret, (uint8_t *)&ret + 4);
 
@@ -2558,10 +2563,10 @@ MemoryInjector::generate_shellcode_arm32(uint64_t func_addr,
                                          const std::vector<uint64_t> &args) {
   std::vector<uint8_t> code;
 
-  // Load arguments into r0-r3
+  
   for (size_t i = 0; i < args.size() && i < 4; i++) {
     uint32_t arg = (uint32_t)args[i];
-    // LDR Rn, [PC, #offset] - simplified
+    
     uint32_t mov = 0xE3A00000 | ((i & 0xF) << 12) | (arg & 0xFF);
     uint32_t orr1 = 0xE3800C00 | ((i & 0xF) << 12) | ((i & 0xF) << 16) |
                     ((arg >> 8) & 0xFF);
@@ -2575,7 +2580,7 @@ MemoryInjector::generate_shellcode_arm32(uint64_t func_addr,
     code.insert(code.end(), (uint8_t *)&orr3, (uint8_t *)&orr3 + 4);
   }
 
-  // LDR R12, [PC, #0] ; BLX R12 ; .word func_addr
+  
   uint32_t ldr_r12 = 0xE59FC000;
   uint32_t blx_r12 = 0xE12FFF3C;
   uint32_t bx_lr = 0xE12FFF1E;
@@ -2606,18 +2611,18 @@ bool MemoryInjector::install_inline_hook(int pid, uint64_t target,
                                     16))
       return false;
 
-    // Allocate trampoline
+    
     info->trampoline_addr = FunctionHooker::allocate_remote(pid, 32);
     if (info->trampoline_addr == 0)
       return false;
 
-    // Build trampoline: original bytes + jump back
+    
     std::vector<uint8_t> tramp(32);
     memcpy(tramp.data(), info->original_bytes.data(), 16);
     uint64_t ret_addr = target + 16;
     uint32_t jmp_back[] = {
-        0x58000050, // LDR X16, [PC, #8]
-        0xD61F0200, // BR X16
+        0x58000050, 
+        0xD61F0200, 
     };
     memcpy(tramp.data() + 16, jmp_back, 8);
     memcpy(tramp.data() + 24, &ret_addr, 8);
@@ -2628,10 +2633,10 @@ bool MemoryInjector::install_inline_hook(int pid, uint64_t target,
       return false;
     }
 
-    // Write hook jump at target
+    
     uint32_t hook_jmp[] = {
-        0x58000050, // LDR X16, [PC, #8]
-        0xD61F0200, // BR X16
+        0x58000050, 
+        0xD61F0200, 
     };
     std::vector<uint8_t> patch(16);
     memcpy(patch.data(), hook_jmp, 8);
@@ -2656,7 +2661,7 @@ bool MemoryInjector::install_inline_hook(int pid, uint64_t target,
     std::vector<uint8_t> tramp(16);
     memcpy(tramp.data(), info->original_bytes.data(), 8);
     uint32_t ret_addr = (uint32_t)(target + 8);
-    uint32_t jmp_back[] = {0xE51FF004, ret_addr}; // LDR PC, [PC, #-4]
+    uint32_t jmp_back[] = {0xE51FF004, ret_addr}; 
     memcpy(tramp.data() + 8, jmp_back, 8);
 
     if (!ProcessTracer::write_memory(pid, info->trampoline_addr, tramp.data(),
@@ -2715,7 +2720,7 @@ bool MemoryInjector::hook_plt_entry(int pid, uint64_t base,
 
 uint64_t MemoryInjector::find_got_entry(int pid, uint64_t base,
                                         const std::string &symbol) {
-  // Read ELF from memory
+  
   std::vector<uint8_t> elf_data(0x10000);
   if (!ProcessTracer::read_memory(pid, base, elf_data.data(), elf_data.size()))
     return 0;
@@ -2770,13 +2775,13 @@ std::string MemoryInjector::read_string_remote(int pid, uint64_t addr,
 uint64_t MemoryInjector::find_art_method(int pid, const std::string &class_name,
                                          const std::string &method_name,
                                          const std::string &signature) {
-  // This requires ART runtime internals
-  // Simplified: look for _ZN3art... symbols
+  
+  
   uint64_t libart = find_libart_base(pid);
   if (libart == 0)
     return 0;
 
-  // TODO: Implement full ART method lookup via runtime structures
+  
   return 0;
 }
 
@@ -2785,8 +2790,8 @@ bool MemoryInjector::hook_art_method(int pid, uint64_t art_method,
   if (art_method == 0)
     return false;
 
-  // ART method structure: entry_point is at offset depending on ART version
-  // Android 10+: offset 0x20 for ARM64
+  
+  
   size_t entry_offset =
       (ProcessTracer::get_arch() == ArchMode::ARM64) ? 0x20 : 0x14;
   size_t ptr_size = (ProcessTracer::get_arch() == ArchMode::ARM64) ? 8 : 4;
@@ -2805,14 +2810,14 @@ std::vector<ARTMethodInfo>
 MemoryInjector::enum_art_methods(int pid, const std::string &class_name) {
   std::vector<ARTMethodInfo> methods;
 
-  // Convert class name to JNI descriptor format
+  
   std::string descriptor = "L" + class_name + ";";
   std::replace(descriptor.begin(), descriptor.end(), '.', '/');
 
-  // Find the class in ART runtime
+  
   uint64_t art_class = ARTHooker::find_class_by_descriptor(pid, descriptor);
   if (art_class == 0) {
-    // Try to find by enumerating loaded classes
+    
     auto all_classes = ARTHooker::enumerate_loaded_classes(pid);
     for (const auto &cls : all_classes) {
       if (cls.descriptor.find(class_name) != std::string::npos ||
@@ -2826,7 +2831,7 @@ MemoryInjector::enum_art_methods(int pid, const std::string &class_name) {
   if (art_class == 0)
     return methods;
 
-  // Get all methods from the class
+  
   return ARTHooker::get_class_methods(pid, art_class);
 }
 
@@ -2846,7 +2851,7 @@ MemoryInjector::find_jni_functions(int pid, const std::string &lib_name) {
   if (lib_base == 0)
     return jni_funcs;
 
-  // Read ELF from memory
+  
   std::vector<uint8_t> elf_data(0x100000);
   if (!ProcessTracer::read_memory(pid, lib_base, elf_data.data(),
                                   elf_data.size()))
@@ -2854,7 +2859,7 @@ MemoryInjector::find_jni_functions(int pid, const std::string &lib_name) {
 
   auto symbols = ElfParser::get_symbols(elf_data);
   for (const auto &sym : symbols) {
-    // JNI functions start with Java_
+    
     if (sym.name.find("Java_") == 0) {
       jni_funcs.push_back({sym.name, lib_base + sym.offset});
     }
@@ -2890,9 +2895,9 @@ MemoryInjector::dump_got(int pid, uint64_t base,
   return got_entries;
 }
 
-// ============================================================================
-// SeccompBypass Implementation
-// ============================================================================
+
+
+
 
 SeccompInfo SeccompBypass::get_seccomp_status(int pid) {
   SeccompInfo info = {false, 0, 0, ""};
@@ -2914,15 +2919,15 @@ SeccompInfo SeccompBypass::get_seccomp_status(int pid) {
 }
 
 bool SeccompBypass::disable_seccomp(int pid) {
-  // Method 1: Use PTRACE_SECCOMP_GET_FILTER to understand filters
-  // Method 2: Patch the seccomp mode in kernel task_struct (requires root +
-  // kernel access) Method 3: Use the memfd workaround for specific operations
+  
+  
+  
 
   if (!ProcessTracer::attach(pid))
     return false;
 
-  // For Android 8+, try to call prctl(PR_SET_SECCOMP, SECCOMP_MODE_DISABLED)
-  // This requires CAP_SYS_ADMIN which root has
+  
+  
 
   uint64_t prctl_addr = MemoryInjector::find_libc_function(pid, "prctl");
   if (prctl_addr == 0) {
@@ -2930,41 +2935,41 @@ bool SeccompBypass::disable_seccomp(int pid) {
     return false;
   }
 
-  // PR_SET_SECCOMP = 22, SECCOMP_MODE_DISABLED = 0
+  
   std::vector<uint64_t> args = {22, 0, 0, 0, 0};
 
   auto result = MemoryInjector::call_remote(pid, prctl_addr, args);
 
   ProcessTracer::detach(pid);
 
-  // Check if seccomp is now disabled
+  
   auto new_status = get_seccomp_status(pid);
   return !new_status.seccomp_enabled;
 }
 
 bool SeccompBypass::patch_seccomp_filter(int pid) {
-  // This patches the BPF filter to allow all syscalls
-  // Works by finding seccomp filter in memory and modifying it
+  
+  
 
   auto status = get_seccomp_status(pid);
   if (!status.seccomp_enabled || status.filter_count == 0)
-    return true; // Already disabled
+    return true; 
 
-  // Seccomp filters are in kernel memory, can't patch directly
-  // Instead, we use ptrace to intercept and allow syscalls
+  
+  
 
-  return false; // This requires kernel module or special capabilities
+  return false; 
 }
 
 bool SeccompBypass::use_memfd_workaround(int pid) {
-  // memfd_create is often allowed even under seccomp
-  // We can use it to create anonymous files in memory
+  
+  
 
   if (!ProcessTracer::attach(pid))
     return false;
 
-  // Find memfd_create or __NR_memfd_create syscall
-  // ARM64: syscall 279, ARM32: syscall 385
+  
+  
 
   ArchMode arch = ProcessTracer::get_arch();
 
@@ -2974,14 +2979,14 @@ bool SeccompBypass::use_memfd_workaround(int pid) {
     ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
     regs = orig_regs;
 
-    // memfd_create("hayabusa", MFD_CLOEXEC)
+    
     uint64_t name_addr = FunctionHooker::allocate_remote(pid, 32);
     const char *name = "hayabusa";
     ProcessTracer::write_memory(pid, name_addr, name, strlen(name) + 1);
 
     regs.regs[0] = name_addr;
-    regs.regs[1] = 1;   // MFD_CLOEXEC
-    regs.regs[8] = 279; // __NR_memfd_create
+    regs.regs[1] = 1;   
+    regs.regs[8] = 279; 
 
     uint64_t pc = regs.pc;
     uint32_t orig_inst;
@@ -3013,11 +3018,11 @@ bool SeccompBypass::use_memfd_workaround(int pid) {
 }
 
 int SeccompBypass::spawn_without_seccomp(const std::string &cmd) {
-  // Use fork + exec with no_new_privs disabled before seccomp
+  
   pid_t pid = fork();
   if (pid == 0) {
-    // Child - try to avoid seccomp
-    // This only works if we're spawning before app sets seccomp
+    
+    
     execl("/system/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
     _exit(1);
   }
@@ -3025,18 +3030,18 @@ int SeccompBypass::spawn_without_seccomp(const std::string &cmd) {
 }
 
 bool SeccompBypass::inject_seccomp_disabler(int pid) {
-  // Inject a small library that disables seccomp from within the process
-  // This is more reliable than external manipulation
+  
+  
 
-  // The library would call prctl(PR_SET_SECCOMP, 0) or
-  // use seccomp(SECCOMP_SET_MODE_FILTER) with permissive filter
+  
+  
 
-  return false; // TODO: Build and inject custom library
+  return false; 
 }
 
-// ============================================================================
-// ARTOffsetFinder Implementation - Dynamic offset discovery
-// ============================================================================
+
+
+
 
 namespace ARTOffsetFinder {
 
@@ -3047,7 +3052,7 @@ ARTOffsets get_config_offsets(int sdk_version, bool is64bit) {
     ARTOffsets offsets;
     offsets.runtime_class_linker = cfg.class_linker_offset;
     offsets.runtime_heap = cfg.heap_offset;
-    offsets.runtime_jit = 0; // Config might not have this, set default or 0
+    offsets.runtime_jit = 0; 
     offsets.classlinker_dex_caches = cfg.dex_caches_offset;
     offsets.classlinker_boot_class_path = 0;
     offsets.dexcache_dex_file = cfg.dex_file_offset;
@@ -3060,17 +3065,17 @@ ARTOffsets get_config_offsets(int sdk_version, bool is64bit) {
 }
 
 ARTOffsets get_fallback_offsets(int sdk_version, bool is64bit) {
-  // First try config
+  
   ARTOffsets config_offsets = get_config_offsets(sdk_version, is64bit);
   if (config_offsets.valid)
     return config_offsets;
 
   ARTOffsets offsets = {0, 0, 0, 0, 0, 0, 0, false, sdk_version};
 
-  // Known offsets for major SDK versions (64-bit)
-  // These are approximate and may need adjustment
+  
+  
   if (is64bit) {
-    if (sdk_version >= 35) { // Android 15
+    if (sdk_version >= 35) { 
       offsets.runtime_class_linker = 0x350;
       offsets.runtime_heap = 0x200;
       offsets.runtime_jit = 0x400;
@@ -3078,7 +3083,7 @@ ARTOffsets get_fallback_offsets(int sdk_version, bool is64bit) {
       offsets.classlinker_boot_class_path = 0x70;
       offsets.dexcache_dex_file = 0x20;
       offsets.jit_code_cache = 0x8;
-    } else if (sdk_version >= 34) { // Android 14
+    } else if (sdk_version >= 34) { 
       offsets.runtime_class_linker = 0x348;
       offsets.runtime_heap = 0x1F8;
       offsets.runtime_jit = 0x3F0;
@@ -3086,7 +3091,7 @@ ARTOffsets get_fallback_offsets(int sdk_version, bool is64bit) {
       offsets.classlinker_boot_class_path = 0x68;
       offsets.dexcache_dex_file = 0x20;
       offsets.jit_code_cache = 0x8;
-    } else if (sdk_version >= 33) { // Android 13
+    } else if (sdk_version >= 33) { 
       offsets.runtime_class_linker = 0x340;
       offsets.runtime_heap = 0x1F8;
       offsets.runtime_jit = 0x3E0;
@@ -3094,7 +3099,7 @@ ARTOffsets get_fallback_offsets(int sdk_version, bool is64bit) {
       offsets.classlinker_boot_class_path = 0x68;
       offsets.dexcache_dex_file = 0x20;
       offsets.jit_code_cache = 0x8;
-    } else if (sdk_version >= 31) { // Android 12/12L
+    } else if (sdk_version >= 31) { 
       offsets.runtime_class_linker = 0x330;
       offsets.runtime_heap = 0x1F8;
       offsets.runtime_jit = 0x3C0;
@@ -3102,7 +3107,7 @@ ARTOffsets get_fallback_offsets(int sdk_version, bool is64bit) {
       offsets.classlinker_boot_class_path = 0x68;
       offsets.dexcache_dex_file = 0x20;
       offsets.jit_code_cache = 0x8;
-    } else if (sdk_version >= 30) { // Android 11
+    } else if (sdk_version >= 30) { 
       offsets.runtime_class_linker = 0x320;
       offsets.runtime_heap = 0x1F8;
       offsets.runtime_jit = 0x3A0;
@@ -3110,7 +3115,7 @@ ARTOffsets get_fallback_offsets(int sdk_version, bool is64bit) {
       offsets.classlinker_boot_class_path = 0x60;
       offsets.dexcache_dex_file = 0x18;
       offsets.jit_code_cache = 0x8;
-    } else { // Android 10 and earlier
+    } else { 
       offsets.runtime_class_linker = 0x310;
       offsets.runtime_heap = 0x1F8;
       offsets.runtime_jit = 0x3A0;
@@ -3120,7 +3125,7 @@ ARTOffsets get_fallback_offsets(int sdk_version, bool is64bit) {
       offsets.jit_code_cache = 0x8;
     }
   } else {
-    // 32-bit offsets (approximately half of 64-bit pointer offsets)
+    
     if (sdk_version >= 33) {
       offsets.runtime_class_linker = 0x1A0;
       offsets.runtime_heap = 0xFC;
@@ -3152,7 +3157,7 @@ bool validate_offsets(int pid, uint64_t runtime_addr,
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
   size_t ptr_size = is64 ? 8 : 4;
 
-  // Read potential ClassLinker pointer
+  
   uint64_t class_linker = 0;
   if (!ProcessTracer::read_memory(pid,
                                   runtime_addr + offsets.runtime_class_linker,
@@ -3160,12 +3165,12 @@ bool validate_offsets(int pid, uint64_t runtime_addr,
     return false;
   }
 
-  // Validate: ClassLinker should be a valid heap pointer
+  
   if (class_linker < 0x10000 || class_linker > 0x0000FFFFFFFFFFFF) {
     return false;
   }
 
-  // Further validation: try to read from ClassLinker
+  
   uint64_t test_val = 0;
   if (!ProcessTracer::read_memory(pid, class_linker, &test_val, ptr_size)) {
     return false;
@@ -3186,18 +3191,18 @@ ARTOffsets discover_offsets(int pid, uint64_t runtime_addr,
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
   size_t ptr_size = is64 ? 8 : 4;
 
-  // Try to discover ClassLinker offset by pattern scanning
-  // ClassLinker vtable should point into libart.so
+  
+  
 
-  // Read first 2KB of Runtime structure
+  
   const size_t scan_size = 2048;
   std::vector<uint8_t> runtime_data(scan_size);
   if (!ProcessTracer::read_memory(pid, runtime_addr, runtime_data.data(),
                                   scan_size)) {
-    return offsets; // Use fallback
+    return offsets; 
   }
 
-  // Find libart.so end address
+  
   auto ranges = ProcessTracer::get_library_ranges(pid);
   uint64_t libart_end = libart_base;
   for (const auto &r : ranges) {
@@ -3207,8 +3212,8 @@ ARTOffsets discover_offsets(int pid, uint64_t runtime_addr,
     }
   }
 
-  // Scan for potential ClassLinker pointer
-  // It should have a vtable pointing into libart.so
+  
+  
   std::vector<size_t> candidates;
 
   for (size_t off = 0x100; off < scan_size - ptr_size; off += ptr_size) {
@@ -3218,19 +3223,19 @@ ARTOffsets discover_offsets(int pid, uint64_t runtime_addr,
     if (ptr < 0x10000 || ptr > 0x0000FFFFFFFFFFFF)
       continue;
 
-    // Read potential vtable from this pointer
+    
     uint64_t vtable = 0;
     if (!ProcessTracer::read_memory(pid, ptr, &vtable, ptr_size))
       continue;
 
-    // Check if vtable is within libart.so
+    
     if (vtable >= libart_base && vtable < libart_end) {
       candidates.push_back(off);
     }
   }
 
-  // ClassLinker is typically in the range 0x300-0x400 for 64-bit
-  // Find the most likely candidate near known offset
+  
+  
   size_t fallback_cl = offsets.runtime_class_linker;
   size_t best_offset = fallback_cl;
   size_t best_distance = 0x100;
@@ -3248,7 +3253,7 @@ ARTOffsets discover_offsets(int pid, uint64_t runtime_addr,
     offsets.runtime_class_linker = best_offset;
   }
 
-  // Validate discovered offsets
+  
   if (validate_offsets(pid, runtime_addr, offsets)) {
     offsets.valid = true;
   }
@@ -3256,11 +3261,11 @@ ARTOffsets discover_offsets(int pid, uint64_t runtime_addr,
   return offsets;
 }
 
-} // namespace ARTOffsetFinder
+} 
 
-// ============================================================================
-// ARTHooker Implementation
-// ============================================================================
+
+
+
 
 ARTRuntimeInfo ARTHooker::find_art_runtime(int pid) {
   ARTRuntimeInfo info = {0, 0, 0, 0, 0, false, ""};
@@ -3269,7 +3274,7 @@ ARTRuntimeInfo ARTHooker::find_art_runtime(int pid) {
   if (libart == 0)
     return info;
 
-  // Find _ZN3art7Runtime9instance_E (art::Runtime::instance_)
+  
   uint64_t instance_sym = FunctionHooker::find_remote_symbol(
       pid, "libart.so", "_ZN3art7Runtime9instance_E");
 
@@ -3277,20 +3282,20 @@ ARTRuntimeInfo ARTHooker::find_art_runtime(int pid) {
     ProcessTracer::read_memory(pid, instance_sym, &info.runtime_addr, 8);
   }
 
-  // Get SDK version from system property
+  
   info.sdk_version = get_sdk_version(pid);
 
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
   size_t ptr_size = is64 ? 8 : 4;
 
-  // Use dynamic offset discovery
+  
   if (info.runtime_addr != 0) {
-    // Discover offsets dynamically for better compatibility
+    
     ARTOffsets offsets = ARTOffsetFinder::discover_offsets(
         pid, info.runtime_addr, libart, info.sdk_version);
 
     if (offsets.valid) {
-      // Use discovered/validated offsets
+      
       ProcessTracer::read_memory(
           pid, info.runtime_addr + offsets.runtime_class_linker,
           &info.class_linker_addr, ptr_size);
@@ -3298,14 +3303,14 @@ ARTRuntimeInfo ARTHooker::find_art_runtime(int pid) {
       ProcessTracer::read_memory(pid, info.runtime_addr + offsets.runtime_heap,
                                  &info.heap_addr, ptr_size);
 
-      // Store thread_list - useful for debugging
-      // Thread list is typically at offset 0x1E8 (64-bit)
+      
+      
       size_t thread_list_offset = is64 ? 0x1E8 : 0xF4;
       ProcessTracer::read_memory(pid, info.runtime_addr + thread_list_offset,
                                  &info.thread_list_addr, ptr_size);
     } else {
-      // Fallback: use legacy hardcoded offsets (kept for backward
-      // compatibility)
+      
+      
       size_t class_linker_offset = 0x310;
       if (info.sdk_version >= 30)
         class_linker_offset = 0x320;
@@ -3331,8 +3336,8 @@ ARTRuntimeInfo ARTHooker::find_art_runtime(int pid) {
 }
 
 int ARTHooker::get_sdk_version(int pid) {
-  // Read ro.build.version.sdk from system properties
-  // or parse /system/build.prop
+  
+  
 
   std::ifstream f("/system/build.prop");
   std::string line;
@@ -3342,7 +3347,7 @@ int ARTHooker::get_sdk_version(int pid) {
     }
   }
 
-  // Default to Android 10
+  
   return 29;
 }
 
@@ -3352,14 +3357,14 @@ uint64_t ARTHooker::find_class_by_descriptor(int pid,
   if (runtime.class_linker_addr == 0)
     return 0;
 
-  // Find ClassLinker::FindClass or LookupClass
+  
   uint64_t find_class = FunctionHooker::find_remote_symbol(
       pid, "libart.so",
       "_ZN3art11ClassLinker9FindClassEPNS_6ThreadEPKcNS_6HandleINS_"
       "6mirror11ClassLoaderEEE");
 
   if (find_class == 0) {
-    // Try alternative symbol
+    
     find_class = FunctionHooker::find_remote_symbol(
         pid, "libart.so",
         "_ZN3art11ClassLinker11LookupClassEPNS_6ThreadEPKcPNS_"
@@ -3369,14 +3374,14 @@ uint64_t ARTHooker::find_class_by_descriptor(int pid,
   if (find_class == 0)
     return 0;
 
-  // Allocate and write descriptor string
+  
   uint64_t desc_addr =
       FunctionHooker::allocate_remote(pid, descriptor.size() + 1);
   ProcessTracer::write_memory(pid, desc_addr, descriptor.c_str(),
                               descriptor.size() + 1);
 
-  // Call FindClass - this is complex as it needs Thread* and ClassLoader Handle
-  // Simplified: just return 0 for now
+  
+  
 
   FunctionHooker::free_remote(pid, desc_addr, descriptor.size() + 1);
   return 0;
@@ -3391,10 +3396,10 @@ ARTClassInfo ARTHooker::get_class_info(int pid, uint64_t art_class) {
   int sdk = get_sdk_version(pid);
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
 
-  // Class structure offsets (approximate, varies by version)
-  // access_flags: offset 4 (32-bit)
-  // super_class: offset 0x10-0x18 (pointer)
-  // methods_: offset depends on version
+  
+  
+  
+  
 
   ProcessTracer::read_memory(pid, art_class + 4, &info.access_flags, 4);
 
@@ -3416,8 +3421,8 @@ std::vector<ARTClassInfo> ARTHooker::enumerate_loaded_classes(int pid) {
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
   size_t ptr_size = is64 ? 8 : 4;
 
-  // ClassLinker structure layout (varies by Android version)
-  // class_table_ offset: SDK 29: 0x48, SDK 30: 0x50, SDK 31+: 0x58
+  
+  
   size_t class_table_offset = 0x48;
   if (sdk >= 30)
     class_table_offset = 0x50;
@@ -3434,8 +3439,8 @@ std::vector<ARTClassInfo> ARTHooker::enumerate_loaded_classes(int pid) {
   if (class_table_addr == 0)
     return classes;
 
-  // ClassTable has classes_ which is a vector of ClassSet
-  // Read the internal hash table structure
+  
+  
   uint64_t buckets_ptr = 0;
   uint32_t num_buckets = 0;
 
@@ -3446,7 +3451,7 @@ std::vector<ARTClassInfo> ARTHooker::enumerate_loaded_classes(int pid) {
   if (buckets_ptr == 0 || num_buckets == 0 || num_buckets > 65536)
     return classes;
 
-  // Scan buckets for class entries
+  
   for (uint32_t i = 0; i < num_buckets && classes.size() < 50000; i++) {
     uint64_t class_ptr = 0;
     ProcessTracer::read_memory(pid, buckets_ptr + i * ptr_size, &class_ptr,
@@ -3457,7 +3462,7 @@ std::vector<ARTClassInfo> ARTHooker::enumerate_loaded_classes(int pid) {
 
     ARTClassInfo info = get_class_info(pid, class_ptr);
     if (info.class_addr != 0) {
-      // Read class descriptor from Class structure
+      
       size_t desc_offset = is64 ? 0x28 : 0x1C;
       if (sdk >= 31)
         desc_offset = is64 ? 0x30 : 0x20;
@@ -3490,10 +3495,10 @@ std::vector<ARTMethodInfo> ARTHooker::get_class_methods(int pid,
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
   size_t ptr_size = is64 ? 8 : 4;
 
-  // Class structure offsets for methods array
-  // methods_ is a LengthPrefixedArray<ArtMethod>
-  // SDK 29: offset 0x30 (64-bit), 0x20 (32-bit)
-  // SDK 31+: offset 0x38 (64-bit), 0x24 (32-bit)
+  
+  
+  
+  
   size_t methods_offset = is64 ? 0x30 : 0x20;
   if (sdk >= 31)
     methods_offset = is64 ? 0x38 : 0x24;
@@ -3507,27 +3512,27 @@ std::vector<ARTMethodInfo> ARTHooker::get_class_methods(int pid,
   if (methods_ptr == 0)
     return methods;
 
-  // LengthPrefixedArray has length at offset 0, then array data
+  
   uint32_t num_methods = 0;
   ProcessTracer::read_memory(pid, methods_ptr, &num_methods, 4);
 
   if (num_methods == 0 || num_methods > 10000)
     return methods;
 
-  // ArtMethod size varies by version
-  // SDK 29: 40 bytes (64-bit), 28 bytes (32-bit)
-  // SDK 31+: 48 bytes (64-bit), 32 bytes (32-bit)
+  
+  
+  
   size_t artmethod_size = is64 ? 40 : 28;
   if (sdk >= 31)
     artmethod_size = is64 ? 48 : 32;
   if (sdk >= 33)
     artmethod_size = is64 ? 56 : 36;
 
-  // Methods array starts after length field (aligned)
+  
   size_t array_offset = is64 ? 8 : 4;
   uint64_t methods_array = methods_ptr + array_offset;
 
-  // Read class descriptor for method info
+  
   size_t desc_offset = is64 ? 0x28 : 0x1C;
   if (sdk >= 31)
     desc_offset = is64 ? 0x30 : 0x20;
@@ -3546,12 +3551,12 @@ std::vector<ARTMethodInfo> ARTHooker::get_class_methods(int pid,
     info.art_method_addr = method_addr;
     info.class_name = class_desc;
 
-    // Read access_flags (offset 4 in ArtMethod)
+    
     ProcessTracer::read_memory(pid, method_addr + 4, &info.access_flags, 4);
 
-    // Read entry_point_from_quick_compiled_code_
-    // SDK 29: offset 0x20 (64-bit), 0x14 (32-bit)
-    // SDK 31+: offset 0x28 (64-bit), 0x18 (32-bit)
+    
+    
+    
     size_t entry_offset = is64 ? 0x20 : 0x14;
     if (sdk >= 31)
       entry_offset = is64 ? 0x28 : 0x18;
@@ -3559,14 +3564,14 @@ std::vector<ARTMethodInfo> ARTHooker::get_class_methods(int pid,
     ProcessTracer::read_memory(pid, method_addr + entry_offset,
                                &info.entry_point, ptr_size);
 
-    // Read dex_method_index (offset 0 in ArtMethod)
+    
     uint32_t dex_method_idx = 0;
     ProcessTracer::read_memory(pid, method_addr, &dex_method_idx, 4);
 
-    // Try to get method name from declaring_class's dex_cache
-    // This requires DexCache access - for now use index as name
+    
+    
     info.method_name = "method_" + std::to_string(dex_method_idx);
-    info.signature = "()V"; // Placeholder - full parsing needs DexFile
+    info.signature = "()V"; 
 
     methods.push_back(info);
   }
@@ -3577,7 +3582,7 @@ std::vector<ARTMethodInfo> ARTHooker::get_class_methods(int pid,
 uint64_t ARTHooker::find_method(int pid, const std::string &class_name,
                                 const std::string &method_name,
                                 const std::string &signature) {
-  // Convert to JNI format
+  
   std::string descriptor = "L" + class_name + ";";
   std::replace(descriptor.begin(), descriptor.end(), '.', '/');
 
@@ -3602,8 +3607,8 @@ bool ARTHooker::hook_method_entry(int pid, uint64_t art_method, uint64_t hook,
   int sdk = get_sdk_version(pid);
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
 
-  // entry_point_from_quick_compiled_code_ offset
-  // SDK 29+: 0x20 for 64-bit, 0x14 for 32-bit
+  
+  
   size_t entry_offset = is64 ? 0x20 : 0x14;
   if (sdk >= 31)
     entry_offset = is64 ? 0x28 : 0x18;
@@ -3627,7 +3632,7 @@ bool ARTHooker::hook_method_native(int pid, uint64_t art_method,
   int sdk = get_sdk_version(pid);
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
 
-  // data_ field points to native function for native methods
+  
   size_t data_offset = is64 ? 0x18 : 0x10;
   size_t ptr_size = is64 ? 8 : 4;
 
@@ -3636,7 +3641,7 @@ bool ARTHooker::hook_method_native(int pid, uint64_t art_method,
 }
 
 bool ARTHooker::force_interpreter_mode(int pid, uint64_t art_method) {
-  // Set method's entry point to art_quick_to_interpreter_bridge
+  
   uint64_t bridge = FunctionHooker::find_remote_symbol(
       pid, "libart.so", "art_quick_to_interpreter_bridge");
 
@@ -3647,7 +3652,7 @@ bool ARTHooker::force_interpreter_mode(int pid, uint64_t art_method) {
 }
 
 bool ARTHooker::force_jit_compilation(int pid, uint64_t art_method) {
-  // Call JitCompileMethod
+  
   uint64_t jit_compile = FunctionHooker::find_remote_symbol(
       pid, "libart.so",
       "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadEb");
@@ -3655,15 +3660,15 @@ bool ARTHooker::force_jit_compilation(int pid, uint64_t art_method) {
   if (jit_compile == 0)
     return false;
 
-  // Need current thread and method pointer
-  // This is complex without full runtime access
+  
+  
 
   return false;
 }
 
-// ============================================================================
-// JITAnalyzer Implementation
-// ============================================================================
+
+
+
 
 JITCodeInfo JITAnalyzer::analyze_jit_code(const std::vector<uint8_t> &code,
                                           uint64_t base_addr, ArchMode arch) {
@@ -3675,12 +3680,12 @@ JITCodeInfo JITAnalyzer::analyze_jit_code(const std::vector<uint8_t> &code,
   info.is_optimized = false;
   info.hotness_count = 0;
 
-  // Scan for call targets
+  
   for (size_t i = 0; i + 4 <= code.size(); i += 4) {
     uint32_t inst = *(const uint32_t *)(code.data() + i);
 
     if (arch == ArchMode::ARM64) {
-      // BL instruction
+      
       if ((inst & 0xFC000000) == 0x94000000) {
         int32_t offset = inst & 0x03FFFFFF;
         if (offset & 0x02000000)
@@ -3688,9 +3693,9 @@ JITCodeInfo JITAnalyzer::analyze_jit_code(const std::vector<uint8_t> &code,
         uint64_t target = base_addr + i + (int64_t)offset * 4;
         info.call_targets.push_back(target);
       }
-      // ADRP + ADD/LDR for string references
+      
       if ((inst & 0x9F000000) == 0x90000000) {
-        // This might be loading a string reference
+        
         int32_t immhi = ((inst >> 5) & 0x7FFFF) << 2;
         int32_t immlo = (inst >> 29) & 0x3;
         int32_t imm21 = immhi | immlo;
@@ -3700,7 +3705,7 @@ JITCodeInfo JITAnalyzer::analyze_jit_code(const std::vector<uint8_t> &code,
         info.string_refs.push_back(page);
       }
     } else {
-      // ARM32 BL
+      
       if ((inst & 0x0F000000) == 0x0B000000) {
         int32_t offset = inst & 0x00FFFFFF;
         if (offset & 0x00800000)
@@ -3720,26 +3725,26 @@ JITAnalyzer::analyze_jit_region(const JITRegion &region, int pid) {
 
   ArchMode arch = ProcessTracer::get_arch();
 
-  // JIT code cache has a header followed by code entries
-  // Try to find function boundaries by looking for prologues
+  
+  
 
   for (size_t offset = 0; offset < region.code.size();) {
-    // Look for ARM64 prologue
+    
     if (offset + 16 <= region.code.size()) {
       uint32_t inst = *(const uint32_t *)(region.code.data() + offset);
 
       bool is_prologue = false;
       if (arch == ArchMode::ARM64) {
-        // STP X29, X30, [SP, #-N]! or SUB SP, SP, #N
+        
         is_prologue = ((inst & 0xFFC003E0) == 0xA9800000) ||
                       ((inst & 0xFF0003FF) == 0xD10003FF);
       } else {
-        // PUSH {regs, lr}
+        
         is_prologue = ((inst & 0xFFFF0000) == 0xE92D0000);
       }
 
       if (is_prologue) {
-        // Find function end
+        
         size_t func_size = InstructionDecoder::find_function_end(
             region.code.data() + offset, region.code.size() - offset, arch);
 
@@ -3842,13 +3847,13 @@ bool JITAnalyzer::hook_jit_compile(int pid, JITHook *hook) {
   if (!hook)
     return false;
 
-  // Find art::jit::Jit::CompileMethod
+  
   uint64_t compile_method = FunctionHooker::find_remote_symbol(
       pid, "libart.so",
       "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadEb");
 
   if (compile_method == 0) {
-    // Try alternative
+    
     compile_method = FunctionHooker::find_remote_symbol(
         pid, "libart.so",
         "_ZN3art3jit11JitCompiler15CompileMethodsEPNS_6ThreadENS_8ArrayRefIPNS_"
@@ -3860,7 +3865,7 @@ bool JITAnalyzer::hook_jit_compile(int pid, JITHook *hook) {
 
   hook->original_handler = compile_method;
 
-  // For now, just record the address - actual hooking would need custom handler
+  
   hook->compile_handler = compile_method;
   hook->active = true;
 
@@ -3871,8 +3876,8 @@ bool JITAnalyzer::unhook_jit_compile(int pid, const JITHook &hook) {
   if (!hook.active)
     return false;
 
-  // Restore original handler if we modified it
-  // For now, just mark as inactive
+  
+  
   return true;
 }
 
@@ -3880,17 +3885,17 @@ std::vector<JITCompileEvent>
 JITAnalyzer::monitor_jit_compiles(int pid, int duration_sec) {
   std::vector<JITCompileEvent> events;
 
-  // This would require setting up a hook on JIT compile methods
-  // and capturing events as they occur
+  
+  
 
-  // Simplified: just capture JIT regions at start and end
+  
   auto start_regions = dump_jit_code_cache(pid);
 
   sleep(duration_sec);
 
   auto end_regions = dump_jit_code_cache(pid);
 
-  // Compare and generate events for new regions
+  
   std::set<uint64_t> start_addrs;
   for (const auto &r : start_regions)
     start_addrs.insert(r.addr);
@@ -3951,7 +3956,7 @@ std::vector<JITRegion> JITAnalyzer::dump_jit_code_cache(int pid) {
 }
 
 bool JITAnalyzer::clear_jit_code_cache(int pid) {
-  // Find JitCodeCache instance from Runtime
+  
   auto runtime_info = ARTHooker::find_art_runtime(pid);
   if (runtime_info.runtime_addr == 0)
     return false;
@@ -3960,8 +3965,8 @@ bool JITAnalyzer::clear_jit_code_cache(int pid) {
   size_t ptr_size = is64 ? 8 : 4;
   int sdk = ARTHooker::get_sdk_version(pid);
 
-  // jit_ field in Runtime points to Jit object
-  // SDK 29: offset ~0x3A0, SDK 31+: ~0x3C0
+  
+  
   size_t jit_offset = 0x3A0;
   if (sdk >= 31)
     jit_offset = 0x3C0;
@@ -3975,7 +3980,7 @@ bool JITAnalyzer::clear_jit_code_cache(int pid) {
   if (jit_ptr == 0)
     return false;
 
-  // Jit object has code_cache_ at offset 0x8 (64-bit) or 0x4 (32-bit)
+  
   size_t cache_offset = is64 ? 0x8 : 0x4;
   uint64_t code_cache_ptr = 0;
   ProcessTracer::read_memory(pid, jit_ptr + cache_offset, &code_cache_ptr,
@@ -3984,13 +3989,13 @@ bool JITAnalyzer::clear_jit_code_cache(int pid) {
   if (code_cache_ptr == 0)
     return false;
 
-  // Find the clear method
+  
   uint64_t clear_func = FunctionHooker::find_remote_symbol(
       pid, "libart.so",
       "_ZN3art3jit12JitCodeCache27ClearAllExceptNativeMethodsEv");
 
   if (clear_func == 0) {
-    // Try alternative name
+    
     clear_func = FunctionHooker::find_remote_symbol(
         pid, "libart.so", "_ZN3art3jit12JitCodeCache5ClearEv");
   }
@@ -3998,16 +4003,16 @@ bool JITAnalyzer::clear_jit_code_cache(int pid) {
   if (clear_func == 0)
     return false;
 
-  // Call the clear method with code_cache as 'this' pointer
+  
   std::vector<uint64_t> args = {code_cache_ptr};
   auto result = MemoryInjector::call_remote(pid, clear_func, args);
 
   return result.success;
 }
 
-// ============================================================================
-// StaticRelinkerEx Implementation
-// ============================================================================
+
+
+
 
 std::vector<uint8_t>
 StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
@@ -4028,10 +4033,10 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
     }
   }
 
-  // Find all external calls with deeper recursion
+  
   auto calls = StaticRelinker::find_external_calls(elf_data, base_addr);
 
-  // Resolve and embed with depth limit from config
+  
   const size_t max_size =
       config.max_total_size > 0 ? config.max_total_size : (64 * 1024 * 1024);
 
@@ -4069,7 +4074,7 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
     while (result.size() % align)
       result.push_back(0);
 
-    // Find calls in embedded code and recurse
+    
     auto sub_calls = InstructionDecoder::scan_calls(
         code.data(), code.size(), addr, ProcessTracer::get_arch());
     for (const auto &c : sub_calls) {
@@ -4086,7 +4091,7 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
     }
   }
 
-  // Patch call sites if config.fix_relocations
+  
   if (config.fix_relocations) {
     patch_relocations(result, embedded_addrs);
   }
@@ -4105,7 +4110,7 @@ StaticRelinkerEx::extract_function_with_deps(int pid, uint64_t addr,
   config.inline_plt_calls = true;
 
   auto code = StaticRelinker::embed_function(pid, addr, 0);
-  // TODO: Build mini-ELF with dependencies
+  
 
   return code;
 }
@@ -4114,12 +4119,12 @@ bool StaticRelinkerEx::patch_relocations(
     std::vector<uint8_t> &data, const std::map<uint64_t, uint64_t> &addr_map) {
   ArchMode arch = ProcessTracer::get_arch();
 
-  // Scan for BL/B instructions and patch if target is in addr_map
+  
   for (size_t i = 0; i + 4 <= data.size(); i += 4) {
     uint32_t inst = *(uint32_t *)(data.data() + i);
 
     if (arch == ArchMode::ARM64) {
-      if ((inst & 0xFC000000) == 0x94000000) { // BL
+      if ((inst & 0xFC000000) == 0x94000000) { 
         int32_t offset = inst & 0x03FFFFFF;
         if (offset & 0x02000000)
           offset |= 0xFC000000;
@@ -4140,16 +4145,16 @@ bool StaticRelinkerEx::patch_relocations(
   return true;
 }
 
-// ============================================================================
-// CryptoAnalyzer Implementation
-// ============================================================================
+
+
+
 
 std::vector<CryptoKeyInfo>
 CryptoAnalyzer::scan_for_keys(const std::vector<uint8_t> &data,
                               uint64_t base_addr) {
   std::vector<CryptoKeyInfo> keys;
 
-  // Use existing AES key detection
+  
   auto aes_keys = ElfParser::detect_aes_keys(data);
 
   for (const auto &k : aes_keys) {
@@ -4173,11 +4178,11 @@ CryptoAnalyzer::extract_runtime_keys(int pid, uint64_t base,
                                      const std::vector<uint8_t> &data) {
   std::vector<CryptoKeyInfo> keys;
 
-  // First, find static keys
+  
   auto static_keys = scan_for_keys(data, base);
   keys.insert(keys.end(), static_keys.begin(), static_keys.end());
 
-  // Look for runtime-generated keys by scanning heap
+  
   std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
   std::string line;
 
@@ -4187,7 +4192,7 @@ CryptoAnalyzer::extract_runtime_keys(int pid, uint64_t base,
       uint64_t start, end;
       if (sscanf(line.c_str(), "%lx-%lx", (unsigned long *)&start,
                  (unsigned long *)&end) == 2) {
-        // Read heap in chunks
+        
         const size_t chunk_size = 1024 * 1024;
         for (uint64_t addr = start; addr < end; addr += chunk_size) {
           size_t read_size = std::min(chunk_size, (size_t)(end - addr));
@@ -4215,29 +4220,29 @@ CryptoAnalyzer::trace_key_derivation(int pid, uint64_t crypto_func) {
   if (crypto_func == 0)
     return keys;
 
-  // Set a breakpoint at the crypto function and capture arguments
+  
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
   size_t ptr_size = is64 ? 8 : 4;
 
-  // Save original instruction
+  
   uint32_t orig_inst;
   if (!ProcessTracer::read_memory(pid, crypto_func, &orig_inst, 4))
     return keys;
 
-  // Insert breakpoint (BRK #0 for ARM64, BKPT #0 for ARM32)
+  
   uint32_t brk_inst = is64 ? 0xD4200000 : 0xE1200070;
   if (!ProcessTracer::write_memory(pid, crypto_func, &brk_inst, 4)) {
     return keys;
   }
 
-  // Continue process and wait for breakpoint hit
+  
   ProcessTracer::continue_process(pid);
 
   int status = 0;
   time_t start = time(nullptr);
   bool hit = false;
 
-  // Wait up to 5 seconds for breakpoint
+  
   while (time(nullptr) - start < 5) {
     if (ProcessTracer::wait_for_stop(pid, &status)) {
       if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
@@ -4248,13 +4253,13 @@ CryptoAnalyzer::trace_key_derivation(int pid, uint64_t crypto_func) {
   }
 
   if (hit) {
-    // Read arguments - key is typically in x1/r1 for most crypto APIs
+    
     uint64_t key_ptr = ProcessTracer::get_register(pid, is64 ? 1 : 1);
     uint64_t key_len_hint = ProcessTracer::get_register(pid, is64 ? 2 : 2);
 
-    // Validate key_len_hint (common sizes: 16, 24, 32 for AES)
+    
     if (key_len_hint == 0 || key_len_hint > 64)
-      key_len_hint = 32; // Default to AES-256
+      key_len_hint = 32; 
 
     if (key_ptr != 0 && key_ptr > 0x1000) {
       CryptoKeyInfo info;
@@ -4275,10 +4280,10 @@ CryptoAnalyzer::trace_key_derivation(int pid, uint64_t crypto_func) {
     }
   }
 
-  // Restore original instruction
+  
   ProcessTracer::write_memory(pid, crypto_func, &orig_inst, 4);
 
-  // Continue process if stopped
+  
   ProcessTracer::continue_process(pid);
 
   return keys;
@@ -4291,8 +4296,8 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
   struct CryptoTarget {
     std::string lib;
     std::string func;
-    int key_arg_idx; // Which argument contains key pointer
-    int len_arg_idx; // Which argument contains length
+    int key_arg_idx; 
+    int len_arg_idx; 
   };
 
   std::vector<CryptoTarget> targets = {
@@ -4306,7 +4311,7 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
 
   bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
 
-  // Find and set breakpoints at each target
+  
   struct Breakpoint {
     uint64_t addr;
     uint32_t orig_inst;
@@ -4337,7 +4342,7 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
   if (breakpoints.empty())
     return calls;
 
-  // Monitor for specified duration
+  
   ProcessTracer::continue_process(pid);
 
   time_t start = time(nullptr);
@@ -4347,14 +4352,14 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
       if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
         uint64_t pc = ProcessTracer::get_pc(pid);
 
-        // Find which breakpoint was hit
+        
         for (auto &bp : breakpoints) {
           if (bp.active && bp.addr == pc) {
             CryptoCallInfo info;
             info.func_addr = bp.addr;
             info.func_name = bp.target.func;
 
-            // Read key argument
+            
             int key_reg = bp.target.key_arg_idx;
             if (key_reg >= 0 && key_reg < 8) {
               uint64_t key_ptr = ProcessTracer::get_register(pid, key_reg);
@@ -4365,7 +4370,7 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
               }
             }
 
-            // Read length argument if available
+            
             if (bp.target.len_arg_idx >= 0) {
               uint64_t len =
                   ProcessTracer::get_register(pid, bp.target.len_arg_idx);
@@ -4374,7 +4379,7 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
               }
             }
 
-            // Read input data (first argument for encrypt/decrypt)
+            
             uint64_t input_ptr = ProcessTracer::get_register(pid, 0);
             if (input_ptr != 0 && input_ptr > 0x1000) {
               info.input_data.resize(64);
@@ -4384,7 +4389,7 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
 
             calls.push_back(info);
 
-            // Single step past breakpoint
+            
             ProcessTracer::write_memory(pid, bp.addr, &bp.orig_inst, 4);
             ProcessTracer::single_step(pid);
             uint32_t brk_inst = is64 ? 0xD4200000 : 0xE1200070;
@@ -4397,7 +4402,7 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
     }
   }
 
-  // Restore all breakpoints
+  
   for (auto &bp : breakpoints) {
     if (bp.active) {
       ProcessTracer::write_memory(pid, bp.addr, &bp.orig_inst, 4);
@@ -4410,7 +4415,7 @@ CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
 std::vector<uint8_t> CryptoAnalyzer::dump_ssl_session_keys(int pid) {
   std::vector<uint8_t> keys;
 
-  // Find libssl.so base to locate SSL_SESSION structures
+  
   uint64_t libssl = 0;
   auto ranges = ProcessTracer::get_library_ranges(pid);
   for (const auto &r : ranges) {
@@ -4420,10 +4425,10 @@ std::vector<uint8_t> CryptoAnalyzer::dump_ssl_session_keys(int pid) {
     }
   }
 
-  // Scan heap for SSL_SESSION magic/patterns
-  // SSL_SESSION has master_key at a known offset
-  // BoringSSL (Android): master_key_length at offset ~0x20, master_key at ~0x24
-  // OpenSSL: varies by version
+  
+  
+  
+  
 
   std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
   std::string line;
@@ -4437,7 +4442,7 @@ std::vector<uint8_t> CryptoAnalyzer::dump_ssl_session_keys(int pid) {
                  (unsigned long *)&end) != 2)
         continue;
 
-      // Limit scan size
+      
       size_t scan_size =
           std::min((size_t)(end - start), (size_t)(32 * 1024 * 1024));
       std::vector<uint8_t> mem(scan_size);
@@ -4445,18 +4450,18 @@ std::vector<uint8_t> CryptoAnalyzer::dump_ssl_session_keys(int pid) {
       if (!ProcessTracer::read_memory(pid, start, mem.data(), scan_size))
         continue;
 
-      // Look for SSL_SESSION pattern:
-      // - master_key_length field (should be 48 for TLS 1.2)
-      // - followed by 48 bytes of master key
+      
+      
+      
       for (size_t i = 0; i + 64 < scan_size; i += 8) {
-        // Check for master_key_length = 48 (0x30)
+        
         uint32_t len = *(uint32_t *)(mem.data() + i);
         if (len == 48) {
-          // Read potential master key (next 48 bytes)
+          
           const uint8_t *key_data = mem.data() + i + 4;
 
-          // Validate it looks like random key material (not all zeros, not
-          // strings)
+          
+          
           int zero_count = 0;
           int printable_count = 0;
           for (int j = 0; j < 48; j++) {
@@ -4466,10 +4471,10 @@ std::vector<uint8_t> CryptoAnalyzer::dump_ssl_session_keys(int pid) {
               printable_count++;
           }
 
-          // Good key: not all zeros, not mostly printable (would be string)
+          
           if (zero_count < 10 && printable_count < 40) {
-            // Format as SSLKEYLOGFILE format: CLIENT_RANDOM <hex> <hex>
-            // For simplified output, just return raw master key
+            
+            
             keys.insert(keys.end(), key_data, key_data + 48);
           }
         }
@@ -4483,7 +4488,7 @@ std::vector<uint8_t> CryptoAnalyzer::dump_ssl_session_keys(int pid) {
 std::vector<CryptoKeyInfo> CryptoAnalyzer::extract_openssl_keys(int pid) {
   std::vector<CryptoKeyInfo> keys;
 
-  // Find libcrypto.so
+  
   uint64_t libcrypto = 0;
   auto ranges = ProcessTracer::get_library_ranges(pid);
   for (const auto &r : ranges) {
@@ -4496,7 +4501,7 @@ std::vector<CryptoKeyInfo> CryptoAnalyzer::extract_openssl_keys(int pid) {
   if (libcrypto == 0)
     return keys;
 
-  // Read libcrypto and scan for key schedules
+  
   size_t lib_size = 0;
   for (const auto &r : ranges) {
     if (r.name.find("libcrypto.so") != std::string::npos) {
@@ -4517,8 +4522,8 @@ std::vector<CryptoKeyInfo> CryptoAnalyzer::extract_openssl_keys(int pid) {
 }
 
 std::vector<CryptoKeyInfo> CryptoAnalyzer::extract_boringssl_keys(int pid) {
-  // BoringSSL is used by Android/Chromium
-  // Similar to OpenSSL but different structure layouts
+  
+  
   return extract_openssl_keys(pid);
 }
 
@@ -4526,7 +4531,7 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
   uint64_t aes_encrypt =
       FunctionHooker::find_remote_symbol(pid, "libcrypto.so", "AES_encrypt");
   if (aes_encrypt == 0) {
-    // Try BoringSSL name
+    
     aes_encrypt = FunctionHooker::find_remote_symbol(pid, "libcrypto.so",
                                                      "aes_nohw_encrypt");
   }
@@ -4537,7 +4542,7 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
   if (original)
     *original = aes_encrypt;
 
-  // Would need to set up actual hook with custom handler
+  
   return true;
 }
 
@@ -4558,63 +4563,63 @@ bool CryptoAnalyzer::hook_aes_decrypt(int pid, uint64_t *original) {
   return true;
 }
 
-// ============================================================================
-// Shellcode Generation (Missing Implementations)
-// ============================================================================
+
+
+
 
 std::vector<uint8_t>
 MemoryInjector::generate_dlopen_shellcode_arm64(const std::string &lib_path) {
   std::vector<uint8_t> code;
 
-  // Save registers
+  
   uint32_t save_regs[] = {
-      0xA9BF7BFD, // STP X29, X30, [SP, #-16]!
-      0x910003FD, // MOV X29, SP
+      0xA9BF7BFD, 
+      0x910003FD, 
   };
   for (auto inst : save_regs)
     code.insert(code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
 
-  // Load dlopen address into X9 (will be patched)
-  // LDR X9, dlopen_addr
-  uint32_t ldr_dlopen = 0x58000049; // LDR X9, [PC, #8] - placeholder
+  
+  
+  uint32_t ldr_dlopen = 0x58000049; 
   code.insert(code.end(), (uint8_t *)&ldr_dlopen, (uint8_t *)&ldr_dlopen + 4);
 
-  // B to after the data
-  uint32_t b_skip = 0x14000004; // B +16
+  
+  uint32_t b_skip = 0x14000004; 
   code.insert(code.end(), (uint8_t *)&b_skip, (uint8_t *)&b_skip + 4);
 
-  // Placeholder for dlopen address (8 bytes)
+  
   uint64_t dlopen_placeholder = 0;
   code.insert(code.end(), (uint8_t *)&dlopen_placeholder,
               (uint8_t *)&dlopen_placeholder + 8);
 
-  // ADR X0, lib_path (will calculate offset to string)
-  // For now, assume string follows code
-  size_t string_offset = code.size() + 32; // Approximate
+  
+  
+  size_t string_offset = code.size() + 32; 
   uint32_t adr_x0 = 0x10000000 | ((string_offset / 4) << 5);
   code.insert(code.end(), (uint8_t *)&adr_x0, (uint8_t *)&adr_x0 + 4);
 
-  // MOV X1, #RTLD_NOW (2)
-  uint32_t mov_x1 = 0xD2800041; // MOV X1, #2
+  
+  uint32_t mov_x1 = 0xD2800041; 
   code.insert(code.end(), (uint8_t *)&mov_x1, (uint8_t *)&mov_x1 + 4);
 
-  // BLR X9 (call dlopen)
+  
   uint32_t blr_x9 = 0xD63F0120;
   code.insert(code.end(), (uint8_t *)&blr_x9, (uint8_t *)&blr_x9 + 4);
 
-  // Restore registers and return
+  
   uint32_t restore_regs[] = {
-      0xA8C17BFD, // LDP X29, X30, [SP], #16
-      0xD65F03C0, // RET
+      0xA8C17BFD, 
+      0xD65F03C0, 
   };
   for (auto inst : restore_regs)
     code.insert(code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
 
-  // Align and add string
+  
   while (code.size() % 8)
     code.push_back(0);
   code.insert(code.end(), lib_path.begin(), lib_path.end());
-  code.push_back(0); // Null terminator
+  code.push_back(0); 
 
   return code;
 }
@@ -4623,41 +4628,41 @@ std::vector<uint8_t>
 MemoryInjector::generate_dlopen_shellcode_arm32(const std::string &lib_path) {
   std::vector<uint8_t> code;
 
-  // PUSH {R4-R7, LR}
+  
   uint32_t push = 0xE92D40F0;
   code.insert(code.end(), (uint8_t *)&push, (uint8_t *)&push + 4);
 
-  // LDR R4, [PC, #offset] - load dlopen address
+  
   uint32_t ldr_r4 = 0xE59F4008;
   code.insert(code.end(), (uint8_t *)&ldr_r4, (uint8_t *)&ldr_r4 + 4);
 
-  // LDR R0, [PC, #offset] - load lib path address
+  
   uint32_t ldr_r0 = 0xE59F0008;
   code.insert(code.end(), (uint8_t *)&ldr_r0, (uint8_t *)&ldr_r0 + 4);
 
-  // MOV R1, #RTLD_NOW (2)
+  
   uint32_t mov_r1 = 0xE3A01002;
   code.insert(code.end(), (uint8_t *)&mov_r1, (uint8_t *)&mov_r1 + 4);
 
-  // BLX R4 (call dlopen)
+  
   uint32_t blx_r4 = 0xE12FFF34;
   code.insert(code.end(), (uint8_t *)&blx_r4, (uint8_t *)&blx_r4 + 4);
 
-  // POP {R4-R7, PC}
+  
   uint32_t pop = 0xE8BD80F0;
   code.insert(code.end(), (uint8_t *)&pop, (uint8_t *)&pop + 4);
 
-  // Placeholder for dlopen address
+  
   uint32_t dlopen_placeholder = 0;
   code.insert(code.end(), (uint8_t *)&dlopen_placeholder,
               (uint8_t *)&dlopen_placeholder + 4);
 
-  // Placeholder for lib path address
+  
   uint32_t path_placeholder = 0;
   code.insert(code.end(), (uint8_t *)&path_placeholder,
               (uint8_t *)&path_placeholder + 4);
 
-  // Add string
+  
   code.insert(code.end(), lib_path.begin(), lib_path.end());
   code.push_back(0);
 

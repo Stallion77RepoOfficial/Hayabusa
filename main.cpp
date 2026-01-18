@@ -18,16 +18,13 @@
 #include <unistd.h>
 #include <vector>
 
-// Global cleanup state for signal handling
-static volatile sig_atomic_t g_cleanup_needed = 0;
-
 void cleanup_attached_processes() {
-  // Cleanup all attached zygote processes
+  
   ZygoteTracer::cleanup_all_attached();
 }
 
 void signal_handler(int sig) {
-  // Use write() instead of cout for async-signal-safety
+  
   const char *msg =
       "\n[!] Signal received, cleaning up attached processes...\n";
   write(STDOUT_FILENO, msg, strlen(msg));
@@ -90,11 +87,17 @@ std::vector<uint8_t> read_file(const std::string &path) {
   size_t total = 0;
   while (total < data.size()) {
     ssize_t r = read(fd, data.data() + total, data.size() - total);
-    if (r <= 0)
+    if (r < 0) {
+      close(fd);
+      return {};
+    }
+    if (r == 0)
       break;
     total += r;
   }
   close(fd);
+  if (total < data.size())
+    data.resize(total);
   return data;
 }
 
@@ -545,19 +548,6 @@ std::vector<Region> get_maps(int pid) {
   return r;
 }
 
-std::vector<uint8_t> dump_mem(int pid, unsigned long addr, size_t size) {
-  std::vector<uint8_t> buf(size, 0);
-  int fd = open(("/proc/" + std::to_string(pid) + "/mem").c_str(), O_RDONLY);
-  if (fd < 0)
-    return buf;
-  for (size_t off = 0; off < size; off += 4096) {
-    size_t len = std::min((size_t)4096, size - off);
-    pread(fd, buf.data() + off, len, addr + off);
-  }
-  close(fd);
-  return buf;
-}
-
 void dump_memory(int pid, const std::string &pkg, const std::string &out) {
   auto regions = get_maps(pid);
   std::map<std::string, std::vector<Region>> grouped;
@@ -641,7 +631,7 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
           continue;
         if (r.start < base || r.end > base + size)
           continue;
-        auto chunk = dump_mem(pid, r.start, r.end - r.start);
+        auto chunk = Memory::dump(pid, r.start, r.end - r.start);
         size_t off = r.start - base;
         for (size_t i = 0; i < chunk.size() && off + i < size; i++) {
           if (chunk[i] != 0 && buf[off + i] == 0)
@@ -750,7 +740,7 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
     std::cout.flush();
   }
 
-  // DEX Dumping
+  
   std::cout << "    [DEX] Scanning for DEX files...\n";
   std::cout.flush();
 
@@ -777,7 +767,7 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
                 << " size=" << std::dec << dex_info.size << "\n";
       std::cout.flush();
 
-      // Dump raw DEX
+      
       auto raw_data =
           DexParser::dump_dex(pid, dex_info.base_addr, dex_info.size);
       if (raw_data.empty())
@@ -794,10 +784,10 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
       }
       base_name += "_" + std::to_string(dex_count++);
 
-      // Save raw
+      
       write_file(out + "/dex/raw/" + base_name + ".dex", raw_data);
 
-      // Handle VDEX container
+      
       if (dex_info.is_vdex) {
         auto extracted = DexParser::extract_dex_from_vdex(raw_data);
         for (size_t j = 0; j < extracted.size(); j++) {
@@ -808,7 +798,7 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
         continue;
       }
 
-      // Convert CompactDex if needed
+      
       std::vector<uint8_t> fixed_data;
       if (dex_info.is_compact || DexParser::is_compact_dex(raw_data)) {
         fixed_data = DexParser::convert_compact_dex_to_dex(raw_data);
@@ -816,7 +806,7 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
         fixed_data = raw_data;
       }
 
-      // Repair checksum
+      
       DexParser::fix_checksum(fixed_data);
       write_file(out + "/dex/fixed/" + base_name + ".dex", fixed_data);
     }
@@ -909,7 +899,7 @@ void cmd_dump(const std::string &pkg, ArchMode arch) {
 }
 
 int main(int argc, char *argv[]) {
-  // Register signal handlers for cleanup
+  
   register_signal_handlers();
 
   if (argc < 3) {
