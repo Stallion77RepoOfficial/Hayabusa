@@ -3,20 +3,20 @@
 #include <string>
 #include <vector>
 
-// DEX Magic constants
+
 static const uint8_t DEX_MAGIC[] = {'d', 'e', 'x', '\n'};
 static const uint8_t CDEX_MAGIC[] = {'c', 'd', 'e', 'x'};
 static const uint8_t VDEX_MAGIC[] = {'v', 'd', 'e', 'x'};
 static const uint8_t OAT_MAGIC[] = {'o', 'a', 't', '\n'};
 
-// DEX versions
+
 static const uint8_t DEX_VERSION_035[] = {'0', '3', '5', '\0'};
 static const uint8_t DEX_VERSION_037[] = {'0', '3', '7', '\0'};
 static const uint8_t DEX_VERSION_038[] = {'0', '3', '8', '\0'};
 static const uint8_t DEX_VERSION_039[] = {'0', '3', '9', '\0'};
 static const uint8_t DEX_VERSION_040[] = {'0', '4', '0', '\0'};
 
-// CompactDex versions
+
 static const uint8_t CDEX_VERSION_001[] = {'0', '0', '1', '\0'};
 static const uint8_t CDEX_VERSION_002[] = {'0', '0', '2', '\0'};
 
@@ -80,7 +80,7 @@ struct CompactDexHeader {
   uint32_t owned_data_end;
 };
 
-// VDEX version 006-018 (Android 8.0 - 9.0)
+
 struct VdexHeader_006 {
   uint8_t magic[4];
   uint8_t vdex_version[4];
@@ -90,7 +90,7 @@ struct VdexHeader_006 {
   uint32_t quickening_info_size;
 };
 
-// VDEX version 019-020 (Android 10)
+
 struct VdexHeader_019 {
   uint8_t magic[4];
   uint8_t vdex_version[4];
@@ -98,14 +98,14 @@ struct VdexHeader_019 {
   uint32_t verifier_deps_size;
 };
 
-// VDEX version 021-026 (Android 11)
+
 struct VdexHeader_021 {
   uint8_t magic[4];
   uint8_t vdex_version[4];
   uint32_t number_of_sections;
 };
 
-// VDEX version 027+ (Android 12+)
+
 struct VdexHeader_027 {
   uint8_t magic[4];
   uint8_t vdex_version[4];
@@ -115,7 +115,7 @@ struct VdexHeader_027 {
   uint32_t class_loader_context_size;
 };
 
-// Generic VDEX header for version detection
+
 struct VdexHeader {
   uint8_t magic[4];
   uint8_t vdex_version[4];
@@ -125,14 +125,14 @@ struct VdexHeader {
   uint32_t class_loader_context_size;
 };
 
-// VDEX section header for v021+
+
 struct VdexSectionHeader {
   uint32_t section_kind;
   uint32_t section_offset;
   uint32_t section_size;
 };
 
-// Section kinds for VDEX v021+
+
 enum VdexSectionKind {
   kVdexSectionChecksum = 0,
   kVdexSectionDexFile = 1,
@@ -141,13 +141,13 @@ enum VdexSectionKind {
   kVdexSectionNumberOfSections = 4,
 };
 
-// VDEX DEX file header (for locating DEX in VDEX)
+
 struct VdexDexFileHeader {
   uint32_t dex_checksum;
   uint32_t dex_offset;
 };
 
-// Quickening info size per DEX (v006-018)
+
 struct QuickeningInfoHeader {
   uint32_t quickening_info_size;
 };
@@ -221,7 +221,7 @@ struct DexMapList {
 
 #pragma pack(pop)
 
-// DEX Map Item Types
+
 enum DexMapItemType {
   kDexTypeHeaderItem = 0x0000,
   kDexTypeStringIdItem = 0x0001,
@@ -246,7 +246,7 @@ enum DexMapItemType {
   kDexTypeHiddenapiClassData = 0xF000,
 };
 
-// Access flags
+
 enum DexAccessFlags {
   kAccPublic = 0x0001,
   kAccPrivate = 0x0002,
@@ -305,23 +305,23 @@ struct DexMethodInfo {
 
 class DexParser {
 public:
-  // Magic detection
+  
   static bool is_dex(const std::vector<uint8_t> &data);
   static bool is_compact_dex(const std::vector<uint8_t> &data);
   static bool is_vdex(const std::vector<uint8_t> &data);
   static bool is_oat(const std::vector<uint8_t> &data);
   static std::string get_dex_version(const std::vector<uint8_t> &data);
 
-  // Memory scanning
+  
   static std::vector<DexInfo> find_dex_in_memory(int pid);
   static std::vector<uint64_t> scan_for_dex_magic(int pid, uint64_t start,
                                                   uint64_t end);
 
-  // Dumping
+  
   static std::vector<uint8_t> dump_dex(int pid, uint64_t addr, size_t size);
   static std::vector<uint8_t> dump_dex_by_header(int pid, uint64_t addr);
 
-  // Conversion
+  
   static std::vector<uint8_t>
   convert_compact_dex_to_dex(const std::vector<uint8_t> &cdex);
   static std::vector<std::vector<uint8_t>>
@@ -329,13 +329,13 @@ public:
   static std::vector<std::vector<uint8_t>>
   extract_dex_from_oat(const std::vector<uint8_t> &oat);
 
-  // Repair
+  
   static std::vector<uint8_t> repair_dex(const std::vector<uint8_t> &data);
   static uint32_t calculate_adler32(const uint8_t *data, size_t len);
   static void calculate_sha1(const uint8_t *data, size_t len, uint8_t *out);
   static bool fix_checksum(std::vector<uint8_t> &data);
 
-  // Parsing
+  
   static std::vector<DexClassInfo>
   get_classes(const std::vector<uint8_t> &data);
   static std::vector<DexMethodInfo>
@@ -346,19 +346,21 @@ public:
   static std::string get_type_by_idx(const std::vector<uint8_t> &data,
                                      uint32_t idx);
 
-  // Utilities
-  static uint32_t read_uleb128(const uint8_t *data, size_t *bytes_read);
-  static int32_t read_sleb128(const uint8_t *data, size_t *bytes_read);
+  
+  static uint32_t read_uleb128(const uint8_t *data, size_t max_len,
+                               size_t *bytes_read);
+  static int32_t read_sleb128(const uint8_t *data, size_t max_len,
+                              size_t *bytes_read);
 };
 
 class DexDumper {
 public:
-  // High-level dump functions
+  
   static std::vector<DexInfo> scan_dex_in_memory(int pid);
   static std::vector<uint8_t> dump_dex_file(int pid, const DexInfo &info);
   static int dump_all_dex(int pid, const std::string &output_dir);
 
-  // Runtime dumping with anti-anti-dump features
+  
   static bool wait_for_dex_load(int pid, const std::string &dex_name,
                                 int timeout_sec);
   static std::vector<uint8_t> dump_after_decrypt(int pid, uint64_t dex_addr,
@@ -366,7 +368,7 @@ public:
   static std::vector<uint8_t> dump_from_class_loader(int pid,
                                                      uint64_t class_loader);
 
-  // VDEX/OAT handling
+  
   static std::vector<std::string> find_vdex_files(int pid);
   static std::vector<std::string> find_oat_files(int pid);
   static int dump_vdex_dex(int pid, const std::string &vdex_path,
@@ -374,7 +376,7 @@ public:
   static int dump_oat_dex(int pid, const std::string &oat_path,
                           const std::string &output_dir);
 
-  // ART runtime specific
+  
   static std::vector<uint64_t> find_dex_file_objects(int pid);
   static uint64_t find_class_linker(int pid);
   static std::vector<uint64_t> get_boot_class_path_dex(int pid);

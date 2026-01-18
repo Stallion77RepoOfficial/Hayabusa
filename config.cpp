@@ -9,9 +9,9 @@ ConfigLoader &ConfigLoader::instance() {
   return instance;
 }
 
-// Simple parser for line-based config:
-// 64:34:class_linker=0x348
-// 32:30:heap=0xFC
+
+
+
 bool ConfigLoader::load_config(const std::string &path) {
   std::ifstream f(path);
   if (!f.is_open())
@@ -22,8 +22,8 @@ bool ConfigLoader::load_config(const std::string &path) {
     if (line.empty() || line[0] == '#')
       continue;
 
-    // Parse format: bitness:sdk:key=value
-    // Example: 64:34:class_linker=0x348
+    
+    
 
     size_t first_colon = line.find(':');
     size_t second_colon = line.find(':', first_colon + 1);

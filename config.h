@@ -20,8 +20,8 @@ class ConfigLoader {
 public:
   static ConfigLoader &instance();
 
-  // Loads simple key-value config
-  // format: 64:34:class_linker=0x348
+  
+  
   bool load_config(const std::string &path);
   ARTOffsetConfig get_offsets(int sdk_version, bool is_64bit);
 

@@ -402,6 +402,8 @@ std::vector<ElfString> ElfParser::get_strings(const std::vector<uint8_t> &data,
       current.clear();
     }
   }
+  if (current.length() >= min_len)
+    strings.push_back({start, current});
   return strings;
 }
 
@@ -1168,6 +1170,7 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
     const Elf32_Sym *syms =
         (const Elf32_Sym *)(data.data() + dynsym->sh_offset);
 
+    size_t sym_count = dynsym->sh_size / sizeof(Elf32_Sym);
     for (size_t i = 0; i < rel_count; i++) {
       uint32_t sym_idx = ELF32_R_SYM(rels[i].r_info);
       uint32_t type = ELF32_R_TYPE(rels[i].r_info);
@@ -1178,9 +1181,10 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
         e.got_offset = rels[i].r_offset;
         e.symbol_index = sym_idx;
 
-        if (sym_idx > 0) {
+        if (sym_idx > 0 && sym_idx < sym_count) {
           uint32_t str_off = syms[sym_idx].st_name;
-          e.symbol_name = get_string_at(data, dynstr->sh_offset + str_off);
+          if (str_off < dynstr->sh_size)
+            e.symbol_name = get_string_at(data, dynstr->sh_offset + str_off);
         }
         entries.push_back(e);
       }
@@ -2336,7 +2340,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
   std::vector<uint8_t> encrypted(data.begin() + offset,
                                  data.begin() + offset + length);
 
-  // Helper: calculate printable ratio
+  
   auto calc_printable_ratio = [](const std::vector<uint8_t> &buf) -> double {
     if (buf.empty())
       return 0.0;
@@ -2349,10 +2353,10 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     return (double)printable / buf.size();
   };
 
-  // Helper: check for known string patterns (URLs, paths, class names)
+  
   auto has_known_patterns = [](const std::vector<uint8_t> &buf) -> bool {
     std::string s(buf.begin(), buf.end());
-    // Common patterns in Android apps
+    
     if (s.find("http") != std::string::npos)
       return true;
     if (s.find("android") != std::string::npos)
@@ -2374,7 +2378,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     return false;
   };
 
-  // 1. Check if it's Base64 encoded
+  
   auto is_base64_char = [](uint8_t c) -> bool {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
            (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
@@ -2387,7 +2391,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
   }
 
   if (base64_count > (int)(length * 0.9) && length >= 4) {
-    // Try Base64 decode
+    
     static const uint8_t b64_table[256] = {
         64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
         64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
@@ -2434,7 +2438,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     }
   }
 
-  // 2. Single-byte XOR with improved scoring
+  
   for (uint8_t key = 1; key < 255; key++) {
     std::vector<uint8_t> decrypted = encrypted;
     for (auto &b : decrypted)
@@ -2456,9 +2460,9 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     }
   }
 
-  // 3. Multi-byte XOR with Kasiski-based key length detection
+  
   if (length >= 16 && results.empty()) {
-    // Find repeated sequences (simplified Kasiski)
+    
     std::map<int, int> distance_counts;
     for (size_t win = 3; win <= 5; win++) {
       for (size_t i = 0; i + win < length; i++) {
@@ -2474,7 +2478,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
       }
     }
 
-    // Try most likely key lengths
+    
     std::vector<int> key_lengths = {4, 8, 16, 2, 3, 6};
     for (auto &[len, count] : distance_counts) {
       if (count > 2 && len >= 2 && len <= 16) {
@@ -2491,7 +2495,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
       if (key_len > (int)length / 2)
         continue;
 
-      // Try to find key by frequency analysis
+      
       std::vector<uint8_t> key(key_len, 0);
       bool key_found = true;
 
@@ -2501,14 +2505,14 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
           freq[encrypted[i]]++;
         }
 
-        // Assume space (0x20) or 'e' (0x65) is most common
+        
         int max_idx = 0;
         for (int i = 0; i < 256; i++) {
           if (freq[i] > freq[max_idx])
             max_idx = i;
         }
 
-        // Try XOR with common chars
+        
         uint8_t best_key = 0;
         double best_ratio = 0;
         for (uint8_t common : {' ', 'e', 'a', 't', 'o', '\0'}) {
@@ -2553,7 +2557,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     }
   }
 
-  // 4. DWORD XOR (improved)
+  
   if (length >= 4 && results.empty()) {
     for (uint32_t key = 0x01010101; key < 0x10101010; key += 0x01010101) {
       std::vector<uint8_t> decrypted = encrypted;
@@ -2576,7 +2580,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     }
   }
 
-  // 5. ADD/SUB cipher (improved)
+  
   if (results.empty()) {
     for (int delta = -128; delta <= 127; delta++) {
       if (delta == 0)
