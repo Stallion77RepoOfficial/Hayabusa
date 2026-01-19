@@ -1039,9 +1039,15 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
   std::vector<uint8_t> result(size, 0);
   size_t page_count = (size + 4095) / 4096;
   std::vector<bool> captured(page_count, false);
+
   if (!attach(pid))
     return result;
+
+  // First pass: read everything we can
   read_memory(pid, base, result.data(), size);
+
+  // Mark pages that have data
+  size_t empty_pages = 0;
   for (size_t i = 0; i < page_count; i++) {
     bool has_data = false;
     size_t page_size = std::min<size_t>(4096, size - i * 4096);
@@ -1049,44 +1055,90 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
       if (result[i * 4096 + j] != 0)
         has_data = true;
     }
-    if (!has_data) {
-      set_protection(pid, base + i * 4096, page_size, PROT_NONE);
-    } else {
+    if (has_data) {
       captured[i] = true;
+    } else {
+      empty_pages++;
     }
   }
+
+  // Set empty pages to PROT_NONE to trigger faults
+  for (size_t i = 0; i < page_count; i++) {
+    if (!captured[i]) {
+      size_t page_size = std::min<size_t>(4096, size - i * 4096);
+      set_protection(pid, base + i * 4096, page_size, PROT_NONE);
+    }
+  }
+
   continue_process(pid);
   time_t start = time(nullptr);
+
   while (time(nullptr) - start < duration_sec) {
     int status;
     pid_t wpid = waitpid(pid, &status, WNOHANG);
+
     if (wpid == pid && WIFSTOPPED(status)) {
       int sig = WSTOPSIG(status);
+
       if (sig == SIGSEGV) {
-        uint64_t fault_addr = get_pc(pid);
-        size_t page_idx = (fault_addr - base) / 4096;
-        if (page_idx < captured.size() && !captured[page_idx]) {
-          size_t page_size = std::min<size_t>(4096, size - page_idx * 4096);
-          set_protection(pid, base + page_idx * 4096, page_size,
-                         PROT_READ | PROT_EXEC);
-          std::vector<uint8_t> page_data(page_size);
-          read_memory(pid, base + page_idx * 4096, page_data.data(), page_size);
-          memcpy(result.data() + page_idx * 4096, page_data.data(), page_size);
-          captured[page_idx] = true;
+        // Get fault address from siginfo
+        siginfo_t si;
+        if (ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si) >= 0) {
+          uint64_t fault_addr = (uint64_t)si.si_addr;
+
+          // Check if fault is in our range
+          if (fault_addr >= base && fault_addr < base + size) {
+            size_t page_idx = (fault_addr - base) / 4096;
+
+            if (page_idx < captured.size() && !captured[page_idx]) {
+              size_t page_size = std::min<size_t>(4096, size - page_idx * 4096);
+
+              // Restore protection FIRST
+              set_protection(pid, base + page_idx * 4096, page_size,
+                             PROT_READ | PROT_EXEC);
+
+              // Then read the data
+              std::vector<uint8_t> page_data(page_size);
+              read_memory(pid, base + page_idx * 4096, page_data.data(),
+                          page_size);
+              memcpy(result.data() + page_idx * 4096, page_data.data(),
+                     page_size);
+              captured[page_idx] = true;
+            }
+          } else {
+            // Fault outside our range - restore all and exit
+            for (size_t i = 0; i < captured.size(); i++) {
+              if (!captured[i]) {
+                set_protection(pid, base + i * 4096,
+                               std::min<size_t>(4096, size - i * 4096),
+                               PROT_READ | PROT_EXEC);
+                captured[i] = true;
+              }
+            }
+          }
         }
         continue_process(pid);
       } else {
+        // Forward other signals
         ptrace(PTRACE_CONT, pid, nullptr, (void *)(long)sig);
       }
+    } else if (wpid == pid && (WIFEXITED(status) || WIFSIGNALED(status))) {
+      // Process died - restore what we can and exit
+      break;
     }
+
     usleep(1000);
   }
+
+  // Restore all remaining protections
   for (size_t i = 0; i < captured.size(); i++) {
-    if (!captured[i])
+    if (!captured[i]) {
       set_protection(pid, base + i * 4096,
                      std::min<size_t>(4096, size - i * 4096),
                      PROT_READ | PROT_EXEC);
+    }
   }
+
   detach(pid);
   return result;
 }

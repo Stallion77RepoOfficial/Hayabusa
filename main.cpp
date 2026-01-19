@@ -18,13 +18,10 @@
 #include <unistd.h>
 #include <vector>
 
-void cleanup_attached_processes() {
-  
-  ZygoteTracer::cleanup_all_attached();
-}
+void cleanup_attached_processes() { ZygoteTracer::cleanup_all_attached(); }
 
 void signal_handler(int sig) {
-  
+
   const char *msg =
       "\n[!] Signal received, cleaning up attached processes...\n";
   write(STDOUT_FILENO, msg, strlen(msg));
@@ -740,7 +737,6 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
     std::cout.flush();
   }
 
-  
   std::cout << "    [DEX] Scanning for DEX files...\n";
   std::cout.flush();
 
@@ -767,7 +763,6 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
                 << " size=" << std::dec << dex_info.size << "\n";
       std::cout.flush();
 
-      
       auto raw_data =
           DexParser::dump_dex(pid, dex_info.base_addr, dex_info.size);
       if (raw_data.empty())
@@ -784,10 +779,8 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
       }
       base_name += "_" + std::to_string(dex_count++);
 
-      
       write_file(out + "/dex/raw/" + base_name + ".dex", raw_data);
 
-      
       if (dex_info.is_vdex) {
         auto extracted = DexParser::extract_dex_from_vdex(raw_data);
         for (size_t j = 0; j < extracted.size(); j++) {
@@ -798,7 +791,6 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
         continue;
       }
 
-      
       std::vector<uint8_t> fixed_data;
       if (dex_info.is_compact || DexParser::is_compact_dex(raw_data)) {
         fixed_data = DexParser::convert_compact_dex_to_dex(raw_data);
@@ -806,7 +798,6 @@ void dump_memory(int pid, const std::string &pkg, const std::string &out) {
         fixed_data = raw_data;
       }
 
-      
       DexParser::fix_checksum(fixed_data);
       write_file(out + "/dex/fixed/" + base_name + ".dex", fixed_data);
     }
@@ -899,7 +890,7 @@ void cmd_dump(const std::string &pkg, ArchMode arch) {
 }
 
 int main(int argc, char *argv[]) {
-  
+
   register_signal_handlers();
 
   if (argc < 3) {
