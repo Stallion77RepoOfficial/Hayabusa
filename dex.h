@@ -286,8 +286,8 @@ struct DexClassInfo {
   uint32_t access_flags;
   std::string super_class;
   uint32_t class_data_off;
-  size_t direct_methods_count;
-  size_t virtual_methods_count;
+  uint32_t direct_methods_count;
+  uint32_t virtual_methods_count;
 };
 
 struct DexMethodInfo {
