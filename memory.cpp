@@ -385,6 +385,300 @@ ElfParser::get_symbols(const std::vector<uint8_t> &data) {
   return symbols;
 }
 
+using SymbolEmit =
+    std::function<void(const char *name, uint64_t offset, uint64_t size,
+                       uint8_t type)>;
+
+static size_t iterate_symbols_shdr32(const std::vector<uint8_t> &data,
+                                     const Elf32_Ehdr *ehdr,
+                                     const SymbolEmit &emit) {
+  if (ehdr->e_shoff == 0 || ehdr->e_shentsize == 0 || ehdr->e_shnum == 0)
+    return 0;
+  if (ehdr->e_shoff + ehdr->e_shnum * ehdr->e_shentsize > data.size())
+    return 0;
+
+  size_t total = 0;
+  for (int i = 0; i < ehdr->e_shnum; i++) {
+    size_t shdr_off = ehdr->e_shoff + i * ehdr->e_shentsize;
+    const Elf32_Shdr *shdr =
+        reinterpret_cast<const Elf32_Shdr *>(data.data() + shdr_off);
+    if (shdr->sh_type != SHT_SYMTAB && shdr->sh_type != SHT_DYNSYM)
+      continue;
+    size_t strtab_off = ehdr->e_shoff + shdr->sh_link * ehdr->e_shentsize;
+    if (strtab_off + sizeof(Elf32_Shdr) > data.size())
+      continue;
+    const Elf32_Shdr *strtab_shdr =
+        reinterpret_cast<const Elf32_Shdr *>(data.data() + strtab_off);
+    if (shdr->sh_offset >= data.size() ||
+        strtab_shdr->sh_offset >= data.size())
+      continue;
+    const char *strtab =
+        reinterpret_cast<const char *>(data.data() + strtab_shdr->sh_offset);
+    size_t num_syms = shdr->sh_size / sizeof(Elf32_Sym);
+    for (size_t j = 0; j < num_syms; j++) {
+      size_t sym_off = shdr->sh_offset + j * sizeof(Elf32_Sym);
+      if (sym_off + sizeof(Elf32_Sym) > data.size())
+        break;
+      const Elf32_Sym *sym =
+          reinterpret_cast<const Elf32_Sym *>(data.data() + sym_off);
+      if (sym->st_name == 0 ||
+          strtab_shdr->sh_offset + sym->st_name >= data.size())
+        continue;
+      const char *name = strtab + sym->st_name;
+      emit(name, sym->st_value, sym->st_size, ELF32_ST_TYPE(sym->st_info));
+      total++;
+    }
+  }
+  return total;
+}
+
+static size_t iterate_symbols_shdr64(const std::vector<uint8_t> &data,
+                                     const Elf64_Ehdr *ehdr,
+                                     const SymbolEmit &emit) {
+  if (ehdr->e_shoff == 0 || ehdr->e_shentsize == 0 || ehdr->e_shnum == 0)
+    return 0;
+  if (ehdr->e_shoff + ehdr->e_shnum * ehdr->e_shentsize > data.size())
+    return 0;
+
+  size_t total = 0;
+  for (int i = 0; i < ehdr->e_shnum; i++) {
+    size_t shdr_off = ehdr->e_shoff + i * ehdr->e_shentsize;
+    const Elf64_Shdr *shdr =
+        reinterpret_cast<const Elf64_Shdr *>(data.data() + shdr_off);
+    if (shdr->sh_type != SHT_SYMTAB && shdr->sh_type != SHT_DYNSYM)
+      continue;
+    size_t strtab_off = ehdr->e_shoff + shdr->sh_link * ehdr->e_shentsize;
+    if (strtab_off + sizeof(Elf64_Shdr) > data.size())
+      continue;
+    const Elf64_Shdr *strtab_shdr =
+        reinterpret_cast<const Elf64_Shdr *>(data.data() + strtab_off);
+    if (shdr->sh_offset >= data.size() ||
+        strtab_shdr->sh_offset >= data.size())
+      continue;
+    const char *strtab =
+        reinterpret_cast<const char *>(data.data() + strtab_shdr->sh_offset);
+    size_t num_syms = shdr->sh_size / sizeof(Elf64_Sym);
+    for (size_t j = 0; j < num_syms; j++) {
+      size_t sym_off = shdr->sh_offset + j * sizeof(Elf64_Sym);
+      if (sym_off + sizeof(Elf64_Sym) > data.size())
+        break;
+      const Elf64_Sym *sym =
+          reinterpret_cast<const Elf64_Sym *>(data.data() + sym_off);
+      if (sym->st_name == 0 ||
+          strtab_shdr->sh_offset + sym->st_name >= data.size())
+        continue;
+      const char *name = strtab + sym->st_name;
+      emit(name, sym->st_value, sym->st_size, ELF64_ST_TYPE(sym->st_info));
+      total++;
+    }
+  }
+  return total;
+}
+
+static size_t iterate_symbols_dynamic32(const std::vector<uint8_t> &data,
+                                        const Elf32_Ehdr *ehdr,
+                                        const SymbolEmit &emit) {
+  if (ehdr->e_phoff == 0 || ehdr->e_phentsize == 0 || ehdr->e_phnum == 0)
+    return 0;
+  uint32_t dyn_addr = 0, dyn_sz = 0;
+  for (int i = 0; i < ehdr->e_phnum; i++) {
+    size_t ph_off = ehdr->e_phoff + i * ehdr->e_phentsize;
+    auto ph =
+        reinterpret_cast<const Elf32_Phdr *>(data.data() + ph_off);
+    if (ph->p_type == PT_DYNAMIC) {
+      dyn_addr = ph->p_offset;
+      dyn_sz = ph->p_filesz;
+      break;
+    }
+  }
+  if (dyn_addr == 0 || dyn_addr + dyn_sz > data.size())
+    return 0;
+  const Elf32_Dyn *dyn =
+      reinterpret_cast<const Elf32_Dyn *>(data.data() + dyn_addr);
+  uint32_t symtab = 0, strtab = 0, hash = 0;
+  for (size_t i = 0; i < dyn_sz / sizeof(Elf32_Dyn); i++) {
+    switch (dyn[i].d_tag) {
+    case DT_SYMTAB:
+      symtab = dyn[i].d_un.d_ptr;
+      break;
+    case DT_STRTAB:
+      strtab = dyn[i].d_un.d_ptr;
+      break;
+    case DT_HASH:
+      hash = dyn[i].d_un.d_ptr;
+      break;
+    }
+  }
+  uint32_t base = 0;
+  for (int i = 0; i < ehdr->e_phnum; i++) {
+    auto ph = reinterpret_cast<const Elf32_Phdr *>(
+        data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
+    if (ph->p_type == PT_LOAD) {
+      base = ph->p_vaddr;
+      break;
+    }
+  }
+  auto r = [&](uint32_t a) { return (a >= base) ? a - base : a; };
+  symtab = r(symtab);
+  strtab = r(strtab);
+  hash = r(hash);
+  size_t count = 0;
+  if (hash + 8 <= data.size()) {
+    const uint32_t *h =
+        reinterpret_cast<const uint32_t *>(data.data() + hash);
+    count = h[1];
+  }
+  if (symtab >= data.size() || strtab >= data.size() || count == 0)
+    return 0;
+
+  size_t total = 0;
+  for (size_t i = 0; i < count; i++) {
+    size_t sym_off = symtab + i * sizeof(Elf32_Sym);
+    if (sym_off + sizeof(Elf32_Sym) > data.size())
+      break;
+    const Elf32_Sym *sym =
+        reinterpret_cast<const Elf32_Sym *>(data.data() + sym_off);
+    if (sym->st_name == 0 || strtab + sym->st_name >= data.size())
+      continue;
+    const char *name =
+        reinterpret_cast<const char *>(data.data() + strtab + sym->st_name);
+    emit(name, sym->st_value, sym->st_size, ELF32_ST_TYPE(sym->st_info));
+    total++;
+  }
+  return total;
+}
+
+static size_t iterate_symbols_dynamic64(const std::vector<uint8_t> &data,
+                                        const Elf64_Ehdr *ehdr,
+                                        const SymbolEmit &emit) {
+  if (ehdr->e_phoff == 0 || ehdr->e_phentsize == 0 || ehdr->e_phnum == 0)
+    return 0;
+  uint64_t dyn_addr = 0, dyn_sz = 0;
+  for (int i = 0; i < ehdr->e_phnum; i++) {
+    size_t ph_off = ehdr->e_phoff + i * ehdr->e_phentsize;
+    auto ph =
+        reinterpret_cast<const Elf64_Phdr *>(data.data() + ph_off);
+    if (ph->p_type == PT_DYNAMIC) {
+      dyn_addr = ph->p_offset;
+      dyn_sz = ph->p_filesz;
+      break;
+    }
+  }
+  if (dyn_addr == 0 || dyn_addr + dyn_sz > data.size())
+    return 0;
+  const Elf64_Dyn *dyn =
+      reinterpret_cast<const Elf64_Dyn *>(data.data() + dyn_addr);
+  uint64_t symtab = 0, strtab = 0, hash = 0;
+  for (size_t i = 0; i < dyn_sz / sizeof(Elf64_Dyn); i++) {
+    switch (dyn[i].d_tag) {
+    case DT_SYMTAB:
+      symtab = dyn[i].d_un.d_ptr;
+      break;
+    case DT_STRTAB:
+      strtab = dyn[i].d_un.d_ptr;
+      break;
+    case DT_HASH:
+      hash = dyn[i].d_un.d_ptr;
+      break;
+    }
+  }
+  uint64_t base = 0;
+  for (int i = 0; i < ehdr->e_phnum; i++) {
+    auto ph = reinterpret_cast<const Elf64_Phdr *>(
+        data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
+    if (ph->p_type == PT_LOAD) {
+      base = ph->p_vaddr;
+      break;
+    }
+  }
+  auto r = [&](uint64_t a) { return (a >= base) ? a - base : a; };
+  symtab = r(symtab);
+  strtab = r(strtab);
+  hash = r(hash);
+  size_t count = 0;
+  if (hash + 8 <= data.size()) {
+    const uint32_t *h =
+        reinterpret_cast<const uint32_t *>(data.data() + hash);
+    count = h[1];
+  }
+  if (symtab >= data.size() || strtab >= data.size() || count == 0)
+    return 0;
+
+  size_t total = 0;
+  for (size_t i = 0; i < count; i++) {
+    size_t sym_off = symtab + i * sizeof(Elf64_Sym);
+    if (sym_off + sizeof(Elf64_Sym) > data.size())
+      break;
+    const Elf64_Sym *sym =
+        reinterpret_cast<const Elf64_Sym *>(data.data() + sym_off);
+    if (sym->st_name == 0 || strtab + sym->st_name >= data.size())
+      continue;
+    const char *name =
+        reinterpret_cast<const char *>(data.data() + strtab + sym->st_name);
+    emit(name, sym->st_value, sym->st_size, ELF64_ST_TYPE(sym->st_info));
+    total++;
+  }
+  return total;
+}
+
+static size_t iterate_symbols(const std::vector<uint8_t> &data,
+                              const SymbolEmit &emit) {
+  if (!ElfParser::is_elf(data))
+    return 0;
+  bool is32 = ElfParser::is_elf32(data);
+  if (is32) {
+    if (data.size() < sizeof(Elf32_Ehdr))
+      return 0;
+    const Elf32_Ehdr *ehdr =
+        reinterpret_cast<const Elf32_Ehdr *>(data.data());
+    size_t count = iterate_symbols_shdr32(data, ehdr, emit);
+    if (count > 0)
+      return count;
+    return iterate_symbols_dynamic32(data, ehdr, emit);
+  }
+
+  if (data.size() < sizeof(Elf64_Ehdr))
+    return 0;
+  const Elf64_Ehdr *ehdr =
+      reinterpret_cast<const Elf64_Ehdr *>(data.data());
+  size_t count = iterate_symbols_shdr64(data, ehdr, emit);
+  if (count > 0)
+    return count;
+  return iterate_symbols_dynamic64(data, ehdr, emit);
+}
+
+size_t ElfParser::count_symbols(const std::vector<uint8_t> &data) {
+  return iterate_symbols(data, [](const char *, uint64_t, uint64_t, uint8_t) {
+  });
+}
+
+size_t ElfParser::write_symbols(std::ostream &out,
+                                const std::vector<uint8_t> &data,
+                                std::vector<ElfSymbol> *vtables) {
+  auto emit = [&](const char *name, uint64_t offset, uint64_t size,
+                  uint8_t type) {
+    if (!name || name[0] == '\0')
+      return;
+    const char *type_str = "OTHER";
+    if (type == STT_FUNC)
+      type_str = "FUNC";
+    else if (type == STT_OBJECT)
+      type_str = "VAR";
+    std::string demangled = demangle_symbol(name);
+    out << "0x" << std::hex << std::setw(8) << std::setfill('0') << offset
+        << std::dec << " " << type_str << " " << demangled << "\n";
+    if (vtables && std::strncmp(name, "_ZTV", 4) == 0) {
+      ElfSymbol v;
+      v.name = name;
+      v.offset = offset;
+      v.size = size;
+      v.type = "VTABLE";
+      vtables->push_back(std::move(v));
+    }
+  };
+  return iterate_symbols(data, emit);
+}
+
 std::vector<ElfString> ElfParser::get_strings(const std::vector<uint8_t> &data,
                                               size_t min_len) {
   std::vector<ElfString> strings;
@@ -405,6 +699,60 @@ std::vector<ElfString> ElfParser::get_strings(const std::vector<uint8_t> &data,
   if (current.length() >= min_len)
     strings.push_back({start, current});
   return strings;
+}
+
+size_t ElfParser::count_strings(const std::vector<uint8_t> &data,
+                                size_t min_len) {
+  size_t count = 0;
+  size_t run = 0;
+  for (size_t i = 0; i < data.size(); i++) {
+    unsigned char c = data[i];
+    if (c >= 32 && c < 127) {
+      run++;
+    } else {
+      if (run >= min_len)
+        count++;
+      run = 0;
+    }
+  }
+  if (run >= min_len)
+    count++;
+  return count;
+}
+
+size_t ElfParser::write_strings(std::ostream &out,
+                                const std::vector<uint8_t> &data,
+                                size_t min_len) {
+  size_t count = 0;
+  size_t run = 0;
+  size_t start = 0;
+  for (size_t i = 0; i < data.size(); i++) {
+    unsigned char c = data[i];
+    if (c >= 32 && c < 127) {
+      if (run == 0)
+        start = i;
+      run++;
+    } else {
+      if (run >= min_len) {
+        out << "0x" << std::hex << std::setw(8) << std::setfill('0') << start
+            << std::dec << " ";
+        out.write(reinterpret_cast<const char *>(data.data() + start),
+                  static_cast<std::streamsize>(run));
+        out << "\n";
+        count++;
+      }
+      run = 0;
+    }
+  }
+  if (run >= min_len) {
+    out << "0x" << std::hex << std::setw(8) << std::setfill('0') << start
+        << std::dec << " ";
+    out.write(reinterpret_cast<const char *>(data.data() + start),
+              static_cast<std::streamsize>(run));
+    out << "\n";
+    count++;
+  }
+  return count;
 }
 
 static const char *g_shstrtab =
@@ -2094,6 +2442,65 @@ std::string ElfParser::generate_signature(const std::vector<uint8_t> &data,
   return sig.str();
 }
 
+static bool vaddr_to_offset(const std::vector<uint8_t> &data, uint64_t vaddr,
+                            size_t &offset_out) {
+  if (!ElfParser::is_elf(data))
+    return false;
+  bool is32 = ElfParser::is_elf32(data);
+
+  if (is32) {
+    if (data.size() < sizeof(Elf32_Ehdr))
+      return false;
+    const Elf32_Ehdr *ehdr =
+        reinterpret_cast<const Elf32_Ehdr *>(data.data());
+    if (ehdr->e_phoff == 0 || ehdr->e_phentsize == 0 || ehdr->e_phnum == 0)
+      return false;
+    if (ehdr->e_phoff + ehdr->e_phnum * ehdr->e_phentsize > data.size())
+      return false;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+      auto ph = reinterpret_cast<const Elf32_Phdr *>(
+          data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
+      if (ph->p_type != PT_LOAD)
+        continue;
+      uint64_t seg_start = ph->p_vaddr;
+      uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
+      if (vaddr >= seg_start && vaddr < seg_end) {
+        uint64_t off = ph->p_offset + (vaddr - seg_start);
+        if (off < data.size()) {
+          offset_out = static_cast<size_t>(off);
+          return true;
+        }
+      }
+    }
+  } else {
+    if (data.size() < sizeof(Elf64_Ehdr))
+      return false;
+    const Elf64_Ehdr *ehdr =
+        reinterpret_cast<const Elf64_Ehdr *>(data.data());
+    if (ehdr->e_phoff == 0 || ehdr->e_phentsize == 0 || ehdr->e_phnum == 0)
+      return false;
+    if (ehdr->e_phoff + ehdr->e_phnum * ehdr->e_phentsize > data.size())
+      return false;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+      auto ph = reinterpret_cast<const Elf64_Phdr *>(
+          data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
+      if (ph->p_type != PT_LOAD)
+        continue;
+      uint64_t seg_start = ph->p_vaddr;
+      uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
+      if (vaddr >= seg_start && vaddr < seg_end) {
+        uint64_t off = ph->p_offset + (vaddr - seg_start);
+        if (off < data.size()) {
+          offset_out = static_cast<size_t>(off);
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 std::vector<RTTIInfo> ElfParser::scan_rtti(const std::vector<uint8_t> &data,
                                            uint64_t base_addr) {
   std::vector<RTTIInfo> results;
@@ -2104,46 +2511,55 @@ std::vector<RTTIInfo> ElfParser::scan_rtti(const std::vector<uint8_t> &data,
   size_t ptr_size = is32 ? 4 : 8;
 
   auto symbols = get_symbols(data);
-  std::map<uint64_t, std::string> typeinfo_map;
-
+  std::vector<ElfSymbol> vtables;
+  vtables.reserve(symbols.size());
   for (const auto &s : symbols) {
-    if (s.name.find("_ZTI") == 0) {
-      typeinfo_map[s.offset] = s.name;
-    }
+    if (s.name.find("_ZTV") == 0)
+      vtables.push_back(s);
   }
+  std::sort(vtables.begin(), vtables.end(),
+            [](const ElfSymbol &a, const ElfSymbol &b) {
+              return a.offset < b.offset;
+            });
 
-  for (const auto &s : symbols) {
-    if (s.name.find("_ZTV") != 0)
-      continue;
+  for (size_t i = 0; i < vtables.size(); i++) {
+    const auto &s = vtables[i];
+
+    size_t vtable_off = 0;
+    if (!vaddr_to_offset(data, s.offset, vtable_off)) {
+      if (s.offset < data.size())
+        vtable_off = static_cast<size_t>(s.offset);
+      else
+        continue;
+    }
 
     RTTIInfo info;
-    info.vtable_addr = base_addr + s.offset;
+    info.vtable_addr = base_addr ? base_addr + s.offset : s.offset;
     info.class_name = s.name;
     info.demangled_name = demangle_symbol(s.name);
     info.base_class_typeinfo = 0;
+    info.typeinfo_addr = 0;
 
-    if (s.offset >= ptr_size * 2) {
+    if (vtable_off >= ptr_size * 2) {
       if (is32) {
         info.typeinfo_addr =
-            *(uint32_t *)(data.data() + s.offset - ptr_size * 2);
+            *(uint32_t *)(data.data() + vtable_off - ptr_size * 2);
       } else {
         info.typeinfo_addr =
-            *(uint64_t *)(data.data() + s.offset - ptr_size * 2);
+            *(uint64_t *)(data.data() + vtable_off - ptr_size * 2);
       }
     }
 
-    info.virtual_functions = get_vtable_functions(data, s.offset, base_addr);
+    size_t vtable_bytes = static_cast<size_t>(s.size);
+    if (vtable_bytes == 0 && i + 1 < vtables.size() &&
+        vtables[i + 1].offset > s.offset) {
+      vtable_bytes = static_cast<size_t>(vtables[i + 1].offset - s.offset);
+    }
+
+    info.virtual_functions =
+        get_vtable_functions(data, vtable_off, base_addr, vtable_bytes);
 
     results.push_back(info);
-  }
-
-  auto strings = get_strings(data, 4);
-  std::map<uint64_t, std::string> string_map;
-  for (const auto &s : strings) {
-    if (!s.value.empty() &&
-        (isdigit(s.value[0]) || (isupper(s.value[0]) && isalpha(s.value[1])))) {
-      string_map[s.offset] = s.value;
-    }
   }
 
   return results;
@@ -2166,40 +2582,183 @@ RTTIInfo ElfParser::find_vtable_by_name(const std::vector<uint8_t> &data,
 
 std::vector<uint64_t>
 ElfParser::get_vtable_functions(const std::vector<uint8_t> &data,
-                                uint64_t vtable_offset, uint64_t base_addr) {
+                                uint64_t vtable_offset, uint64_t base_addr,
+                                size_t max_bytes) {
   std::vector<uint64_t> funcs;
   if (vtable_offset >= data.size())
     return funcs;
+  size_t table_off = static_cast<size_t>(vtable_offset);
 
   bool is32 = is_elf32(data);
   size_t ptr_size = is32 ? 4 : 8;
 
-  size_t start = vtable_offset;
-
-  for (size_t i = 0; i < 200; i++) {
-    size_t off = start + i * ptr_size;
-    if (off + ptr_size > data.size())
-      break;
-
-    uint64_t func_ptr;
+  if (max_bytes == 0) {
+    if (!is_elf(data))
+      return funcs;
     if (is32) {
-      func_ptr = *(uint32_t *)(data.data() + off);
+      if (data.size() >= sizeof(Elf32_Ehdr)) {
+        const Elf32_Ehdr *ehdr =
+            reinterpret_cast<const Elf32_Ehdr *>(data.data());
+        if (ehdr->e_phoff != 0 &&
+            ehdr->e_phoff + ehdr->e_phnum * ehdr->e_phentsize <= data.size()) {
+          for (int i = 0; i < ehdr->e_phnum; i++) {
+            auto ph = reinterpret_cast<const Elf32_Phdr *>(
+                data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (ph->p_type != PT_LOAD)
+              continue;
+            uint64_t seg_off = ph->p_offset;
+            uint64_t seg_end = ph->p_offset + ph->p_filesz;
+            if (seg_off >= data.size())
+              continue;
+            if (seg_end > data.size())
+              seg_end = data.size();
+            if (table_off >= seg_off && table_off < seg_end) {
+              max_bytes = static_cast<size_t>(seg_end - table_off);
+              break;
+            }
+          }
+        }
+      }
     } else {
-      func_ptr = *(uint64_t *)(data.data() + off);
-    }
-
-    if (func_ptr == 0)
-      break;
-
-    uint64_t relative = func_ptr - base_addr;
-    if (relative < data.size()) {
-      funcs.push_back(func_ptr);
-    } else if (func_ptr < 0x1000) {
-      break;
+      if (data.size() >= sizeof(Elf64_Ehdr)) {
+        const Elf64_Ehdr *ehdr =
+            reinterpret_cast<const Elf64_Ehdr *>(data.data());
+        if (ehdr->e_phoff != 0 &&
+            ehdr->e_phoff + ehdr->e_phnum * ehdr->e_phentsize <= data.size()) {
+          for (int i = 0; i < ehdr->e_phnum; i++) {
+            auto ph = reinterpret_cast<const Elf64_Phdr *>(
+                data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (ph->p_type != PT_LOAD)
+              continue;
+            uint64_t seg_off = ph->p_offset;
+            uint64_t seg_end = ph->p_offset + ph->p_filesz;
+            if (seg_off >= data.size())
+              continue;
+            if (seg_end > data.size())
+              seg_end = data.size();
+            if (table_off >= seg_off && table_off < seg_end) {
+              max_bytes = static_cast<size_t>(seg_end - table_off);
+              break;
+            }
+          }
+        }
+      }
     }
   }
 
+  if (max_bytes == 0)
+    max_bytes = data.size() - table_off;
+
+  size_t max_off = table_off + max_bytes;
+  if (max_off < table_off || max_off > data.size())
+    max_off = data.size();
+
+  for (size_t off = table_off; off + ptr_size <= max_off;
+       off += ptr_size) {
+    uint64_t raw_ptr =
+        is32 ? *(uint32_t *)(data.data() + off)
+             : *(uint64_t *)(data.data() + off);
+
+    if (raw_ptr == 0)
+      break;
+
+    uint64_t absolute = raw_ptr;
+    if (base_addr != 0) {
+      if (raw_ptr < base_addr && raw_ptr < data.size()) {
+        absolute = base_addr + raw_ptr;
+      }
+    }
+
+    if (base_addr == 0 && absolute < 0x1000)
+      break;
+
+    funcs.push_back(absolute);
+  }
+
   return funcs;
+}
+
+size_t ElfParser::write_rtti(std::ostream &out,
+                             const std::vector<uint8_t> &data,
+                             uint64_t base_addr,
+                             const std::vector<ElfSymbol> &vtables) {
+  if (data.size() < 64 || vtables.empty()) {
+    out << "\n=== VTABLE/RTTI (0) ===\n";
+    return 0;
+  }
+
+  std::vector<const ElfSymbol *> sorted;
+  sorted.reserve(vtables.size());
+  for (const auto &v : vtables)
+    sorted.push_back(&v);
+  std::sort(sorted.begin(), sorted.end(),
+            [](const ElfSymbol *a, const ElfSymbol *b) {
+              return a->offset < b->offset;
+            });
+
+  bool is32 = is_elf32(data);
+  size_t ptr_size = is32 ? 4 : 8;
+
+  size_t valid = 0;
+  for (const auto *s : sorted) {
+    size_t vtable_off = 0;
+    if (vaddr_to_offset(data, s->offset, vtable_off)) {
+      valid++;
+      continue;
+    }
+    if (s->offset < data.size())
+      valid++;
+  }
+
+  out << "\n=== VTABLE/RTTI (" << valid << ") ===\n";
+  if (valid == 0)
+    return 0;
+
+  for (size_t i = 0; i < sorted.size(); i++) {
+    const auto *s = sorted[i];
+    size_t vtable_off = 0;
+    if (!vaddr_to_offset(data, s->offset, vtable_off)) {
+      if (s->offset < data.size())
+        vtable_off = static_cast<size_t>(s->offset);
+      else
+        continue;
+    }
+
+    uint64_t vtable_addr = base_addr ? base_addr + s->offset : s->offset;
+    uint64_t typeinfo_addr = 0;
+    if (vtable_off >= ptr_size * 2) {
+      if (is32) {
+        typeinfo_addr =
+            *(uint32_t *)(data.data() + vtable_off - ptr_size * 2);
+      } else {
+        typeinfo_addr =
+            *(uint64_t *)(data.data() + vtable_off - ptr_size * 2);
+      }
+    }
+
+    size_t vtable_bytes = static_cast<size_t>(s->size);
+    if (vtable_bytes == 0 && i + 1 < sorted.size()) {
+      uint64_t next_off = sorted[i + 1]->offset;
+      if (next_off > s->offset)
+        vtable_bytes = static_cast<size_t>(next_off - s->offset);
+    }
+
+    auto virtuals =
+        get_vtable_functions(data, vtable_off, base_addr, vtable_bytes);
+
+    out << "VTABLE 0x" << std::hex << std::setw(8) << std::setfill('0')
+        << vtable_addr << std::dec << " " << demangle_symbol(s->name) << "\n";
+    out << "  typeinfo: 0x" << std::hex << typeinfo_addr << std::dec << "\n";
+    if (!virtuals.empty()) {
+      out << "  virtuals (" << std::dec << virtuals.size() << "):";
+      for (auto fn : virtuals) {
+        out << " 0x" << std::hex << fn;
+      }
+      out << std::dec << "\n";
+    }
+  }
+
+  return valid;
 }
 
 StringXref ElfParser::find_string_xrefs(const std::vector<uint8_t> &data,
@@ -2340,7 +2899,6 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
   std::vector<uint8_t> encrypted(data.begin() + offset,
                                  data.begin() + offset + length);
 
-  
   auto calc_printable_ratio = [](const std::vector<uint8_t> &buf) -> double {
     if (buf.empty())
       return 0.0;
@@ -2353,10 +2911,9 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     return (double)printable / buf.size();
   };
 
-  
   auto has_known_patterns = [](const std::vector<uint8_t> &buf) -> bool {
     std::string s(buf.begin(), buf.end());
-    
+
     if (s.find("http") != std::string::npos)
       return true;
     if (s.find("android") != std::string::npos)
@@ -2378,7 +2935,6 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     return false;
   };
 
-  
   auto is_base64_char = [](uint8_t c) -> bool {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
            (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
@@ -2391,7 +2947,7 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
   }
 
   if (base64_count > (int)(length * 0.9) && length >= 4) {
-    
+
     static const uint8_t b64_table[256] = {
         64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
         64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
@@ -2438,7 +2994,6 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     }
   }
 
-  
   for (uint8_t key = 1; key < 255; key++) {
     std::vector<uint8_t> decrypted = encrypted;
     for (auto &b : decrypted)
@@ -2460,9 +3015,8 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     }
   }
 
-  
   if (length >= 16 && results.empty()) {
-    
+
     std::map<int, int> distance_counts;
     for (size_t win = 3; win <= 5; win++) {
       for (size_t i = 0; i + win < length; i++) {
@@ -2478,7 +3032,6 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
       }
     }
 
-    
     std::vector<int> key_lengths = {4, 8, 16, 2, 3, 6};
     for (auto &[len, count] : distance_counts) {
       if (count > 2 && len >= 2 && len <= 16) {
@@ -2495,7 +3048,6 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
       if (key_len > (int)length / 2)
         continue;
 
-      
       std::vector<uint8_t> key(key_len, 0);
       bool key_found = true;
 
@@ -2505,14 +3057,12 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
           freq[encrypted[i]]++;
         }
 
-        
         int max_idx = 0;
         for (int i = 0; i < 256; i++) {
           if (freq[i] > freq[max_idx])
             max_idx = i;
         }
 
-        
         uint8_t best_key = 0;
         double best_ratio = 0;
         for (uint8_t common : {' ', 'e', 'a', 't', 'o', '\0'}) {
@@ -2557,7 +3107,6 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     }
   }
 
-  
   if (length >= 4 && results.empty()) {
     for (uint32_t key = 0x01010101; key < 0x10101010; key += 0x01010101) {
       std::vector<uint8_t> decrypted = encrypted;
@@ -2580,7 +3129,6 @@ ElfParser::try_decrypt(const std::vector<uint8_t> &data, uint64_t offset,
     }
   }
 
-  
   if (results.empty()) {
     for (int delta = -128; delta <= 127; delta++) {
       if (delta == 0)

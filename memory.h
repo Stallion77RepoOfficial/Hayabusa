@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -101,8 +102,21 @@ public:
   static bool is_elf(const std::vector<uint8_t> &data);
   static bool is_elf32(const std::vector<uint8_t> &data);
   static std::vector<ElfSymbol> get_symbols(const std::vector<uint8_t> &data);
+  static size_t count_symbols(const std::vector<uint8_t> &data);
+  static size_t write_symbols(std::ostream &out,
+                              const std::vector<uint8_t> &data,
+                              std::vector<ElfSymbol> *vtables = nullptr);
   static std::vector<ElfString> get_strings(const std::vector<uint8_t> &data,
                                             size_t min_len);
+  static size_t count_strings(const std::vector<uint8_t> &data,
+                              size_t min_len);
+  static size_t write_strings(std::ostream &out,
+                              const std::vector<uint8_t> &data,
+                              size_t min_len);
+  static size_t write_rtti(std::ostream &out,
+                           const std::vector<uint8_t> &data,
+                           uint64_t base_addr,
+                           const std::vector<ElfSymbol> &vtables);
 
   struct PltEntry {
     uint64_t offset;
@@ -149,7 +163,7 @@ public:
 
   static std::vector<uint64_t>
   get_vtable_functions(const std::vector<uint8_t> &data, uint64_t vtable_offset,
-                       uint64_t base_addr = 0);
+                       uint64_t base_addr = 0, size_t max_bytes = 0);
 
   static StringXref find_string_xrefs(const std::vector<uint8_t> &data,
                                       const std::string &str,

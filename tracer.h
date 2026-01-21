@@ -1,5 +1,4 @@
 #pragma once
-#include "config.h"
 #include <cstdint>
 #include <elf.h>
 #include <functional>
@@ -114,12 +113,6 @@ struct EmbedContext {
   static constexpr size_t MAX_TOTAL_SIZE = 16 * 1024 * 1024;
 };
 
-struct JITRegion {
-  uint64_t addr;
-  size_t size;
-  std::vector<uint8_t> code;
-};
-
 struct LibraryRange {
   uint64_t start;
   uint64_t end;
@@ -147,7 +140,7 @@ uint64_t resolve_plt_arm64(int pid, uint64_t plt_addr);
 uint64_t resolve_plt_arm32(int pid, uint64_t plt_addr);
 uint64_t resolve_plt(int pid, uint64_t plt_addr, ArchMode arch);
 
-} // namespace InstructionDecoder
+}
 
 class ProcessTracer {
 public:
@@ -166,7 +159,6 @@ public:
   static uint64_t get_pc(int pid);
   static std::vector<uint8_t> dump_on_demand(int pid, uint64_t base,
                                              size_t size, int duration_sec);
-  static std::vector<JITRegion> capture_jit(int pid, int duration_sec);
   static std::vector<LibraryRange> get_library_ranges(int pid);
   static std::string
   find_library_for_address(const std::vector<LibraryRange> &ranges,
@@ -233,15 +225,6 @@ struct ShellcodeInfo {
   size_t data_size;
 };
 
-struct ARTMethodInfo {
-  uint64_t art_method_addr;
-  uint64_t entry_point;
-  std::string class_name;
-  std::string method_name;
-  std::string signature;
-  uint32_t access_flags;
-};
-
 class MemoryInjector {
 public:
   static uint64_t remote_mmap(int pid, uint64_t addr, size_t size, int prot,
@@ -289,15 +272,6 @@ public:
   static std::vector<std::pair<std::string, uint64_t>>
   dump_got(int pid, uint64_t base, const std::vector<uint8_t> &elf_data);
 
-  static uint64_t find_libart_base(int pid);
-  static uint64_t find_art_method(int pid, const std::string &class_name,
-                                  const std::string &method_name,
-                                  const std::string &signature);
-  static bool hook_art_method(int pid, uint64_t art_method, uint64_t hook,
-                              uint64_t *original_entry);
-  static std::vector<ARTMethodInfo>
-  enum_art_methods(int pid, const std::string &class_name);
-
   static std::vector<std::pair<std::string, uint64_t>>
   find_jni_functions(int pid, const std::string &lib_name);
   static bool hook_jni_function(int pid, uint64_t jni_func, uint64_t hook,
@@ -327,125 +301,6 @@ public:
 
   static int spawn_without_seccomp(const std::string &cmd);
   static bool inject_seccomp_disabler(int pid);
-};
-
-struct ARTOffsets {
-  size_t runtime_class_linker;
-  size_t runtime_heap;
-  size_t runtime_jit;
-  size_t classlinker_dex_caches;
-  size_t classlinker_boot_class_path;
-  size_t dexcache_dex_file;
-  size_t jit_code_cache;
-  bool valid;
-  int discovered_sdk;
-};
-
-namespace ARTOffsetFinder {
-
-ARTOffsets discover_offsets(int pid, uint64_t runtime_addr,
-                            uint64_t libart_base, int sdk_version);
-
-bool validate_offsets(int pid, uint64_t runtime_addr,
-                      const ARTOffsets &offsets);
-
-} // namespace ARTOffsetFinder
-
-struct ARTRuntimeInfo {
-  uint64_t runtime_addr;
-  uint64_t class_linker_addr;
-  uint64_t heap_addr;
-  uint64_t thread_list_addr;
-  int sdk_version;
-  bool is_debug_build;
-  std::string art_version;
-};
-
-struct ARTClassInfo {
-  uint64_t class_addr;
-  std::string descriptor;
-  uint32_t access_flags;
-  uint64_t super_class;
-  uint64_t methods_ptr;
-  uint32_t num_virtual_methods;
-  uint32_t num_direct_methods;
-};
-
-class ARTHooker {
-public:
-  static ARTRuntimeInfo find_art_runtime(int pid);
-  static int get_sdk_version(int pid);
-
-  static uint64_t find_class_by_descriptor(int pid,
-                                           const std::string &descriptor);
-  static ARTClassInfo get_class_info(int pid, uint64_t art_class);
-  static std::vector<ARTClassInfo> enumerate_loaded_classes(int pid);
-
-  static std::vector<ARTMethodInfo> get_class_methods(int pid,
-                                                      uint64_t art_class);
-  static uint64_t find_method(int pid, const std::string &class_name,
-                              const std::string &method_name,
-                              const std::string &signature);
-
-  static bool hook_method_entry(int pid, uint64_t art_method, uint64_t hook,
-                                uint64_t *original);
-  static bool hook_method_native(int pid, uint64_t art_method,
-                                 uint64_t native_func);
-
-  static bool force_interpreter_mode(int pid, uint64_t art_method);
-  static bool force_jit_compilation(int pid, uint64_t art_method);
-};
-
-struct JITCodeInfo {
-  uint64_t addr;
-  size_t size;
-  std::string method_name;
-  std::string class_name;
-  std::vector<uint64_t> call_targets;
-  std::vector<uint64_t> string_refs;
-  bool is_osr;
-  bool is_baseline;
-  bool is_optimized;
-  uint32_t hotness_count;
-};
-
-struct JITHook {
-  uint64_t compile_handler;
-  uint64_t original_handler;
-  uint64_t trampoline;
-  bool active;
-};
-
-struct JITCompileEvent {
-  uint64_t method_addr;
-  uint64_t code_addr;
-  size_t code_size;
-  std::string method_name;
-  time_t timestamp;
-};
-
-class JITAnalyzer {
-public:
-  static JITCodeInfo analyze_jit_code(const std::vector<uint8_t> &code,
-                                      uint64_t base_addr, ArchMode arch);
-  static std::vector<JITCodeInfo> analyze_jit_region(const JITRegion &region,
-                                                     int pid);
-
-  static std::string disassemble_arm64(const uint8_t *code, size_t size,
-                                       uint64_t base);
-  static std::string disassemble_arm32(const uint8_t *code, size_t size,
-                                       uint64_t base);
-
-  static bool hook_jit_compile(int pid, JITHook *hook);
-  static bool unhook_jit_compile(int pid, const JITHook &hook);
-
-  static std::vector<JITCompileEvent> monitor_jit_compiles(int pid,
-                                                           int duration_sec);
-  static std::vector<JITCodeInfo> capture_jit_with_analysis(int pid,
-                                                            int duration_sec);
-
-  static std::vector<JITRegion> dump_jit_code_cache(int pid);
-  static bool clear_jit_code_cache(int pid);
 };
 
 struct RelinkConfig {
