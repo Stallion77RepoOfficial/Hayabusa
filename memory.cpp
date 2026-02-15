@@ -35,6 +35,10 @@
 #define R_ARM_JUMP_SLOT 22
 #endif
 
+#ifndef PT_GNU_RELRO
+#define PT_GNU_RELRO 0x6474E552
+#endif
+
 std::vector<ModuleInfo> Memory::get_maps(int pid) {
   std::vector<ModuleInfo> mods;
   std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
@@ -147,247 +151,35 @@ bool ElfParser::is_elf32(const std::vector<uint8_t> &data) {
   return data.size() >= 5 && data[4] == ELFCLASS32;
 }
 
-std::vector<ElfSymbol>
-ElfParser::get_symbols(const std::vector<uint8_t> &data) {
-  std::vector<ElfSymbol> symbols;
-  if (data.size() < 16)
-    return symbols;
-  if (!is_elf(data))
-    return symbols;
-  bool is32 = is_elf32(data);
-  if (is32) {
-    if (data.size() < sizeof(Elf32_Ehdr))
-      return symbols;
-    const Elf32_Ehdr *ehdr = reinterpret_cast<const Elf32_Ehdr *>(data.data());
-    if (ehdr->e_shoff != 0 &&
-        ehdr->e_shoff + ehdr->e_shnum * ehdr->e_shentsize <= data.size()) {
-      for (int i = 0; i < ehdr->e_shnum; i++) {
-        size_t shdr_off = ehdr->e_shoff + i * ehdr->e_shentsize;
-        const Elf32_Shdr *shdr =
-            reinterpret_cast<const Elf32_Shdr *>(data.data() + shdr_off);
-        if (shdr->sh_type != SHT_SYMTAB && shdr->sh_type != SHT_DYNSYM)
-          continue;
-        size_t strtab_off = ehdr->e_shoff + shdr->sh_link * ehdr->e_shentsize;
-        if (strtab_off + sizeof(Elf32_Shdr) > data.size())
-          continue;
-        const Elf32_Shdr *strtab_shdr =
-            reinterpret_cast<const Elf32_Shdr *>(data.data() + strtab_off);
-        if (shdr->sh_offset >= data.size() ||
-            strtab_shdr->sh_offset >= data.size())
-          continue;
-        const char *strtab = reinterpret_cast<const char *>(
-            data.data() + strtab_shdr->sh_offset);
-        size_t num_syms = shdr->sh_size / sizeof(Elf32_Sym);
-        for (size_t j = 0; j < num_syms; j++) {
-          size_t sym_off = shdr->sh_offset + j * sizeof(Elf32_Sym);
-          if (sym_off + sizeof(Elf32_Sym) > data.size())
-            break;
-          const Elf32_Sym *sym =
-              reinterpret_cast<const Elf32_Sym *>(data.data() + sym_off);
-          if (sym->st_name == 0)
-            continue;
-          ElfSymbol s;
-          s.name = strtab + sym->st_name;
-          s.offset = sym->st_value;
-          s.size = sym->st_size;
-          int type = ELF32_ST_TYPE(sym->st_info);
-          s.type = (type == STT_FUNC) ? "FUNC"
-                                      : (type == STT_OBJECT ? "VAR" : "OTHER");
-          symbols.push_back(s);
-        }
-      }
-      if (!symbols.empty())
-        return symbols;
-    }
-    uint32_t dyn_addr = 0, dyn_sz = 0;
-    if (ehdr->e_phoff == 0)
-      return symbols;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-      size_t ph_off = ehdr->e_phoff + i * ehdr->e_phentsize;
-      auto ph = reinterpret_cast<const Elf32_Phdr *>(data.data() + ph_off);
-      if (ph->p_type == PT_DYNAMIC) {
-        dyn_addr = ph->p_offset;
-        dyn_sz = ph->p_filesz;
-        break;
-      }
-    }
-    if (dyn_addr == 0)
-      return symbols;
-    const Elf32_Dyn *dyn =
-        reinterpret_cast<const Elf32_Dyn *>(data.data() + dyn_addr);
-    uint32_t symtab = 0, strtab = 0, hash = 0;
-    for (size_t i = 0; i < dyn_sz / sizeof(Elf32_Dyn); i++) {
-      switch (dyn[i].d_tag) {
-      case DT_SYMTAB:
-        symtab = dyn[i].d_un.d_ptr;
-        break;
-      case DT_STRTAB:
-        strtab = dyn[i].d_un.d_ptr;
-        break;
-      case DT_HASH:
-        hash = dyn[i].d_un.d_ptr;
-        break;
-      }
-    }
-    uint32_t base = 0;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-      auto ph = reinterpret_cast<const Elf32_Phdr *>(
-          data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
-      if (ph->p_type == PT_LOAD) {
-        base = ph->p_vaddr;
-        break;
-      }
-    }
-    auto r = [&](uint32_t a) { return (a >= base) ? a - base : a; };
-    symtab = r(symtab);
-    strtab = r(strtab);
-    hash = r(hash);
-    size_t count = 0;
-    if (hash + 8 <= data.size()) {
-      const uint32_t *h =
-          reinterpret_cast<const uint32_t *>(data.data() + hash);
-      count = h[1];
-    }
-    if (symtab >= data.size() || strtab >= data.size() || count == 0)
-      return symbols;
-    for (size_t i = 0; i < count; i++) {
-      size_t sym_off = symtab + i * sizeof(Elf32_Sym);
-      if (sym_off + sizeof(Elf32_Sym) > data.size())
-        break;
-      const Elf32_Sym *sym =
-          reinterpret_cast<const Elf32_Sym *>(data.data() + sym_off);
-      if (sym->st_name == 0 || strtab + sym->st_name >= data.size())
-        continue;
-      ElfSymbol s;
-      s.name =
-          reinterpret_cast<const char *>(data.data() + strtab + sym->st_name);
-      s.offset = sym->st_value;
-      s.size = sym->st_size;
-      int type = ELF32_ST_TYPE(sym->st_info);
-      s.type =
-          (type == STT_FUNC) ? "FUNC" : (type == STT_OBJECT ? "VAR" : "OTHER");
-      symbols.push_back(s);
-    }
-  } else {
-    if (data.size() < sizeof(Elf64_Ehdr))
-      return symbols;
-    const Elf64_Ehdr *ehdr = reinterpret_cast<const Elf64_Ehdr *>(data.data());
-    if (ehdr->e_shoff != 0 &&
-        ehdr->e_shoff + ehdr->e_shnum * ehdr->e_shentsize <= data.size()) {
-      for (int i = 0; i < ehdr->e_shnum; i++) {
-        size_t shdr_off = ehdr->e_shoff + i * ehdr->e_shentsize;
-        const Elf64_Shdr *shdr =
-            reinterpret_cast<const Elf64_Shdr *>(data.data() + shdr_off);
-        if (shdr->sh_type != SHT_SYMTAB && shdr->sh_type != SHT_DYNSYM)
-          continue;
-        size_t strtab_off = ehdr->e_shoff + shdr->sh_link * ehdr->e_shentsize;
-        if (strtab_off + sizeof(Elf64_Shdr) > data.size())
-          continue;
-        const Elf64_Shdr *strtab_shdr =
-            reinterpret_cast<const Elf64_Shdr *>(data.data() + strtab_off);
-        if (shdr->sh_offset >= data.size() ||
-            strtab_shdr->sh_offset >= data.size())
-          continue;
-        const char *strtab = reinterpret_cast<const char *>(
-            data.data() + strtab_shdr->sh_offset);
-        size_t num_syms = shdr->sh_size / sizeof(Elf64_Sym);
-        for (size_t j = 0; j < num_syms; j++) {
-          size_t sym_off = shdr->sh_offset + j * sizeof(Elf64_Sym);
-          if (sym_off + sizeof(Elf64_Sym) > data.size())
-            break;
-          const Elf64_Sym *sym =
-              reinterpret_cast<const Elf64_Sym *>(data.data() + sym_off);
-          if (sym->st_name == 0)
-            continue;
-          ElfSymbol s;
-          s.name = strtab + sym->st_name;
-          s.offset = sym->st_value;
-          s.size = sym->st_size;
-          int type = ELF64_ST_TYPE(sym->st_info);
-          s.type = (type == STT_FUNC) ? "FUNC"
-                                      : (type == STT_OBJECT ? "VAR" : "OTHER");
-          symbols.push_back(s);
-        }
-      }
-      if (!symbols.empty())
-        return symbols;
-    }
-    uint64_t dyn_addr = 0, dyn_sz = 0;
-    if (ehdr->e_phoff == 0)
-      return symbols;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-      size_t ph_off = ehdr->e_phoff + i * ehdr->e_phentsize;
-      auto ph = reinterpret_cast<const Elf64_Phdr *>(data.data() + ph_off);
-      if (ph->p_type == PT_DYNAMIC) {
-        dyn_addr = ph->p_offset;
-        dyn_sz = ph->p_filesz;
-        break;
-      }
-    }
-    if (dyn_addr == 0)
-      return symbols;
-    const Elf64_Dyn *dyn =
-        reinterpret_cast<const Elf64_Dyn *>(data.data() + dyn_addr);
-    uint64_t symtab = 0, strtab = 0, hash = 0;
-    for (size_t i = 0; i < dyn_sz / sizeof(Elf64_Dyn); i++) {
-      switch (dyn[i].d_tag) {
-      case DT_SYMTAB:
-        symtab = dyn[i].d_un.d_ptr;
-        break;
-      case DT_STRTAB:
-        strtab = dyn[i].d_un.d_ptr;
-        break;
-      case DT_HASH:
-        hash = dyn[i].d_un.d_ptr;
-        break;
-      }
-    }
-    uint64_t base = 0;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-      auto ph = reinterpret_cast<const Elf64_Phdr *>(
-          data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
-      if (ph->p_type == PT_LOAD) {
-        base = ph->p_vaddr;
-        break;
-      }
-    }
-    auto r = [&](uint64_t a) { return (a >= base) ? a - base : a; };
-    symtab = r(symtab);
-    strtab = r(strtab);
-    hash = r(hash);
-    size_t count = 0;
-    if (hash + 8 <= data.size()) {
-      const uint32_t *h =
-          reinterpret_cast<const uint32_t *>(data.data() + hash);
-      count = h[1];
-    }
-    if (symtab >= data.size() || strtab >= data.size() || count == 0)
-      return symbols;
-    for (size_t i = 0; i < count; i++) {
-      size_t sym_off = symtab + i * sizeof(Elf64_Sym);
-      if (sym_off + sizeof(Elf64_Sym) > data.size())
-        break;
-      const Elf64_Sym *sym =
-          reinterpret_cast<const Elf64_Sym *>(data.data() + sym_off);
-      if (sym->st_name == 0 || strtab + sym->st_name >= data.size())
-        continue;
-      ElfSymbol s;
-      s.name =
-          reinterpret_cast<const char *>(data.data() + strtab + sym->st_name);
-      s.offset = sym->st_value;
-      s.size = sym->st_size;
-      int type = ELF64_ST_TYPE(sym->st_info);
-      s.type =
-          (type == STT_FUNC) ? "FUNC" : (type == STT_OBJECT ? "VAR" : "OTHER");
-      symbols.push_back(s);
-    }
-  }
-  return symbols;
-}
-
 using SymbolEmit =
     std::function<void(const char *name, uint64_t offset, uint64_t size,
                        uint8_t type)>;
+
+static size_t iterate_symbols(const std::vector<uint8_t> &data,
+                              const SymbolEmit &emit);
+
+std::vector<ElfSymbol>
+ElfParser::get_symbols(const std::vector<uint8_t> &data) {
+  std::vector<ElfSymbol> symbols;
+  if (data.size() < 16 || !is_elf(data))
+    return symbols;
+
+  iterate_symbols(data,
+                  [&](const char *name, uint64_t offset, uint64_t size,
+                      uint8_t type) {
+                    if (!name || name[0] == '\0')
+                      return;
+                    ElfSymbol s;
+                    s.name = name;
+                    s.offset = offset;
+                    s.size = size;
+                    s.type = (type == STT_FUNC)    ? "FUNC"
+                             : (type == STT_OBJECT) ? "VAR"
+                                                    : "OTHER";
+                    symbols.push_back(s);
+                  });
+  return symbols;
+}
 
 static size_t iterate_symbols_shdr32(const std::vector<uint8_t> &data,
                                      const Elf32_Ehdr *ehdr,
@@ -2185,14 +1977,14 @@ bool ElfParser::has_relro(const std::vector<uint8_t> &data) {
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
     const Elf32_Phdr *phdrs = (const Elf32_Phdr *)(data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
-      if (phdrs[i].p_type == 0x6474E552)
+      if (phdrs[i].p_type == PT_GNU_RELRO)
         return true;
     }
   } else {
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
     const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
-      if (phdrs[i].p_type == 0x6474E552)
+      if (phdrs[i].p_type == PT_GNU_RELRO)
         return true;
     }
   }
@@ -2237,8 +2029,8 @@ ElfParser::get_init_array(const std::vector<uint8_t> &data) {
   std::vector<uint64_t> funcs;
   bool is32 = is_elf32(data);
 
-  uint64_t init_arr = find_dynamic_entry(data, 25, is32);
-  uint64_t init_sz = find_dynamic_entry(data, 27, is32);
+  uint64_t init_arr = find_dynamic_entry(data, DT_INIT_ARRAY, is32);
+  uint64_t init_sz = find_dynamic_entry(data, DT_INIT_ARRAYSZ, is32);
 
   if (init_arr == 0 || init_sz == 0)
     return funcs;
@@ -2270,8 +2062,8 @@ ElfParser::get_fini_array(const std::vector<uint8_t> &data) {
   std::vector<uint64_t> funcs;
   bool is32 = is_elf32(data);
 
-  uint64_t fini_arr = find_dynamic_entry(data, 26, is32);
-  uint64_t fini_sz = find_dynamic_entry(data, 28, is32);
+  uint64_t fini_arr = find_dynamic_entry(data, DT_FINI_ARRAY, is32);
+  uint64_t fini_sz = find_dynamic_entry(data, DT_FINI_ARRAYSZ, is32);
 
   if (fini_arr == 0 || fini_sz == 0)
     return funcs;

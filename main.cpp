@@ -23,6 +23,9 @@ int g_pid = -1;
 const char *g_current_module = nullptr;
 const char *g_current_step = nullptr;
 
+static constexpr const char *USAGE =
+    "Usage: hayabusa dump <package> --mode <arm32|arm64> [--timeout <sec>]\n";
+
 void cleanup() { ZygoteTracer::cleanup_all_attached(); }
 
 void signal_handler(int sig) {
@@ -90,6 +93,56 @@ bool read_exact(int fd, void *buf, size_t size, uint64_t offset) {
   return true;
 }
 
+template <typename Ehdr, typename Phdr>
+static bool read_elf_image_impl(int mem_fd, uint64_t base,
+                                std::vector<uint8_t> &out,
+                                uint64_t &image_size) {
+  Ehdr ehdr;
+  if (!read_exact(mem_fd, &ehdr, sizeof(ehdr), base))
+    return false;
+  if (ehdr.e_phoff == 0 || ehdr.e_phnum == 0 ||
+      ehdr.e_phentsize != sizeof(Phdr))
+    return false;
+  size_t ph_size = ehdr.e_phnum * sizeof(Phdr);
+  std::vector<Phdr> phdrs(ehdr.e_phnum);
+  if (!read_exact(mem_fd, phdrs.data(), ph_size, base + ehdr.e_phoff))
+    return false;
+
+  for (const auto &ph : phdrs) {
+    if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
+      continue;
+    uint64_t end = static_cast<uint64_t>(ph.p_offset) + ph.p_filesz;
+    if (end > image_size)
+      image_size = end;
+  }
+  if (image_size == 0 || image_size > std::numeric_limits<size_t>::max())
+    return false;
+
+  out.assign(static_cast<size_t>(image_size), 0);
+
+  for (const auto &ph : phdrs) {
+    if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
+      continue;
+    uint64_t src = base + ph.p_vaddr;
+    uint64_t dst_off = ph.p_offset;
+    uint64_t seg_size = ph.p_filesz;
+    if (dst_off >= out.size())
+      continue;
+    if (dst_off + seg_size > out.size())
+      seg_size = out.size() - dst_off;
+    uint8_t *dest = out.data() + static_cast<size_t>(dst_off);
+    for (uint64_t page_off = 0; page_off < seg_size; page_off += 4096) {
+      size_t len = std::min<uint64_t>(4096, seg_size - page_off);
+      ssize_t rd = pread(mem_fd, dest + page_off, len, src + page_off);
+      if (rd < 0)
+        memset(dest + page_off, 0, len);
+      else if ((size_t)rd < len)
+        memset(dest + page_off + rd, 0, len - rd);
+    }
+  }
+  return true;
+}
+
 bool read_elf_image(int mem_fd, uint64_t base, std::vector<uint8_t> &out,
                     uint64_t &image_size) {
   unsigned char ident[EI_NIDENT] = {0};
@@ -100,104 +153,12 @@ bool read_elf_image(int mem_fd, uint64_t base, std::vector<uint8_t> &out,
     return false;
 
   image_size = 0;
-  if (ident[EI_CLASS] == ELFCLASS32) {
-    Elf32_Ehdr ehdr;
-    if (!read_exact(mem_fd, &ehdr, sizeof(ehdr), base))
-      return false;
-    if (ehdr.e_phoff == 0 || ehdr.e_phnum == 0 ||
-        ehdr.e_phentsize != sizeof(Elf32_Phdr))
-      return false;
-    size_t ph_size = ehdr.e_phnum * sizeof(Elf32_Phdr);
-    std::vector<Elf32_Phdr> phdrs(ehdr.e_phnum);
-    if (!read_exact(mem_fd, phdrs.data(), ph_size, base + ehdr.e_phoff))
-      return false;
-
-    for (const auto &ph : phdrs) {
-      if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
-        continue;
-      uint64_t end = static_cast<uint64_t>(ph.p_offset) + ph.p_filesz;
-      if (end > image_size)
-        image_size = end;
-    }
-    if (image_size == 0 ||
-        image_size > std::numeric_limits<size_t>::max())
-      return false;
-
-    out.assign(static_cast<size_t>(image_size), 0);
-
-    for (const auto &ph : phdrs) {
-      if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
-        continue;
-      uint64_t src = base + ph.p_vaddr;
-      uint64_t dst_off = ph.p_offset;
-      uint64_t seg_size = ph.p_filesz;
-      if (dst_off >= out.size())
-        continue;
-      if (dst_off + seg_size > out.size())
-        seg_size = out.size() - dst_off;
-      uint8_t *dest = out.data() + static_cast<size_t>(dst_off);
-      for (uint64_t page_off = 0; page_off < seg_size; page_off += 4096) {
-        size_t len = std::min<uint64_t>(4096, seg_size - page_off);
-        ssize_t rd =
-            pread(mem_fd, dest + page_off, len, src + page_off);
-        if (rd < 0)
-          memset(dest + page_off, 0, len);
-        else if ((size_t)rd < len)
-          memset(dest + page_off + rd, 0, len - rd);
-      }
-    }
-    return true;
-  }
-
-  if (ident[EI_CLASS] == ELFCLASS64) {
-    Elf64_Ehdr ehdr;
-    if (!read_exact(mem_fd, &ehdr, sizeof(ehdr), base))
-      return false;
-    if (ehdr.e_phoff == 0 || ehdr.e_phnum == 0 ||
-        ehdr.e_phentsize != sizeof(Elf64_Phdr))
-      return false;
-    size_t ph_size = ehdr.e_phnum * sizeof(Elf64_Phdr);
-    std::vector<Elf64_Phdr> phdrs(ehdr.e_phnum);
-    if (!read_exact(mem_fd, phdrs.data(), ph_size, base + ehdr.e_phoff))
-      return false;
-
-    for (const auto &ph : phdrs) {
-      if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
-        continue;
-      uint64_t end = ph.p_offset + ph.p_filesz;
-      if (end > image_size)
-        image_size = end;
-    }
-    if (image_size == 0 ||
-        image_size > std::numeric_limits<size_t>::max())
-      return false;
-
-    out.assign(static_cast<size_t>(image_size), 0);
-
-    for (const auto &ph : phdrs) {
-      if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
-        continue;
-      uint64_t src = base + ph.p_vaddr;
-      uint64_t dst_off = ph.p_offset;
-      uint64_t seg_size = ph.p_filesz;
-      if (dst_off >= out.size())
-        continue;
-      if (dst_off + seg_size > out.size())
-        seg_size = out.size() - dst_off;
-      uint8_t *dest = out.data() + static_cast<size_t>(dst_off);
-      for (uint64_t page_off = 0; page_off < seg_size; page_off += 4096) {
-        size_t len = std::min<uint64_t>(4096, seg_size - page_off);
-        ssize_t rd =
-            pread(mem_fd, dest + page_off, len, src + page_off);
-        if (rd < 0)
-          memset(dest + page_off, 0, len);
-        else if ((size_t)rd < len)
-          memset(dest + page_off + rd, 0, len - rd);
-      }
-    }
-    return true;
-  }
-
+  if (ident[EI_CLASS] == ELFCLASS32)
+    return read_elf_image_impl<Elf32_Ehdr, Elf32_Phdr>(mem_fd, base, out,
+                                                        image_size);
+  if (ident[EI_CLASS] == ELFCLASS64)
+    return read_elf_image_impl<Elf64_Ehdr, Elf64_Phdr>(mem_fd, base, out,
+                                                        image_size);
   return false;
 }
 
@@ -610,8 +571,8 @@ void analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
 }
 
 struct Region {
-  unsigned long start, end;
-  unsigned long offset;
+  uint64_t start, end;
+  uint64_t offset;
   std::string perms, name;
 };
 
@@ -644,7 +605,7 @@ std::string make_safe_name(const std::string &name) {
   return safe;
 }
 
-std::vector<Region> get_maps(int pid) {
+std::vector<Region> get_regions(int pid) {
   std::vector<Region> r;
   std::ifstream f("/proc/" + std::to_string(pid) + "/maps");
   std::string line;
@@ -671,7 +632,7 @@ std::vector<Region> get_maps(int pid) {
 
 int dump_analysis(int pid, const std::string &out,
                   std::map<uint64_t, ModuleState> &state_by_base) {
-  auto regions = get_maps(pid);
+  auto regions = get_regions(pid);
 
   int mem_fd = open(("/proc/" + std::to_string(pid) + "/mem").c_str(),
                     O_RDONLY);
@@ -858,16 +819,14 @@ int main(int argc, char *argv[]) {
   atexit(cleanup);
 
   if (argc < 5) {
-    std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64> "
-                 "[--timeout <sec>]\n";
+    std::cout << USAGE;
     return 1;
   }
 
   std::string cmd = argv[1];
   std::string pkg = argv[2];
   if (cmd != "dump") {
-    std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64> "
-                 "[--timeout <sec>]\n";
+    std::cout << USAGE;
     return 1;
   }
 
@@ -884,8 +843,7 @@ int main(int argc, char *argv[]) {
       else if (mode_value == "arm64")
         arch = ArchMode::ARM64;
       else {
-        std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64> "
-                     "[--timeout <sec>]\n";
+        std::cout << USAGE;
         return 1;
       }
       have_mode = true;
@@ -894,15 +852,13 @@ int main(int argc, char *argv[]) {
       if (timeout_sec < 0)
         timeout_sec = 0;
     } else {
-      std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64> "
-                   "[--timeout <sec>]\n";
+      std::cout << USAGE;
       return 1;
     }
   }
 
   if (!have_mode) {
-    std::cout << "Usage: hayabusa dump <package> --mode <arm32|arm64> "
-                 "[--timeout <sec>]\n";
+    std::cout << USAGE;
     return 1;
   }
 

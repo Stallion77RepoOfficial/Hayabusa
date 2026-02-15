@@ -70,6 +70,67 @@ struct user_regs_struct_32 {
   uint32_t regs[18];
 };
 
+static constexpr int SYS_MMAP_64 = 222;
+static constexpr int SYS_MUNMAP_64 = 215;
+static constexpr int SYS_MPROTECT_64 = 226;
+static constexpr int SYS_MEMFD_CREATE_64 = 279;
+static constexpr int SYS_MMAP2_32 = 192;
+static constexpr int SYS_MUNMAP_32 = 91;
+static constexpr int SYS_MPROTECT_32 = 125;
+
+static uint64_t execute_syscall(int pid, const std::vector<uint64_t> &args,
+                                int syscall_nr) {
+  if (g_arch == ArchMode::ARM64) {
+    user_regs_struct_64 orig_regs, regs;
+    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
+    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    regs = orig_regs;
+    for (size_t i = 0; i < args.size() && i < 8; i++)
+      regs.regs[i] = args[i];
+    regs.regs[8] = syscall_nr;
+    uint64_t pc = regs.pc;
+    uint32_t orig_inst;
+    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
+    uint32_t svc_inst = 0xD4000001;
+    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
+    iov.iov_base = &regs;
+    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+    int status;
+    waitpid(pid, &status, 0);
+    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    uint64_t result = regs.regs[0];
+    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+    iov.iov_base = &orig_regs;
+    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    return result;
+  } else {
+    user_regs_struct_32 orig_regs, regs;
+    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
+    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    regs = orig_regs;
+    for (size_t i = 0; i < args.size() && i < 6; i++)
+      regs.regs[i] = (uint32_t)args[i];
+    regs.regs[7] = syscall_nr;
+    uint32_t pc = regs.regs[15];
+    uint32_t orig_inst;
+    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
+    uint32_t svc_inst = 0xEF000000;
+    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
+    iov.iov_base = &regs;
+    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+    int status;
+    waitpid(pid, &status, 0);
+    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    uint32_t result = regs.regs[0];
+    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+    iov.iov_base = &orig_regs;
+    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    return result;
+  }
+}
+
 namespace InstructionDecoder {
 
 DecodedInstruction decode_arm64(uint32_t inst, uint64_t addr) {
@@ -913,51 +974,9 @@ bool ProcessTracer::write_memory(int pid, uint64_t addr, const void *buf,
 
 bool ProcessTracer::set_protection(int pid, uint64_t addr, size_t len,
                                    int prot) {
-  if (g_arch == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-    regs.regs[0] = addr;
-    regs.regs[1] = len;
-    regs.regs[2] = prot;
-    regs.regs[8] = 226;
-    uint64_t pc = regs.pc;
-    uint32_t orig_inst;
-    read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xD4000001;
-    write_memory(pid, pc, &svc_inst, 4);
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-  } else {
-    user_regs_struct_32 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-    regs.regs[0] = (uint32_t)addr;
-    regs.regs[1] = (uint32_t)len;
-    regs.regs[2] = (uint32_t)prot;
-    regs.regs[7] = 125;
-    uint32_t pc = regs.regs[15];
-    uint32_t orig_inst;
-    read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xEF000000;
-    write_memory(pid, pc, &svc_inst, 4);
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-  }
+  int syscall_nr =
+      (g_arch == ArchMode::ARM64) ? SYS_MPROTECT_64 : SYS_MPROTECT_32;
+  execute_syscall(pid, {addr, (uint64_t)len, (uint64_t)prot}, syscall_nr);
   return true;
 }
 
@@ -1186,130 +1205,49 @@ ProcessTracer::find_library_for_address(const std::vector<LibraryRange> &ranges,
 }
 
 uint64_t FunctionHooker::allocate_remote(int pid, size_t size) {
-  if (g_arch == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-    regs.regs[0] = 0;
-    regs.regs[1] = size;
-    regs.regs[2] = PROT_READ | PROT_WRITE | PROT_EXEC;
-    regs.regs[3] = MAP_PRIVATE | MAP_ANONYMOUS;
-    regs.regs[4] = -1;
-    regs.regs[5] = 0;
-    regs.regs[8] = 222;
-    uint64_t pc = regs.pc;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xD4000001;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    uint64_t result = regs.regs[0];
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    return (result == (uint64_t)-1) ? 0 : result;
-  } else {
-    user_regs_struct_32 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-    regs.regs[0] = 0;
-    regs.regs[1] = (uint32_t)size;
-    regs.regs[2] = PROT_READ | PROT_WRITE | PROT_EXEC;
-    regs.regs[3] = MAP_PRIVATE | MAP_ANONYMOUS;
-    regs.regs[4] = -1;
-    regs.regs[5] = 0;
-    regs.regs[7] = 192;
-    uint32_t pc = regs.regs[15];
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xEF000000;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    uint32_t result = regs.regs[0];
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    return (result == (uint32_t)-1) ? 0 : result;
-  }
+  int syscall_nr = (g_arch == ArchMode::ARM64) ? SYS_MMAP_64 : SYS_MMAP2_32;
+  uint64_t result = execute_syscall(
+      pid,
+      {0, (uint64_t)size, (uint64_t)(PROT_READ | PROT_WRITE | PROT_EXEC),
+       (uint64_t)(MAP_PRIVATE | MAP_ANONYMOUS), (uint64_t)-1, 0},
+      syscall_nr);
+  return (result == (uint64_t)-1) ? 0 : result;
 }
 
 bool FunctionHooker::free_remote(int pid, uint64_t addr, size_t size) {
-  if (g_arch == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-    regs.regs[0] = addr;
-    regs.regs[1] = size;
-    regs.regs[8] = 215;
-    uint64_t pc = regs.pc;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xD4000001;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-  } else {
-    user_regs_struct_32 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-    regs.regs[0] = (uint32_t)addr;
-    regs.regs[1] = (uint32_t)size;
-    regs.regs[7] = 91;
-    uint32_t pc = regs.regs[15];
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xEF000000;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-  }
+  int syscall_nr = (g_arch == ArchMode::ARM64) ? SYS_MUNMAP_64 : SYS_MUNMAP_32;
+  execute_syscall(pid, {addr, (uint64_t)size}, syscall_nr);
   return true;
 }
 
-static uint64_t parse_remote_symbol_64(int pid, uint64_t lib_base,
-                                       const std::string &sym) {
-  uint8_t ehdr_buf[64];
-  if (!ProcessTracer::read_memory(pid, lib_base, ehdr_buf, 64))
+template <typename Ehdr, typename Phdr, typename Dyn, typename Sym>
+static uint64_t parse_remote_symbol_impl(int pid, uint64_t lib_base,
+                                         const std::string &sym) {
+  constexpr size_t ehdr_sz = sizeof(Ehdr);
+  constexpr size_t phdr_sz = sizeof(Phdr);
+  constexpr size_t dyn_sz = sizeof(Dyn);
+  constexpr size_t sym_sz = sizeof(Sym);
+  constexpr bool is64 = (sizeof(typename std::remove_pointer<
+                             decltype(((Ehdr *)nullptr))>::type) == sizeof(Elf64_Ehdr));
+
+  uint8_t ehdr_buf[ehdr_sz];
+  if (!ProcessTracer::read_memory(pid, lib_base, ehdr_buf, ehdr_sz))
     return 0;
-  Elf64_Ehdr *ehdr = (Elf64_Ehdr *)ehdr_buf;
+  Ehdr *ehdr = (Ehdr *)ehdr_buf;
   if (memcmp(ehdr->e_ident, ELFMAG, 4) != 0)
     return 0;
+
   uint64_t phdr_off = ehdr->e_phoff;
   uint16_t phnum = ehdr->e_phnum;
   uint16_t phentsize = ehdr->e_phentsize;
   uint64_t dyn_vaddr = 0, dyn_size = 0;
+
   for (uint16_t i = 0; i < phnum; i++) {
-    uint8_t phdr_buf[56];
+    uint8_t phdr_buf[phdr_sz];
     if (!ProcessTracer::read_memory(pid, lib_base + phdr_off + i * phentsize,
-                                    phdr_buf, 56))
+                                    phdr_buf, phdr_sz))
       continue;
-    Elf64_Phdr *phdr = (Elf64_Phdr *)phdr_buf;
+    Phdr *phdr = (Phdr *)phdr_buf;
     if (phdr->p_type == PT_DYNAMIC) {
       dyn_vaddr = phdr->p_vaddr;
       dyn_size = phdr->p_memsz;
@@ -1318,14 +1256,15 @@ static uint64_t parse_remote_symbol_64(int pid, uint64_t lib_base,
   }
   if (dyn_vaddr == 0)
     return 0;
+
   uint64_t symtab = 0, strtab = 0, hash = 0, gnu_hash = 0;
   size_t nchain = 0;
-  for (uint64_t off = 0; off < dyn_size; off += 16) {
-    uint8_t dyn_buf[16];
+  for (uint64_t off = 0; off < dyn_size; off += dyn_sz) {
+    uint8_t dyn_buf[dyn_sz];
     if (!ProcessTracer::read_memory(pid, lib_base + dyn_vaddr + off, dyn_buf,
-                                    16))
+                                    dyn_sz))
       break;
-    Elf64_Dyn *dyn = (Elf64_Dyn *)dyn_buf;
+    Dyn *dyn = (Dyn *)dyn_buf;
     if (dyn->d_tag == DT_NULL)
       break;
     switch (dyn->d_tag) {
@@ -1345,6 +1284,7 @@ static uint64_t parse_remote_symbol_64(int pid, uint64_t lib_base,
   }
   if (symtab == 0 || strtab == 0)
     return 0;
+
   if (hash != 0) {
     uint32_t hash_hdr[2];
     if (ProcessTracer::read_memory(pid, hash, hash_hdr, 8))
@@ -1356,7 +1296,9 @@ static uint64_t parse_remote_symbol_64(int pid, uint64_t lib_base,
       uint32_t nbuckets = gnu_hdr[0];
       uint32_t symoffset = gnu_hdr[1];
       uint32_t bloom_size = gnu_hdr[2];
-      uint64_t buckets_addr = gnu_hash + 16 + bloom_size * 8;
+      size_t bloom_entry_sz = is64 ? 8 : 4;
+      uint64_t buckets_addr =
+          gnu_hash + 16 + bloom_size * bloom_entry_sz;
       uint32_t max_bucket = 0;
       for (uint32_t i = 0; i < nbuckets; i++) {
         uint32_t b;
@@ -1369,8 +1311,8 @@ static uint64_t parse_remote_symbol_64(int pid, uint64_t lib_base,
         uint32_t idx = max_bucket - symoffset;
         while (true) {
           uint32_t chain_val;
-          if (!ProcessTracer::read_memory(pid, chain_addr + idx * 4, &chain_val,
-                                          4))
+          if (!ProcessTracer::read_memory(pid, chain_addr + idx * 4,
+                                          &chain_val, 4))
             break;
           if (chain_val & 1) {
             nchain = max_bucket + 1;
@@ -1386,83 +1328,12 @@ static uint64_t parse_remote_symbol_64(int pid, uint64_t lib_base,
   }
   if (nchain == 0)
     nchain = 4096;
-  for (size_t i = 0; i < nchain; i++) {
-    uint8_t sym_buf[24];
-    if (!ProcessTracer::read_memory(pid, symtab + i * 24, sym_buf, 24))
-      break;
-    Elf64_Sym *s = (Elf64_Sym *)sym_buf;
-    if (s->st_name == 0 || s->st_value == 0)
-      continue;
-    char name_buf[256] = {0};
-    ProcessTracer::read_memory(pid, strtab + s->st_name, name_buf, 255);
-    if (strcmp(name_buf, sym.c_str()) == 0)
-      return s->st_value;
-  }
-  return 0;
-}
 
-static uint64_t parse_remote_symbol_32(int pid, uint64_t lib_base,
-                                       const std::string &sym) {
-  uint8_t ehdr_buf[52];
-  if (!ProcessTracer::read_memory(pid, lib_base, ehdr_buf, 52))
-    return 0;
-  Elf32_Ehdr *ehdr = (Elf32_Ehdr *)ehdr_buf;
-  if (memcmp(ehdr->e_ident, ELFMAG, 4) != 0)
-    return 0;
-  uint32_t phdr_off = ehdr->e_phoff;
-  uint16_t phnum = ehdr->e_phnum;
-  uint16_t phentsize = ehdr->e_phentsize;
-  uint32_t dyn_vaddr = 0, dyn_size = 0;
-  for (uint16_t i = 0; i < phnum; i++) {
-    uint8_t phdr_buf[32];
-    if (!ProcessTracer::read_memory(pid, lib_base + phdr_off + i * phentsize,
-                                    phdr_buf, 32))
-      continue;
-    Elf32_Phdr *phdr = (Elf32_Phdr *)phdr_buf;
-    if (phdr->p_type == PT_DYNAMIC) {
-      dyn_vaddr = phdr->p_vaddr;
-      dyn_size = phdr->p_memsz;
-      break;
-    }
-  }
-  if (dyn_vaddr == 0)
-    return 0;
-  uint32_t symtab = 0, strtab = 0, hash = 0;
-  size_t nchain = 0;
-  for (uint32_t off = 0; off < dyn_size; off += 8) {
-    uint8_t dyn_buf[8];
-    if (!ProcessTracer::read_memory(pid, lib_base + dyn_vaddr + off, dyn_buf,
-                                    8))
-      break;
-    Elf32_Dyn *dyn = (Elf32_Dyn *)dyn_buf;
-    if (dyn->d_tag == DT_NULL)
-      break;
-    switch (dyn->d_tag) {
-    case DT_SYMTAB:
-      symtab = dyn->d_un.d_ptr;
-      break;
-    case DT_STRTAB:
-      strtab = dyn->d_un.d_ptr;
-      break;
-    case DT_HASH:
-      hash = dyn->d_un.d_ptr;
-      break;
-    }
-  }
-  if (symtab == 0 || strtab == 0)
-    return 0;
-  if (hash != 0) {
-    uint32_t hash_hdr[2];
-    if (ProcessTracer::read_memory(pid, hash, hash_hdr, 8))
-      nchain = hash_hdr[1];
-  }
-  if (nchain == 0)
-    nchain = 4096;
   for (size_t i = 0; i < nchain; i++) {
-    uint8_t sym_buf[16];
-    if (!ProcessTracer::read_memory(pid, symtab + i * 16, sym_buf, 16))
+    uint8_t sym_buf[sym_sz];
+    if (!ProcessTracer::read_memory(pid, symtab + i * sym_sz, sym_buf, sym_sz))
       break;
-    Elf32_Sym *s = (Elf32_Sym *)sym_buf;
+    Sym *s = (Sym *)sym_buf;
     if (s->st_name == 0 || s->st_value == 0)
       continue;
     char name_buf[256] = {0};
@@ -1487,9 +1358,11 @@ uint64_t FunctionHooker::find_remote_symbol(int pid, const std::string &lib,
     sscanf(line.c_str(), "%lx", (unsigned long *)&base);
     uint64_t offset;
     if (g_arch == ArchMode::ARM64)
-      offset = parse_remote_symbol_64(pid, base, sym);
+      offset = parse_remote_symbol_impl<Elf64_Ehdr, Elf64_Phdr, Elf64_Dyn,
+                                        Elf64_Sym>(pid, base, sym);
     else
-      offset = parse_remote_symbol_32(pid, base, sym);
+      offset = parse_remote_symbol_impl<Elf32_Ehdr, Elf32_Phdr, Elf32_Dyn,
+                                        Elf32_Sym>(pid, base, sym);
     if (offset != 0)
       return base + offset;
   }
@@ -1947,7 +1820,7 @@ StaticRelinker::relink(const std::vector<uint8_t> &elf_data, int pid,
     embed_offset++;
   result.resize(embed_offset);
   std::map<uint64_t, uint64_t> embedded_addrs;
-  static constexpr size_t MAX_TOTAL_EMBED_SIZE = 16 * 1024 * 1024;
+  static constexpr size_t MAX_TOTAL_EMBED_SIZE = EmbedContext::MAX_TOTAL_SIZE;
 
   for (const auto &call : external_calls) {
     uint64_t target_addr = call.second;
@@ -2048,145 +1921,23 @@ uint64_t MemoryInjector::remote_mmap(int pid, uint64_t addr, size_t size,
   if (!ProcessTracer::attach(pid))
     return 0;
 
-  RemoteCallResult result;
-  if (ProcessTracer::get_arch() == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-
-    regs.regs[0] = addr;
-    regs.regs[1] = size;
-    regs.regs[2] = prot;
-    regs.regs[3] = flags;
-    regs.regs[4] = (uint64_t)-1;
-    regs.regs[5] = 0;
-    regs.regs[8] = 222;
-
-    uint64_t pc = regs.pc;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xD4000001;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    uint64_t ret = regs.regs[0];
-
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ProcessTracer::detach(pid);
-
-    return (ret == (uint64_t)-1) ? 0 : ret;
-  } else {
-    user_regs_struct_32 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-
-    regs.regs[0] = (uint32_t)addr;
-    regs.regs[1] = (uint32_t)size;
-    regs.regs[2] = (uint32_t)prot;
-    regs.regs[3] = (uint32_t)flags;
-    regs.regs[4] = (uint32_t)-1;
-    regs.regs[5] = 0;
-    regs.regs[7] = 192;
-
-    uint32_t pc = regs.regs[15];
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xEF000000;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    uint32_t ret = regs.regs[0];
-
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ProcessTracer::detach(pid);
-
-    return (ret == (uint32_t)-1) ? 0 : ret;
-  }
+  int syscall_nr = (g_arch == ArchMode::ARM64) ? SYS_MMAP_64 : SYS_MMAP2_32;
+  uint64_t ret = execute_syscall(
+      pid, {addr, (uint64_t)size, (uint64_t)prot, (uint64_t)flags,
+            (uint64_t)-1, 0},
+      syscall_nr);
+  ProcessTracer::detach(pid);
+  return (ret == (uint64_t)-1) ? 0 : ret;
 }
 
 bool MemoryInjector::remote_munmap(int pid, uint64_t addr, size_t size) {
   if (!ProcessTracer::attach(pid))
     return false;
 
-  bool success = false;
-  if (ProcessTracer::get_arch() == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-
-    regs.regs[0] = addr;
-    regs.regs[1] = size;
-    regs.regs[8] = 215;
-
-    uint64_t pc = regs.pc;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xD4000001;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    success = (regs.regs[0] == 0);
-
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-  } else {
-    user_regs_struct_32 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-
-    regs.regs[0] = (uint32_t)addr;
-    regs.regs[1] = (uint32_t)size;
-    regs.regs[7] = 91;
-
-    uint32_t pc = regs.regs[15];
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xEF000000;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    success = (regs.regs[0] == 0);
-
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-  }
-
+  int syscall_nr = (g_arch == ArchMode::ARM64) ? SYS_MUNMAP_64 : SYS_MUNMAP_32;
+  uint64_t ret = execute_syscall(pid, {addr, (uint64_t)size}, syscall_nr);
   ProcessTracer::detach(pid);
-  return success;
+  return (ret == 0);
 }
 
 bool MemoryInjector::remote_mprotect(int pid, uint64_t addr, size_t size,
@@ -2813,37 +2564,12 @@ bool SeccompBypass::use_memfd_workaround(int pid) {
   ArchMode arch = ProcessTracer::get_arch();
 
   if (arch == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-
     uint64_t name_addr = FunctionHooker::allocate_remote(pid, 32);
     const char *name = "hayabusa";
     ProcessTracer::write_memory(pid, name_addr, name, strlen(name) + 1);
 
-    regs.regs[0] = name_addr;
-    regs.regs[1] = 1;
-    regs.regs[8] = 279;
-
-    uint64_t pc = regs.pc;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-    uint32_t svc_inst = 0xD4000001;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
-
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    int memfd = (int)regs.regs[0];
-
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    int memfd = (int)execute_syscall(pid, {name_addr, 1},
+                                     SYS_MEMFD_CREATE_64);
 
     FunctionHooker::free_remote(pid, name_addr, 32);
     ProcessTracer::detach(pid);
@@ -3319,8 +3045,8 @@ std::vector<CryptoKeyInfo> CryptoAnalyzer::extract_openssl_keys(int pid) {
     }
   }
 
-  if (lib_size > 16 * 1024 * 1024)
-    lib_size = 16 * 1024 * 1024;
+  if (lib_size > EmbedContext::MAX_TOTAL_SIZE)
+    lib_size = EmbedContext::MAX_TOTAL_SIZE;
 
   std::vector<uint8_t> data(lib_size);
   if (ProcessTracer::read_memory(pid, libcrypto, data.data(), lib_size)) {
@@ -3335,24 +3061,24 @@ std::vector<CryptoKeyInfo> CryptoAnalyzer::extract_boringssl_keys(int pid) {
   return extract_openssl_keys(pid);
 }
 
-bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
-  uint64_t aes_encrypt =
-      FunctionHooker::find_remote_symbol(pid, "libcrypto.so", "AES_encrypt");
-  if (aes_encrypt == 0) {
-    aes_encrypt = FunctionHooker::find_remote_symbol(pid, "libcrypto.so",
-                                                     "aes_nohw_encrypt");
-  }
-  if (aes_encrypt == 0) {
-    aes_encrypt = FunctionHooker::find_remote_symbol(pid, "libcrypto.so",
-                                                     "OPENSSL_AES_encrypt");
-  }
+static bool hook_aes_function(int pid, uint64_t *original,
+                              const char *primary_sym,
+                              const char *nohw_sym,
+                              const char *openssl_sym) {
+  uint64_t func_addr =
+      FunctionHooker::find_remote_symbol(pid, "libcrypto.so", primary_sym);
+  if (func_addr == 0)
+    func_addr =
+        FunctionHooker::find_remote_symbol(pid, "libcrypto.so", nohw_sym);
+  if (func_addr == 0)
+    func_addr =
+        FunctionHooker::find_remote_symbol(pid, "libcrypto.so", openssl_sym);
 
-  if (aes_encrypt == 0)
+  if (func_addr == 0)
     return false;
 
   if (original)
-    *original = aes_encrypt;
-
+    *original = func_addr;
 
   uint64_t key_storage = FunctionHooker::allocate_remote(pid, 4096);
   if (key_storage == 0)
@@ -3361,7 +3087,6 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
   uint64_t zero = 0;
   ProcessTracer::write_memory(pid, key_storage, &zero, 8);
 
-
   if (ProcessTracer::get_arch() == ArchMode::ARM64) {
     std::vector<uint8_t> hook_code;
 
@@ -3369,9 +3094,8 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
         0xA9BE7BFD,
         0xA9010FE0,
     };
-    for (auto inst : prologue) {
+    for (auto inst : prologue)
       hook_code.insert(hook_code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
-    }
 
     uint64_t storage = key_storage;
     uint32_t mov_x9[] = {
@@ -3380,17 +3104,15 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
         static_cast<uint32_t>(0xF2C00009 | (((storage >> 32) & 0xFFFF) << 5)),
         static_cast<uint32_t>(0xF2E00009 | (((storage >> 48) & 0xFFFF) << 5)),
     };
-    for (auto inst : mov_x9) {
+    for (auto inst : mov_x9)
       hook_code.insert(hook_code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
-    }
 
     uint32_t epilogue[] = {
         0xA9410FE0,
         0xA8C27BFD,
     };
-    for (auto inst : epilogue) {
+    for (auto inst : epilogue)
       hook_code.insert(hook_code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
-    }
 
     uint32_t ldr_x10 = 0x58000050;
     uint32_t br_x10 = 0xD61F0140;
@@ -3398,9 +3120,8 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
                      (uint8_t *)&ldr_x10 + 4);
     hook_code.insert(hook_code.end(), (uint8_t *)&br_x10,
                      (uint8_t *)&br_x10 + 4);
-
-    hook_code.insert(hook_code.end(), (uint8_t *)&aes_encrypt,
-                     (uint8_t *)&aes_encrypt + 8);
+    hook_code.insert(hook_code.end(), (uint8_t *)&func_addr,
+                     (uint8_t *)&func_addr + 8);
 
     uint64_t hook_addr =
         FunctionHooker::allocate_remote(pid, hook_code.size() + 64);
@@ -3413,7 +3134,7 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
                                 hook_code.size());
 
     HookInfo info;
-    if (!MemoryInjector::install_inline_hook(pid, aes_encrypt, hook_addr,
+    if (!MemoryInjector::install_inline_hook(pid, func_addr, hook_addr,
                                              &info)) {
       FunctionHooker::free_remote(pid, key_storage, 4096);
       FunctionHooker::free_remote(pid, hook_addr, hook_code.size() + 64);
@@ -3427,93 +3148,14 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
   return true;
 }
 
+bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
+  return hook_aes_function(pid, original, "AES_encrypt", "aes_nohw_encrypt",
+                           "OPENSSL_AES_encrypt");
+}
+
 bool CryptoAnalyzer::hook_aes_decrypt(int pid, uint64_t *original) {
-  uint64_t aes_decrypt =
-      FunctionHooker::find_remote_symbol(pid, "libcrypto.so", "AES_decrypt");
-  if (aes_decrypt == 0) {
-    aes_decrypt = FunctionHooker::find_remote_symbol(pid, "libcrypto.so",
-                                                     "aes_nohw_decrypt");
-  }
-  if (aes_decrypt == 0) {
-    aes_decrypt = FunctionHooker::find_remote_symbol(pid, "libcrypto.so",
-                                                     "OPENSSL_AES_decrypt");
-  }
-
-  if (aes_decrypt == 0)
-    return false;
-
-  if (original)
-    *original = aes_decrypt;
-
-  uint64_t key_storage = FunctionHooker::allocate_remote(pid, 4096);
-  if (key_storage == 0)
-    return false;
-
-  uint64_t zero = 0;
-  ProcessTracer::write_memory(pid, key_storage, &zero, 8);
-
-  if (ProcessTracer::get_arch() == ArchMode::ARM64) {
-    std::vector<uint8_t> hook_code;
-
-    uint32_t prologue[] = {
-        0xA9BE7BFD,
-        0xA9010FE0,
-    };
-    for (auto inst : prologue) {
-      hook_code.insert(hook_code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
-    }
-
-    uint64_t storage = key_storage;
-    uint32_t mov_x9[] = {
-        static_cast<uint32_t>(0xD2800009 | (((storage >> 0) & 0xFFFF) << 5)),
-        static_cast<uint32_t>(0xF2A00009 | (((storage >> 16) & 0xFFFF) << 5)),
-        static_cast<uint32_t>(0xF2C00009 | (((storage >> 32) & 0xFFFF) << 5)),
-        static_cast<uint32_t>(0xF2E00009 | (((storage >> 48) & 0xFFFF) << 5)),
-    };
-    for (auto inst : mov_x9) {
-      hook_code.insert(hook_code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
-    }
-
-    uint32_t epilogue[] = {
-        0xA9410FE0,
-        0xA8C27BFD,
-    };
-    for (auto inst : epilogue) {
-      hook_code.insert(hook_code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
-    }
-
-    uint32_t ldr_x10 = 0x58000050;
-    uint32_t br_x10 = 0xD61F0140;
-    hook_code.insert(hook_code.end(), (uint8_t *)&ldr_x10,
-                     (uint8_t *)&ldr_x10 + 4);
-    hook_code.insert(hook_code.end(), (uint8_t *)&br_x10,
-                     (uint8_t *)&br_x10 + 4);
-    hook_code.insert(hook_code.end(), (uint8_t *)&aes_decrypt,
-                     (uint8_t *)&aes_decrypt + 8);
-
-    uint64_t hook_addr =
-        FunctionHooker::allocate_remote(pid, hook_code.size() + 64);
-    if (hook_addr == 0) {
-      FunctionHooker::free_remote(pid, key_storage, 4096);
-      return false;
-    }
-
-    ProcessTracer::write_memory(pid, hook_addr, hook_code.data(),
-                                hook_code.size());
-
-    HookInfo info;
-    if (!MemoryInjector::install_inline_hook(pid, aes_decrypt, hook_addr,
-                                             &info)) {
-      FunctionHooker::free_remote(pid, key_storage, 4096);
-      FunctionHooker::free_remote(pid, hook_addr, hook_code.size() + 64);
-      return false;
-    }
-
-    ProcessTracer::write_memory(pid, hook_addr + hook_code.size() - 8,
-                                &info.trampoline_addr, 8);
-  }
-
-  return true;
+  return hook_aes_function(pid, original, "AES_decrypt", "aes_nohw_decrypt",
+                           "OPENSSL_AES_decrypt");
 }
 
 std::vector<uint8_t>
