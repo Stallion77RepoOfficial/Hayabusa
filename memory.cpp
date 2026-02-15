@@ -562,6 +562,88 @@ static uint64_t align_up(uint64_t v, uint64_t a) {
   return (v + a - 1) & ~(a - 1);
 }
 
+struct DynParsed {
+  uint64_t strtab = 0, strsz = 0, symtab = 0, syment = 0;
+  uint64_t hash = 0, gnu_hash = 0;
+  uint64_t rel = 0, relsz = 0, relent = 0;
+  uint64_t jmprel = 0, pltrelsz = 0;
+  uint64_t pltgot = 0;
+  uint64_t init_arr = 0, init_sz = 0, fini_arr = 0, fini_sz = 0;
+};
+
+template <typename Dyn>
+static DynParsed parse_dynamic_tags(Dyn *dyn, size_t dyn_n,
+                                    const std::function<uint64_t(uint64_t)> &r,
+                                    int rel_tag, int relsz_tag,
+                                    int relent_tag, uint64_t default_syment,
+                                    uint64_t default_relent) {
+  DynParsed p;
+  p.syment = default_syment;
+  p.relent = default_relent;
+  for (size_t i = 0; i < dyn_n; i++) {
+    switch (dyn[i].d_tag) {
+    case DT_STRTAB:
+      p.strtab = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.strtab);
+      break;
+    case DT_STRSZ:
+      p.strsz = dyn[i].d_un.d_val;
+      break;
+    case DT_SYMTAB:
+      p.symtab = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.symtab);
+      break;
+    case DT_SYMENT:
+      p.syment = dyn[i].d_un.d_val;
+      break;
+    case DT_HASH:
+      p.hash = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.hash);
+      break;
+    case DT_GNU_HASH:
+      p.gnu_hash = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.gnu_hash);
+      break;
+    case DT_JMPREL:
+      p.jmprel = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.jmprel);
+      break;
+    case DT_PLTRELSZ:
+      p.pltrelsz = dyn[i].d_un.d_val;
+      break;
+    case DT_PLTGOT:
+      p.pltgot = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.pltgot);
+      break;
+    case DT_INIT_ARRAY:
+      p.init_arr = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.init_arr);
+      break;
+    case DT_INIT_ARRAYSZ:
+      p.init_sz = dyn[i].d_un.d_val;
+      break;
+    case DT_FINI_ARRAY:
+      p.fini_arr = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.fini_arr);
+      break;
+    case DT_FINI_ARRAYSZ:
+      p.fini_sz = dyn[i].d_un.d_val;
+      break;
+    default:
+      break;
+    }
+    if (dyn[i].d_tag == rel_tag) {
+      p.rel = dyn[i].d_un.d_ptr;
+      dyn[i].d_un.d_ptr = r(p.rel);
+    } else if (dyn[i].d_tag == relsz_tag) {
+      p.relsz = dyn[i].d_un.d_val;
+    } else if (dyn[i].d_tag == relent_tag) {
+      p.relent = dyn[i].d_un.d_val;
+    }
+  }
+  return p;
+}
+
 static std::vector<uint8_t> repair_elf32(const std::vector<uint8_t> &data,
                                          uint64_t base_addr) {
   std::vector<uint8_t> fixed = data;
@@ -617,13 +699,8 @@ static std::vector<uint8_t> repair_elf32(const std::vector<uint8_t> &data,
     ehdr->e_entry -= bias;
   Elf32_Shdr shdr[18] = {};
   auto r = [&](uint32_t a) { return (a >= bias) ? a - bias : a; };
-  uint32_t strtab = 0, strsz = 0, symtab = 0, syment = sizeof(Elf32_Sym);
-  uint32_t hash = 0, gnu_hash = 0;
-  uint32_t rel = 0, relsz = 0, relent = sizeof(Elf32_Rel);
-  uint32_t jmprel = 0, pltrelsz = 0;
-  uint32_t pltgot = 0;
-  uint32_t init_arr = 0, init_sz = 0, fini_arr = 0, fini_sz = 0;
   size_t nDynSyms = 0;
+  DynParsed dp;
   if (dyn_off != 0 && dyn_sz != 0 && dyn_off + dyn_sz <= fixed.size()) {
     shdr[12].sh_name = shstr_off(".dynamic");
     shdr[12].sh_type = SHT_DYNAMIC;
@@ -635,67 +712,16 @@ static std::vector<uint8_t> repair_elf32(const std::vector<uint8_t> &data,
     shdr[12].sh_entsize = 8;
     Elf32_Dyn *dyn = reinterpret_cast<Elf32_Dyn *>(fixed.data() + dyn_off);
     size_t dyn_n = dyn_sz / sizeof(Elf32_Dyn);
-    for (size_t i = 0; i < dyn_n; i++) {
-      switch (dyn[i].d_tag) {
-      case DT_STRTAB:
-        strtab = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(strtab);
-        break;
-      case DT_STRSZ:
-        strsz = dyn[i].d_un.d_val;
-        break;
-      case DT_SYMTAB:
-        symtab = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(symtab);
-        break;
-      case DT_SYMENT:
-        syment = dyn[i].d_un.d_val;
-        break;
-      case DT_HASH:
-        hash = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(hash);
-        break;
-      case DT_GNU_HASH:
-        gnu_hash = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(gnu_hash);
-        break;
-      case DT_REL:
-        rel = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(rel);
-        break;
-      case DT_RELSZ:
-        relsz = dyn[i].d_un.d_val;
-        break;
-      case DT_RELENT:
-        relent = dyn[i].d_un.d_val;
-        break;
-      case DT_JMPREL:
-        jmprel = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(jmprel);
-        break;
-      case DT_PLTRELSZ:
-        pltrelsz = dyn[i].d_un.d_val;
-        break;
-      case DT_PLTGOT:
-        pltgot = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(pltgot);
-        break;
-      case DT_INIT_ARRAY:
-        init_arr = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(init_arr);
-        break;
-      case DT_INIT_ARRAYSZ:
-        init_sz = dyn[i].d_un.d_val;
-        break;
-      case DT_FINI_ARRAY:
-        fini_arr = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(fini_arr);
-        break;
-      case DT_FINI_ARRAYSZ:
-        fini_sz = dyn[i].d_un.d_val;
-        break;
-      }
-    }
+    dp = parse_dynamic_tags(dyn, dyn_n, r, DT_REL, DT_RELSZ, DT_RELENT,
+                            sizeof(Elf32_Sym), sizeof(Elf32_Rel));
+    uint32_t strtab = dp.strtab, strsz = dp.strsz, symtab = dp.symtab;
+    uint32_t syment = dp.syment;
+    uint32_t hash = dp.hash, gnu_hash = dp.gnu_hash;
+    uint32_t rel = dp.rel, relsz = dp.relsz, relent = dp.relent;
+    uint32_t jmprel = dp.jmprel, pltrelsz = dp.pltrelsz;
+    uint32_t pltgot = dp.pltgot;
+    uint32_t init_arr = dp.init_arr, init_sz = dp.init_sz;
+    uint32_t fini_arr = dp.fini_arr, fini_sz = dp.fini_sz;
     if (hash) {
       uint32_t h_off = r(hash);
       if (h_off + 8 <= fixed.size()) {
@@ -931,13 +957,8 @@ static std::vector<uint8_t> repair_elf64(const std::vector<uint8_t> &data,
     ehdr->e_entry -= bias;
   Elf64_Shdr shdr[18] = {};
   auto r = [&](uint64_t a) { return (a >= bias) ? a - bias : a; };
-  uint64_t strtab = 0, strsz = 0, symtab = 0, syment = sizeof(Elf64_Sym);
-  uint64_t hash = 0, gnu_hash = 0;
-  uint64_t rela = 0, relasz = 0, relaent = sizeof(Elf64_Rela);
-  uint64_t jmprel = 0, pltrelsz = 0;
-  uint64_t pltgot = 0;
-  uint64_t init_arr = 0, init_sz = 0, fini_arr = 0, fini_sz = 0;
   size_t nDynSyms = 0;
+  DynParsed dp;
   if (dyn_off != 0 && dyn_sz != 0 && dyn_off + dyn_sz <= fixed.size()) {
     shdr[12].sh_name = shstr_off(".dynamic");
     shdr[12].sh_type = SHT_DYNAMIC;
@@ -949,67 +970,16 @@ static std::vector<uint8_t> repair_elf64(const std::vector<uint8_t> &data,
     shdr[12].sh_entsize = 16;
     Elf64_Dyn *dyn = reinterpret_cast<Elf64_Dyn *>(fixed.data() + dyn_off);
     size_t dyn_n = dyn_sz / sizeof(Elf64_Dyn);
-    for (size_t i = 0; i < dyn_n; i++) {
-      switch (dyn[i].d_tag) {
-      case DT_STRTAB:
-        strtab = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(strtab);
-        break;
-      case DT_STRSZ:
-        strsz = dyn[i].d_un.d_val;
-        break;
-      case DT_SYMTAB:
-        symtab = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(symtab);
-        break;
-      case DT_SYMENT:
-        syment = dyn[i].d_un.d_val;
-        break;
-      case DT_HASH:
-        hash = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(hash);
-        break;
-      case DT_GNU_HASH:
-        gnu_hash = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(gnu_hash);
-        break;
-      case DT_RELA:
-        rela = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(rela);
-        break;
-      case DT_RELASZ:
-        relasz = dyn[i].d_un.d_val;
-        break;
-      case DT_RELAENT:
-        relaent = dyn[i].d_un.d_val;
-        break;
-      case DT_JMPREL:
-        jmprel = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(jmprel);
-        break;
-      case DT_PLTRELSZ:
-        pltrelsz = dyn[i].d_un.d_val;
-        break;
-      case DT_PLTGOT:
-        pltgot = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(pltgot);
-        break;
-      case DT_INIT_ARRAY:
-        init_arr = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(init_arr);
-        break;
-      case DT_INIT_ARRAYSZ:
-        init_sz = dyn[i].d_un.d_val;
-        break;
-      case DT_FINI_ARRAY:
-        fini_arr = dyn[i].d_un.d_ptr;
-        dyn[i].d_un.d_ptr = r(fini_arr);
-        break;
-      case DT_FINI_ARRAYSZ:
-        fini_sz = dyn[i].d_un.d_val;
-        break;
-      }
-    }
+    dp = parse_dynamic_tags(dyn, dyn_n, r, DT_RELA, DT_RELASZ, DT_RELAENT,
+                            sizeof(Elf64_Sym), sizeof(Elf64_Rela));
+    uint64_t strtab = dp.strtab, strsz = dp.strsz, symtab = dp.symtab;
+    uint64_t syment = dp.syment;
+    uint64_t hash = dp.hash, gnu_hash = dp.gnu_hash;
+    uint64_t rela = dp.rel, relasz = dp.relsz, relaent = dp.relent;
+    uint64_t jmprel = dp.jmprel, pltrelsz = dp.pltrelsz;
+    uint64_t pltgot = dp.pltgot;
+    uint64_t init_arr = dp.init_arr, init_sz = dp.init_sz;
+    uint64_t fini_arr = dp.fini_arr, fini_sz = dp.fini_sz;
     if (hash) {
       uint64_t h_off = r(hash);
       if (h_off + 8 <= fixed.size()) {
