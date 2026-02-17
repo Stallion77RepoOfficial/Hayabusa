@@ -73,7 +73,6 @@ struct user_regs_struct_32 {
 static constexpr int SYS_MMAP_64 = 222;
 static constexpr int SYS_MUNMAP_64 = 215;
 static constexpr int SYS_MPROTECT_64 = 226;
-static constexpr int SYS_MEMFD_CREATE_64 = 279;
 static constexpr int SYS_MMAP2_32 = 192;
 static constexpr int SYS_MUNMAP_32 = 91;
 static constexpr int SYS_MPROTECT_32 = 125;
@@ -477,7 +476,7 @@ bool is_arm32_prologue(uint32_t inst) {
     return true;
   if ((inst & 0xFFFFF000) == 0xE24DD000)
     return true;
-  if ((inst & 0xFFFF0FFF) == 0xE1A0B00D)
+  if ((inst & 0xFFFF0FFF) == 0xE1A0000D)
     return true;
   return false;
 }
@@ -608,7 +607,7 @@ std::vector<FunctionBoundary> linear_sweep(const uint8_t *code, size_t size,
     return linear_sweep_arm32(code, size, base);
 }
 
-}
+} // namespace InstructionDecoder
 
 int ZygoteTracer::find_zygote_pid() {
   DIR *d = opendir("/proc");
@@ -634,328 +633,39 @@ int ZygoteTracer::find_zygote_pid() {
   return -1;
 }
 
-bool ZygoteTracer::attach_zygote(int zygote_pid) {
-  if (ptrace(PTRACE_ATTACH, zygote_pid, nullptr, nullptr) < 0) {
-    int err = errno;
-    if (err == EPERM) {
-      std::ifstream f("/proc/" + std::to_string(zygote_pid) + "/status");
-      std::string line;
-      while (std::getline(f, line)) {
-        if (line.find("TracerPid:") == 0) {
-          int tpid = atoi(line.substr(10).c_str());
-          if (tpid > 0) {
-            std::ifstream tf("/proc/" + std::to_string(tpid) + "/cmdline");
-            std::string tcmd;
-            std::getline(tf, tcmd);
-            if (tcmd.find("hayabusa") != std::string::npos) {
-              std::cout << "    [!] Found zombie Hayabusa instance (PID: "
-                        << tpid << "), killing it...\n";
-              kill(tpid, SIGKILL);
-              sleep(1);
-
-              if (ptrace(PTRACE_ATTACH, zygote_pid, nullptr, nullptr) == 0) {
-                std::cout << "    [+] Successfully recovered and attached to "
-                             "Zygote.\n";
-
-                register_attached_pid(zygote_pid);
-                int status;
-                waitpid(zygote_pid, &status, 0);
-                if (!WIFSTOPPED(status)) {
-                  unregister_attached_pid(zygote_pid);
-                  return false;
-                }
-                unsigned long opts = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-                                     PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
-                ptrace(PTRACE_SETOPTIONS, zygote_pid, nullptr, opts);
-                return true;
-              }
-            } else {
-              std::cerr << "    [!] Zygote is ALREADY traced by PID " << tpid
-                        << " (" << tcmd << ")\n";
-              std::cerr << "    [!] Try: adb shell su -c \"kill -9 " << tpid
-                        << "\"\n";
-            }
-          }
-          break;
-        }
-      }
-    }
-    std::cerr << "    [!] ptrace attach failed: " << strerror(err) << "\n";
-    return false;
-  }
-
-  register_attached_pid(zygote_pid);
-
-  int status;
-  waitpid(zygote_pid, &status, 0);
-  if (!WIFSTOPPED(status)) {
-    std::cerr << "    [!] Waitpid failed or process not stopped. Status: "
-              << status << "\n";
-    unregister_attached_pid(zygote_pid);
-    return false;
-  }
-
-  unsigned long opts = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-                       PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
-  if (ptrace(PTRACE_SETOPTIONS, zygote_pid, nullptr, opts) < 0) {
-    ptrace(PTRACE_DETACH, zygote_pid, nullptr, nullptr);
-    unregister_attached_pid(zygote_pid);
-    return false;
-  }
-  return true;
-}
-
-int ZygoteTracer::wait_for_fork(int zygote_pid, const std::string &target_pkg) {
-
-  ptrace(PTRACE_CONT, zygote_pid, nullptr, nullptr);
-
-  std::set<int> zygote_pids;
-  zygote_pids.insert(zygote_pid);
-
-  DIR *proc_dir = opendir("/proc");
-  if (proc_dir) {
-    struct dirent *ent;
-    while ((ent = readdir(proc_dir))) {
-      int pid = atoi(ent->d_name);
-      if (pid <= 0 || pid == zygote_pid)
-        continue;
-      std::ifstream cmdfile("/proc/" + std::string(ent->d_name) + "/cmdline");
-      std::string cmdline;
-      std::getline(cmdfile, cmdline);
-      if (cmdline.find("zygote") != std::string::npos) {
-
-        if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) == 0) {
-          int status;
-          waitpid(pid, &status, 0);
-          unsigned long opts = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-                               PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
-          ptrace(PTRACE_SETOPTIONS, pid, nullptr, opts);
-          ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-          zygote_pids.insert(pid);
-          register_attached_pid(pid);
-          std::cout << "    [DEBUG] Attached to secondary Zygote: " << pid
-                    << "\n";
-        } else {
-          std::cerr << "    [DEBUG] Failed to attach to secondary Zygote: "
-                    << pid << " (" << strerror(errno) << ")\n";
-        }
-      }
-    }
-    closedir(proc_dir);
-  }
-
-  time_t start_time = time(nullptr);
-  const int TIMEOUT_SECONDS = 60;
-  std::set<int> checked_children;
-  std::set<int> pending_children;
-  time_t last_check = 0;
-  time_t last_poll = 0;
-
-  while (time(nullptr) - start_time < TIMEOUT_SECONDS) {
-    int status;
-    int pid = waitpid(-1, &status, __WALL | WNOHANG);
-
-    if (pid > 0) {
-
-      if (WIFSTOPPED(status)) {
-        std::cout << "    [TRACE] PID: " << pid
-                  << " Stopped. Signal: " << WSTOPSIG(status);
-        if (WSTOPSIG(status) == SIGTRAP)
-          std::cout << " (SIGTRAP/EVENT)";
-        std::cout << "\n";
-      } else if (WIFEXITED(status)) {
-        std::cout << "    [TRACE] PID: " << pid
-                  << " Exited: " << WEXITSTATUS(status) << "\n";
-      } else if (WIFSIGNALED(status)) {
-        std::cout << "    [TRACE] PID: " << pid
-                  << " Signaled: " << WTERMSIG(status) << "\n";
-      }
-
-      if (zygote_pids.count(pid)) {
-
-        if (WIFSTOPPED(status)) {
-          int sig = WSTOPSIG(status);
-          int injection_sig = 0;
-
-          if (sig == SIGTRAP) {
-            int event = (status >> 16) & 0xFF;
-            if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
-                event == PTRACE_EVENT_CLONE) {
-              unsigned long child_pid_ul;
-              ptrace(PTRACE_GETEVENTMSG, pid, nullptr, &child_pid_ul);
-              int child_pid = (int)child_pid_ul;
-
-              if (child_pid > 0 &&
-                  checked_children.find(child_pid) == checked_children.end()) {
-                checked_children.insert(child_pid);
-
-                std::cout << "    [DEBUG] Fork detected! Parent: " << pid
-                          << " -> New Child: " << child_pid << "\n";
-
-                int child_status;
-                waitpid(child_pid, &child_status, __WALL);
-                ptrace(PTRACE_CONT, child_pid, nullptr, nullptr);
-                pending_children.insert(child_pid);
-              }
-            }
-          } else if (sig != SIGSTOP) {
-
-            injection_sig = sig;
-          }
-
-          ptrace(PTRACE_CONT, pid, nullptr, (void *)(long)injection_sig);
-        } else {
-          if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            zygote_pids.erase(pid);
-          }
-        }
-      } else if (pending_children.count(pid)) {
-
-        if (WIFEXITED(status) || WIFSIGNALED(status)) {
-          pending_children.erase(pid);
-        } else if (WIFSTOPPED(status)) {
-
-          ptrace(PTRACE_CONT, pid, nullptr,
-                 (void *)(long)(WSTOPSIG(status) == SIGTRAP
-                                    ? 0
-                                    : WSTOPSIG(status)));
-        }
-      } else {
-
-        if (WIFSTOPPED(status))
-          ptrace(PTRACE_CONT, pid, nullptr, 0);
-      }
-    } else {
-      usleep(10000);
-    }
-
-    time_t now = time(nullptr);
-    if (now != last_poll) {
-      last_poll = now;
-
-      DIR *proc_dir = opendir("/proc");
-      if (proc_dir) {
-        struct dirent *ent;
-        while ((ent = readdir(proc_dir))) {
-          int p = atoi(ent->d_name);
-          if (p <= 0)
-            continue;
-
-          if (zygote_pids.count(p) || pending_children.count(p))
-            continue;
-
-          std::ifstream f("/proc/" + std::to_string(p) + "/cmdline");
-          std::string cmd;
-          if (f.is_open())
-            std::getline(f, cmd);
-
-          if (!cmd.empty() && cmd.rfind(target_pkg, 0) == 0 &&
-              cmd.find("hayabusa") == std::string::npos &&
-              cmd.find("logcat") == std::string::npos &&
-              cmd.find("content://") == std::string::npos) {
-            std::cout << "    [+] Target found via polling: " << cmd
-                      << " (PID: " << p << ")\n";
-
-            for (int zpid : zygote_pids) {
-              ptrace(PTRACE_DETACH, zpid, nullptr, nullptr);
-              unregister_attached_pid(zpid);
-            }
-
-            for (int other : pending_children) {
-              if (other != p)
-                ptrace(PTRACE_DETACH, other, nullptr, nullptr);
-            }
-
-            ptrace(PTRACE_DETACH, p, nullptr, nullptr);
-            kill(p, SIGCONT);
-
-            return p;
-          }
-        }
-        closedir(proc_dir);
-      }
-    }
-
-    if (now != last_check) {
-      last_check = now;
-      for (auto it = pending_children.begin(); it != pending_children.end();) {
-        int child_pid = *it;
-        std::ifstream f("/proc/" + std::to_string(child_pid) + "/cmdline");
-        std::string cmd;
-        if (f.is_open()) {
-          std::getline(f, cmd);
-          f.close();
-        }
-        if (cmd.empty()) {
-
-          std::ifstream fc("/proc/" + std::to_string(child_pid) + "/comm");
-          if (fc.is_open()) {
-            std::getline(fc, cmd);
-            fc.close();
-          }
-        }
-
-        if (!cmd.empty()) {
-
-          if (cmd.find(target_pkg) != std::string::npos) {
-            std::cout << "    [+] Target found: " << cmd
-                      << " (PID: " << child_pid << ")\n";
-
-            for (int zpid : zygote_pids) {
-              ptrace(PTRACE_DETACH, zpid, nullptr, nullptr);
-              unregister_attached_pid(zpid);
-            }
-
-            for (int other : pending_children) {
-              if (other != child_pid)
-                ptrace(PTRACE_DETACH, other, nullptr, nullptr);
-            }
-
-            ptrace(PTRACE_DETACH, child_pid, nullptr, nullptr);
-            kill(child_pid, SIGCONT);
-
-            return child_pid;
-          }
-        }
-
-        ++it;
-      }
-    }
-  }
-
-  for (int zpid : zygote_pids) {
-    ptrace(PTRACE_DETACH, zpid, nullptr, nullptr);
-    unregister_attached_pid(zpid);
-  }
-
-  return -1;
-}
-
-bool ZygoteTracer::intercept_dlopen(int pid) {
-  auto maps = ProcessTracer::get_library_ranges(pid);
-  uint64_t linker_base = 0;
-  for (const auto &m : maps) {
-    if (m.name.find("linker64") != std::string::npos ||
-        m.name.find("linker") != std::string::npos) {
-      linker_base = m.start;
-      break;
-    }
-  }
-  return linker_base != 0;
-}
-
 void ProcessTracer::set_arch(ArchMode mode) { g_arch = mode; }
 ArchMode ProcessTracer::get_arch() { return g_arch; }
 
+static std::map<int, int> g_attach_refcount;
+
 bool ProcessTracer::attach(int pid) {
+  auto it = g_attach_refcount.find(pid);
+  if (it != g_attach_refcount.end() && it->second > 0) {
+    it->second++;
+    return true;
+  }
   if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) < 0)
     return false;
   int status;
-  waitpid(pid, &status, 0);
-  return WIFSTOPPED(status);
+  if (waitpid(pid, &status, 0) != pid) {
+    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+    return false;
+  }
+  if (!WIFSTOPPED(status)) {
+    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+    return false;
+  }
+  g_attach_refcount[pid] = 1;
+  return true;
 }
 
 bool ProcessTracer::detach(int pid) {
+  auto it = g_attach_refcount.find(pid);
+  if (it != g_attach_refcount.end() && it->second > 1) {
+    it->second--;
+    return true;
+  }
+  g_attach_refcount.erase(pid);
   return ptrace(PTRACE_DETACH, pid, nullptr, nullptr) >= 0;
 }
 
@@ -976,8 +686,9 @@ bool ProcessTracer::set_protection(int pid, uint64_t addr, size_t len,
                                    int prot) {
   int syscall_nr =
       (g_arch == ArchMode::ARM64) ? SYS_MPROTECT_64 : SYS_MPROTECT_32;
-  execute_syscall(pid, {addr, (uint64_t)len, (uint64_t)prot}, syscall_nr);
-  return true;
+  uint64_t ret =
+      execute_syscall(pid, {addr, (uint64_t)len, (uint64_t)prot}, syscall_nr);
+  return ret == 0;
 }
 
 bool ProcessTracer::single_step(int pid) {
@@ -1072,7 +783,6 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
 
   read_memory(pid, base, result.data(), size);
 
-  size_t empty_pages = 0;
   for (size_t i = 0; i < page_count; i++) {
     bool has_data = false;
     size_t page_size = std::min<size_t>(4096, size - i * 4096);
@@ -1082,8 +792,6 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
     }
     if (has_data) {
       captured[i] = true;
-    } else {
-      empty_pages++;
     }
   }
 
@@ -1227,8 +935,10 @@ static uint64_t parse_remote_symbol_impl(int pid, uint64_t lib_base,
   constexpr size_t phdr_sz = sizeof(Phdr);
   constexpr size_t dyn_sz = sizeof(Dyn);
   constexpr size_t sym_sz = sizeof(Sym);
-  constexpr bool is64 = (sizeof(typename std::remove_pointer<
-                             decltype(((Ehdr *)nullptr))>::type) == sizeof(Elf64_Ehdr));
+  constexpr bool is64 =
+      (sizeof(
+           typename std::remove_pointer<decltype(((Ehdr *)nullptr))>::type) ==
+       sizeof(Elf64_Ehdr));
 
   uint8_t ehdr_buf[ehdr_sz];
   if (!ProcessTracer::read_memory(pid, lib_base, ehdr_buf, ehdr_sz))
@@ -1297,8 +1007,7 @@ static uint64_t parse_remote_symbol_impl(int pid, uint64_t lib_base,
       uint32_t symoffset = gnu_hdr[1];
       uint32_t bloom_size = gnu_hdr[2];
       size_t bloom_entry_sz = is64 ? 8 : 4;
-      uint64_t buckets_addr =
-          gnu_hash + 16 + bloom_size * bloom_entry_sz;
+      uint64_t buckets_addr = gnu_hash + 16 + bloom_size * bloom_entry_sz;
       uint32_t max_bucket = 0;
       for (uint32_t i = 0; i < nbuckets; i++) {
         uint32_t b;
@@ -1311,8 +1020,8 @@ static uint64_t parse_remote_symbol_impl(int pid, uint64_t lib_base,
         uint32_t idx = max_bucket - symoffset;
         while (true) {
           uint32_t chain_val;
-          if (!ProcessTracer::read_memory(pid, chain_addr + idx * 4,
-                                          &chain_val, 4))
+          if (!ProcessTracer::read_memory(pid, chain_addr + idx * 4, &chain_val,
+                                          4))
             break;
           if (chain_val & 1) {
             nchain = max_bucket + 1;
@@ -1348,21 +1057,32 @@ uint64_t FunctionHooker::find_remote_symbol(int pid, const std::string &lib,
                                             const std::string &sym) {
   std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
   std::string line;
+  std::vector<uint64_t> candidate_bases;
   while (std::getline(maps, line)) {
     if (line.find(lib) == std::string::npos)
       continue;
     if (line.find("r-xp") == std::string::npos &&
         line.find("r--p") == std::string::npos)
       continue;
-    uint64_t base;
-    sscanf(line.c_str(), "%lx", (unsigned long *)&base);
+    uint64_t base = 0;
+    uint64_t map_off = 0;
+    if (sscanf(line.c_str(), "%lx-%*lx %*4s %lx", (unsigned long *)&base,
+               (unsigned long *)&map_off) < 2)
+      continue;
+    if (map_off == 0)
+      candidate_bases.insert(candidate_bases.begin(), base);
+    else
+      candidate_bases.push_back(base);
+  }
+  for (uint64_t base : candidate_bases) {
     uint64_t offset;
-    if (g_arch == ArchMode::ARM64)
+    if (g_arch == ArchMode::ARM64) {
       offset = parse_remote_symbol_impl<Elf64_Ehdr, Elf64_Phdr, Elf64_Dyn,
                                         Elf64_Sym>(pid, base, sym);
-    else
+    } else {
       offset = parse_remote_symbol_impl<Elf32_Ehdr, Elf32_Phdr, Elf32_Dyn,
                                         Elf32_Sym>(pid, base, sym);
+    }
     if (offset != 0)
       return base + offset;
   }
@@ -1380,14 +1100,17 @@ bool FunctionHooker::hook_function(int pid, uint64_t target, uint64_t hook,
       return false;
     uint8_t tramp_code[32];
     memcpy(tramp_code, orig_bytes, 16);
-    uint32_t br_back[4] = {0x58000050, (uint32_t)(target + 16),
-                           (uint32_t)((target + 16) >> 32), 0xD61F0000};
-    memcpy(tramp_code + 16, br_back, 16);
+    uint32_t jmp_back[2] = {0x58000050, 0xD61F0200};
+    memcpy(tramp_code + 16, jmp_back, 8);
+    uint64_t ret_addr = target + 16;
+    memcpy(tramp_code + 24, &ret_addr, 8);
     ProcessTracer::write_memory(pid, trampoline, tramp_code, 32);
     *original = trampoline;
-    uint32_t hook_jmp[4] = {0x58000050, (uint32_t)hook, (uint32_t)(hook >> 32),
-                            0xD61F0000};
-    return ProcessTracer::write_memory(pid, target, hook_jmp, 16);
+    uint32_t hook_jmp[2] = {0x58000050, 0xD61F0200};
+    uint8_t patch[16];
+    memcpy(patch, hook_jmp, 8);
+    memcpy(patch + 8, &hook, 8);
+    return ProcessTracer::write_memory(pid, target, patch, sizeof(patch));
   } else {
     uint32_t orig_bytes[2];
     if (!ProcessTracer::read_memory(pid, target, orig_bytes, 8))
@@ -1485,6 +1208,7 @@ bool FunctionHooker::inject_library(int pid, const std::string &lib_path) {
 std::vector<RelinkEntry>
 StaticRelinker::find_external_calls(const std::vector<uint8_t> &data,
                                     uint64_t base) {
+  (void)base;
   std::vector<RelinkEntry> entries;
   if (data.size() < 64)
     return entries;
@@ -1661,259 +1385,15 @@ std::vector<uint8_t> StaticRelinker::embed_function(int pid, uint64_t addr,
   return func_data;
 }
 
-static std::vector<std::pair<uint64_t, uint64_t>>
-scan_bl_instructions_64(const std::vector<uint8_t> &code, uint64_t base) {
-  std::vector<std::pair<uint64_t, uint64_t>> calls;
-  for (size_t i = 0; i + 4 <= code.size(); i += 4) {
-    uint32_t inst = *(const uint32_t *)(code.data() + i);
-    if ((inst & 0xFC000000) == 0x94000000) {
-      int32_t offset = inst & 0x03FFFFFF;
-      if (offset & 0x02000000)
-        offset |= 0xFC000000;
-      uint64_t pc = base + i;
-      uint64_t target = pc + (int64_t)offset * 4;
-      calls.push_back({i, target});
-    }
-  }
-  return calls;
-}
-
-static std::vector<std::pair<uint64_t, uint64_t>>
-scan_bl_instructions_32(const std::vector<uint8_t> &code, uint64_t base) {
-  std::vector<std::pair<uint64_t, uint64_t>> calls;
-  for (size_t i = 0; i + 4 <= code.size(); i += 4) {
-    uint32_t inst = *(const uint32_t *)(code.data() + i);
-    if ((inst & 0x0F000000) == 0x0B000000) {
-      int32_t offset = inst & 0x00FFFFFF;
-      if (offset & 0x00800000)
-        offset |= 0xFF000000;
-      uint64_t pc = base + i + 8;
-      uint64_t target = pc + offset * 4;
-      calls.push_back({i, target});
-    }
-  }
-  return calls;
-}
-
 std::vector<uint8_t>
 StaticRelinker::relink(const std::vector<uint8_t> &elf_data, int pid,
                        uint64_t base_addr) {
-  std::vector<uint8_t> result = elf_data;
-  auto lib_ranges = ProcessTracer::get_library_ranges(pid);
-  std::string self_lib;
-  for (const auto &r : lib_ranges) {
-    if (base_addr >= r.start && base_addr < r.end) {
-      self_lib = r.name;
-      break;
-    }
-  }
-
-  auto plt_entries = ElfParser::get_plt_entries(elf_data);
-  std::map<uint64_t, std::string> got_to_symbol;
-  std::map<std::string, uint64_t> symbol_to_addr;
-
-  for (const auto &pe : plt_entries) {
-    if (!pe.symbol_name.empty()) {
-      got_to_symbol[pe.got_offset] = pe.symbol_name;
-      if (symbol_to_addr.find(pe.symbol_name) == symbol_to_addr.end()) {
-        uint64_t addr =
-            ElfParser::resolve_plt_symbol(pid, elf_data, pe.symbol_name);
-        if (addr != 0) {
-          symbol_to_addr[pe.symbol_name] = addr;
-        }
-      }
-    }
-  }
-
-  std::vector<std::pair<uint64_t, uint64_t>> external_calls;
-  uint64_t self_start = base_addr;
-  uint64_t self_end = base_addr + elf_data.size();
-  if (!self_lib.empty()) {
-    for (const auto &r : lib_ranges) {
-      if (r.name == self_lib) {
-        if (r.start < self_start)
-          self_start = r.start;
-        if (r.end > self_end)
-          self_end = r.end;
-      }
-    }
-  }
-  if (g_arch == ArchMode::ARM64) {
-    auto all_calls = scan_bl_instructions_64(elf_data, base_addr);
-    for (const auto &call : all_calls) {
-      uint64_t target = call.second;
-      uint64_t resolved_target = target;
-      std::string direct_lib =
-          ProcessTracer::find_library_for_address(lib_ranges, target);
-      if (!direct_lib.empty() && direct_lib != self_lib) {
-        external_calls.push_back({call.first, target});
-        continue;
-      }
-      if (target >= self_start && target < self_end) {
-        uint8_t plt_stub[16];
-        if (ProcessTracer::read_memory(pid, target, plt_stub, 16)) {
-          for (int skip = 0; skip <= 4; skip += 4) {
-            uint32_t inst0 = *(uint32_t *)(plt_stub + skip);
-            uint32_t inst1 = *(uint32_t *)(plt_stub + skip + 4);
-            bool is_adrp = (inst0 & 0x9F000000) == 0x90000000;
-            bool is_ldr = (inst1 & 0xFFC00000) == 0xF9400000;
-            if (is_adrp && is_ldr) {
-              int32_t immhi = ((inst0 >> 5) & 0x7FFFF) << 2;
-              int32_t immlo = (inst0 >> 29) & 0x3;
-              int32_t imm21 = (immhi | immlo);
-              if (imm21 & 0x100000)
-                imm21 |= 0xFFE00000;
-              int64_t page_offset = (int64_t)imm21 << 12;
-              uint64_t page_base = ((target + skip) & ~0xFFFULL) + page_offset;
-              uint32_t ldr_imm = ((inst1 >> 10) & 0xFFF) << 3;
-              uint64_t got_addr = page_base + ldr_imm;
-              uint64_t got_value = 0;
-              if (ProcessTracer::read_memory(pid, got_addr, &got_value, 8)) {
-                if (got_value > 0x1000 && got_value != target) {
-                  std::string got_lib = ProcessTracer::find_library_for_address(
-                      lib_ranges, got_value);
-                  if (!got_lib.empty() && got_lib != self_lib) {
-                    resolved_target = got_value;
-                    break;
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-      if (resolved_target != target) {
-        external_calls.push_back({call.first, resolved_target});
-      }
-    }
-  } else {
-    auto all_calls = scan_bl_instructions_32(elf_data, base_addr);
-    for (const auto &call : all_calls) {
-      uint64_t target = call.second;
-      uint64_t resolved_target = target;
-      if (target >= base_addr && target < base_addr + elf_data.size()) {
-        uint64_t offset_in_elf = target - base_addr;
-        if (offset_in_elf + 8 <= elf_data.size()) {
-          uint32_t inst0 = *(const uint32_t *)(elf_data.data() + offset_in_elf);
-          if ((inst0 & 0x0E5F0000) == 0x04100000) {
-            uint32_t got_offset = inst0 & 0xFFF;
-            uint64_t got_addr = target + 8 + got_offset;
-            uint32_t got_value = 0;
-            if (ProcessTracer::read_memory(pid, got_addr, &got_value, 4)) {
-              if (got_value != 0 && got_value != (uint32_t)target)
-                resolved_target = got_value;
-            }
-          }
-        }
-      }
-      std::string target_lib =
-          ProcessTracer::find_library_for_address(lib_ranges, resolved_target);
-      if (!target_lib.empty() && target_lib != self_lib)
-        external_calls.push_back({call.first, resolved_target});
-    }
-  }
-  if (external_calls.empty())
-    return result;
-  size_t align = (g_arch == ArchMode::ARM64) ? 16 : 4;
-  uint64_t embed_offset = result.size();
-  while (embed_offset % align)
-    embed_offset++;
-  result.resize(embed_offset);
-  std::map<uint64_t, uint64_t> embedded_addrs;
-  static constexpr size_t MAX_TOTAL_EMBED_SIZE = EmbedContext::MAX_TOTAL_SIZE;
-
-  for (const auto &call : external_calls) {
-    uint64_t target_addr = call.second;
-    if (embedded_addrs.count(target_addr))
-      continue;
-
-    auto func_code = embed_function(pid, target_addr, 0);
-    if (func_code.empty() || func_code.size() < 8)
-      continue;
-
-    if (result.size() + func_code.size() > MAX_TOTAL_EMBED_SIZE)
-      break;
-
-    uint64_t local_offset = result.size();
-    embedded_addrs[target_addr] = local_offset;
-    result.insert(result.end(), func_code.begin(), func_code.end());
-    while (result.size() % align)
-      result.push_back(0);
-  }
-  for (const auto &call : external_calls) {
-    uint64_t call_offset = call.first;
-    uint64_t target_addr = call.second;
-    if (!embedded_addrs.count(target_addr))
-      continue;
-    uint64_t local_offset = embedded_addrs[target_addr];
-    if (call_offset + 4 > elf_data.size())
-      continue;
-    if (g_arch == ArchMode::ARM64) {
-      int64_t rel_offset = (int64_t)local_offset - (int64_t)call_offset;
-      rel_offset /= 4;
-      if (rel_offset >= -0x2000000 && rel_offset < 0x2000000) {
-        uint32_t new_inst = 0x94000000 | (rel_offset & 0x03FFFFFF);
-        *(uint32_t *)(result.data() + call_offset) = new_inst;
-      }
-    } else {
-      int64_t rel_offset = (int64_t)local_offset - (int64_t)(call_offset + 8);
-      rel_offset /= 4;
-      if (rel_offset >= -0x800000 && rel_offset < 0x800000) {
-        uint32_t orig_inst = *(uint32_t *)(result.data() + call_offset);
-        uint32_t new_inst =
-            (orig_inst & 0xFF000000) | (rel_offset & 0x00FFFFFF);
-        *(uint32_t *)(result.data() + call_offset) = new_inst;
-      }
-    }
-  }
-  return result;
-}
-
-void StaticRelinker::recursive_embed(EmbedContext &ctx, uint64_t addr) {
-  if (ctx.current_depth >= EmbedContext::MAX_DEPTH)
-    return;
-
-  if (ctx.total_embedded_size >= EmbedContext::MAX_TOTAL_SIZE)
-    return;
-
-  if (ctx.embedded_addresses.count(addr))
-    return;
-
-  auto lib_ranges = ProcessTracer::get_library_ranges(ctx.pid);
-  std::string lib = ProcessTracer::find_library_for_address(lib_ranges, addr);
-
-  if (lib == ctx.self_library)
-    return;
-
-  ctx.embedded_addresses.insert(addr);
-
-  auto code = embed_function(ctx.pid, addr, 0);
-  if (code.empty())
-    return;
-
-  auto calls = InstructionDecoder::scan_calls(code.data(), code.size(), addr,
-                                              ProcessTracer::get_arch());
-
-  ctx.current_depth++;
-  for (auto &call : calls) {
-    if (call.target_address == 0 || call.target_address == addr)
-      continue;
-
-    std::string call_lib = ProcessTracer::find_library_for_address(
-        lib_ranges, call.target_address);
-
-    if (!call_lib.empty() && call_lib != ctx.self_library) {
-      call.is_external = true;
-
-      if (!ctx.embedded_addresses.count(call.target_address)) {
-        recursive_embed(ctx, call.target_address);
-      }
-    }
-  }
-  ctx.current_depth--;
-
-  ctx.pending_embeds.push_back({addr, code});
-  ctx.total_embedded_size += code.size();
+  RelinkConfig cfg{};
+  cfg.max_depth = 8;
+  cfg.max_total_size = 64 * 1024 * 1024;
+  cfg.fix_relocations = true;
+  cfg.inline_plt_calls = true;
+  return StaticRelinkerEx::relink_full(elf_data, pid, base_addr, cfg);
 }
 
 uint64_t MemoryInjector::remote_mmap(int pid, uint64_t addr, size_t size,
@@ -1923,8 +1403,8 @@ uint64_t MemoryInjector::remote_mmap(int pid, uint64_t addr, size_t size,
 
   int syscall_nr = (g_arch == ArchMode::ARM64) ? SYS_MMAP_64 : SYS_MMAP2_32;
   uint64_t ret = execute_syscall(
-      pid, {addr, (uint64_t)size, (uint64_t)prot, (uint64_t)flags,
-            (uint64_t)-1, 0},
+      pid,
+      {addr, (uint64_t)size, (uint64_t)prot, (uint64_t)flags, (uint64_t)-1, 0},
       syscall_nr);
   ProcessTracer::detach(pid);
   return (ret == (uint64_t)-1) ? 0 : ret;
@@ -2547,52 +2027,6 @@ bool SeccompBypass::disable_seccomp(int pid) {
   return !new_status.seccomp_enabled;
 }
 
-bool SeccompBypass::patch_seccomp_filter(int pid) {
-
-  auto status = get_seccomp_status(pid);
-  if (!status.seccomp_enabled || status.filter_count == 0)
-    return true;
-
-  return false;
-}
-
-bool SeccompBypass::use_memfd_workaround(int pid) {
-
-  if (!ProcessTracer::attach(pid))
-    return false;
-
-  ArchMode arch = ProcessTracer::get_arch();
-
-  if (arch == ArchMode::ARM64) {
-    uint64_t name_addr = FunctionHooker::allocate_remote(pid, 32);
-    const char *name = "hayabusa";
-    ProcessTracer::write_memory(pid, name_addr, name, strlen(name) + 1);
-
-    int memfd = (int)execute_syscall(pid, {name_addr, 1},
-                                     SYS_MEMFD_CREATE_64);
-
-    FunctionHooker::free_remote(pid, name_addr, 32);
-    ProcessTracer::detach(pid);
-
-    return memfd >= 0;
-  }
-
-  ProcessTracer::detach(pid);
-  return false;
-}
-
-int SeccompBypass::spawn_without_seccomp(const std::string &cmd) {
-
-  pid_t pid = fork();
-  if (pid == 0) {
-
-    execl("/system/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
-    _exit(1);
-  }
-  return pid;
-}
-
-bool SeccompBypass::inject_seccomp_disabler(int pid) { return false; }
 
 std::vector<uint8_t>
 StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
@@ -2641,6 +2075,9 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
 
     if (!config.exclude_libs.empty() && config.exclude_libs.count(lib))
       return;
+    if (!config.include_only_libs.empty() &&
+        !config.include_only_libs.count(lib))
+      return;
 
     auto code = StaticRelinker::embed_function(pid, addr, 0);
     if (code.empty() || code.size() < 8)
@@ -2655,9 +2092,16 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
     auto sub_calls = InstructionDecoder::scan_calls(
         code.data(), code.size(), addr, ProcessTracer::get_arch());
     for (const auto &c : sub_calls) {
-      if (c.target_address != 0 && c.target_address != addr) {
-        embed_recursive(c.target_address, depth + 1);
+      if (c.target_address == 0 || c.target_address == addr)
+        continue;
+      uint64_t target = c.target_address;
+      if (config.inline_plt_calls) {
+        uint64_t resolved = InstructionDecoder::resolve_plt(
+            pid, c.target_address, ProcessTracer::get_arch());
+        if (resolved != 0)
+          target = resolved;
       }
+      embed_recursive(target, depth + 1);
     }
   };
 
@@ -2669,49 +2113,284 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
   }
 
   if (config.fix_relocations) {
-    patch_relocations(result, embedded_addrs);
+    patch_relocations(result, embedded_addrs, base_addr);
   }
 
   return result;
 }
 
+struct EmbeddedFunctionInfo {
+  uint64_t remote_addr;
+  uint64_t local_offset;
+  size_t size;
+  int depth;
+};
+
+static bool patch_call_site(std::vector<uint8_t> &blob, size_t call_site,
+                            uint64_t target_local, ArchMode arch) {
+  if (call_site + 4 > blob.size())
+    return false;
+  if (arch == ArchMode::ARM64) {
+    int64_t rel = static_cast<int64_t>(target_local) -
+                  static_cast<int64_t>(call_site);
+    if ((rel & 0x3) != 0)
+      return false;
+    int64_t imm = rel / 4;
+    if (imm < -0x2000000LL || imm >= 0x2000000LL)
+      return false;
+    uint32_t inst = 0x94000000 | (static_cast<uint32_t>(imm) & 0x03FFFFFF);
+    memcpy(blob.data() + call_site, &inst, sizeof(inst));
+    return true;
+  }
+
+  int64_t rel = static_cast<int64_t>(target_local) -
+                static_cast<int64_t>(call_site + 8);
+  uint32_t orig = 0;
+  memcpy(&orig, blob.data() + call_site, sizeof(orig));
+
+  // ARM32 BL (immediate): cond(31:28) 1011 imm24, target = pc+8 + imm24<<2
+  if ((orig & 0x0F000000) == 0x0B000000) {
+    if ((rel & 0x3) != 0)
+      return false;
+    int64_t imm = rel / 4;
+    if (imm < -0x800000LL || imm >= 0x800000LL)
+      return false;
+    uint32_t inst =
+        (orig & 0xFF000000) | (static_cast<uint32_t>(imm) & 0x00FFFFFF);
+    memcpy(blob.data() + call_site, &inst, sizeof(inst));
+    return true;
+  }
+
+  // ARM32 BLX (immediate): 1111 101H imm24, target = pc+8 + signext(imm24:H:0)
+  if ((orig & 0xFE000000) == 0xFA000000) {
+    if ((rel & 0x1) != 0)
+      return false;
+    int64_t imm25 = rel >> 1;
+    int64_t imm24 = imm25 >> 1;
+    if (imm24 < -0x800000LL || imm24 >= 0x800000LL)
+      return false;
+    uint32_t h = static_cast<uint32_t>(imm25 & 1);
+    uint32_t inst =
+        (orig & 0xFE000000) | (h << 24) |
+        (static_cast<uint32_t>(imm24) & 0x00FFFFFF);
+    memcpy(blob.data() + call_site, &inst, sizeof(inst));
+    return true;
+  }
+
+  return false;
+}
+
+static void patch_embedded_calls(std::vector<uint8_t> &blob, int pid,
+                                 const std::vector<EmbeddedFunctionInfo> &funcs,
+                                 const std::map<uint64_t, uint64_t> &addr_map,
+                                 ArchMode arch) {
+  for (const auto &fn : funcs) {
+    if (fn.local_offset + fn.size > blob.size())
+      continue;
+    const uint8_t *code = blob.data() + fn.local_offset;
+    auto calls =
+        InstructionDecoder::scan_calls(code, fn.size, fn.remote_addr, arch);
+    for (const auto &call : calls) {
+      if (call.call_site_offset + 4 > fn.size)
+        continue;
+      uint64_t target_addr = call.target_address;
+      auto it = addr_map.find(target_addr);
+      if (it == addr_map.end()) {
+        uint64_t resolved = InstructionDecoder::resolve_plt(pid, target_addr, arch);
+        if (resolved != 0 && resolved != target_addr)
+          it = addr_map.find(resolved);
+      }
+      if (it == addr_map.end())
+        continue;
+      size_t call_site = static_cast<size_t>(fn.local_offset + call.call_site_offset);
+      patch_call_site(blob, call_site, it->second, arch);
+    }
+  }
+}
+
 std::vector<uint8_t>
 StaticRelinkerEx::extract_function_with_deps(int pid, uint64_t addr,
                                              int max_depth) {
-  RelinkConfig config;
-  config.max_depth = max_depth;
-  config.max_total_size = 64 * 1024 * 1024;
-  config.embed_data_refs = true;
-  config.fix_relocations = true;
-  config.inline_plt_calls = true;
+  if (max_depth < 0)
+    max_depth = 0;
 
-  auto code = StaticRelinker::embed_function(pid, addr, 0);
+  const ArchMode arch = ProcessTracer::get_arch();
+  const size_t align = (arch == ArchMode::ARM64) ? 16 : 4;
+  const size_t max_total_size = 64 * 1024 * 1024;
 
-  return code;
+  auto ranges = ProcessTracer::get_library_ranges(pid);
+  std::string root_lib = ProcessTracer::find_library_for_address(ranges, addr);
+  if (root_lib.empty())
+    return {};
+
+  std::vector<uint8_t> result;
+  result.reserve(256 * 1024);
+
+  std::map<uint64_t, uint64_t> embedded_by_remote;
+  std::vector<EmbeddedFunctionInfo> embedded_funcs;
+  std::vector<std::pair<uint64_t, int>> pending;
+  std::set<uint64_t> queued;
+
+  pending.push_back({addr, 0});
+  queued.insert(addr);
+
+  while (!pending.empty()) {
+    auto current = pending.back();
+    pending.pop_back();
+    uint64_t current_addr = current.first;
+    int depth = current.second;
+
+    if (embedded_by_remote.count(current_addr))
+      continue;
+    if (depth > max_depth)
+      continue;
+
+    auto code = StaticRelinker::embed_function(pid, current_addr, 0);
+    if (code.empty() || code.size() < 4) {
+      if (current_addr == addr)
+        return {};
+      continue;
+    }
+
+    while (result.size() % align)
+      result.push_back(0);
+
+    if (result.size() + code.size() > max_total_size) {
+      if (current_addr == addr)
+        return {};
+      continue;
+    }
+
+    uint64_t local_offset = result.size();
+    result.insert(result.end(), code.begin(), code.end());
+    embedded_by_remote[current_addr] = local_offset;
+    embedded_funcs.push_back({current_addr, local_offset, code.size(), depth});
+
+    if (depth >= max_depth)
+      continue;
+
+    auto calls = InstructionDecoder::scan_calls(code.data(), code.size(),
+                                                current_addr, arch);
+    for (const auto &c : calls) {
+      uint64_t target = c.target_address;
+      if (target == 0 || target == current_addr)
+        continue;
+      std::string target_lib =
+          ProcessTracer::find_library_for_address(ranges, target);
+      if (target_lib.empty())
+        continue;
+
+      uint64_t resolved_target = target;
+      if (target_lib == root_lib) {
+        uint64_t plt_resolved = InstructionDecoder::resolve_plt(pid, target, arch);
+        if (plt_resolved != 0) {
+          std::string resolved_lib =
+              ProcessTracer::find_library_for_address(ranges, plt_resolved);
+          if (!resolved_lib.empty())
+            resolved_target = plt_resolved;
+        }
+      }
+
+      if (!embedded_by_remote.count(resolved_target) &&
+          queued.insert(resolved_target).second) {
+        pending.push_back({resolved_target, depth + 1});
+      }
+    }
+  }
+
+  auto root_it = embedded_by_remote.find(addr);
+  if (root_it == embedded_by_remote.end())
+    return {};
+
+  patch_embedded_calls(result, pid, embedded_funcs, embedded_by_remote, arch);
+  return result;
+}
+
+template <typename Ehdr, typename Phdr>
+static bool file_offset_to_vaddr_impl(const std::vector<uint8_t> &data,
+                                      size_t file_off, uint64_t &vaddr_out) {
+  if (data.size() < sizeof(Ehdr))
+    return false;
+  const Ehdr *ehdr = reinterpret_cast<const Ehdr *>(data.data());
+  if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0 ||
+      ehdr->e_phentsize != sizeof(Phdr))
+    return false;
+  size_t ph_end = static_cast<size_t>(ehdr->e_phoff) +
+                  static_cast<size_t>(ehdr->e_phnum) * sizeof(Phdr);
+  if (ph_end > data.size())
+    return false;
+  const Phdr *phdrs = reinterpret_cast<const Phdr *>(data.data() + ehdr->e_phoff);
+  for (int i = 0; i < ehdr->e_phnum; i++) {
+    const Phdr &ph = phdrs[i];
+    if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
+      continue;
+    uint64_t seg_off = ph.p_offset;
+    uint64_t seg_end = ph.p_offset + ph.p_filesz;
+    if (file_off < seg_off || file_off >= seg_end)
+      continue;
+    uint64_t delta = static_cast<uint64_t>(file_off) - seg_off;
+    vaddr_out = ph.p_vaddr + delta;
+    return true;
+  }
+  return false;
+}
+
+static bool file_offset_to_vaddr(const std::vector<uint8_t> &data, size_t file_off,
+                                 uint64_t &vaddr_out) {
+  if (data.size() < EI_NIDENT || data[0] != 0x7f || data[1] != 'E' ||
+      data[2] != 'L' || data[3] != 'F')
+    return false;
+  if (data[EI_CLASS] == ELFCLASS32)
+    return file_offset_to_vaddr_impl<Elf32_Ehdr, Elf32_Phdr>(data, file_off,
+                                                              vaddr_out);
+  if (data[EI_CLASS] == ELFCLASS64)
+    return file_offset_to_vaddr_impl<Elf64_Ehdr, Elf64_Phdr>(data, file_off,
+                                                              vaddr_out);
+  return false;
 }
 
 bool StaticRelinkerEx::patch_relocations(
-    std::vector<uint8_t> &data, const std::map<uint64_t, uint64_t> &addr_map) {
+    std::vector<uint8_t> &data, const std::map<uint64_t, uint64_t> &addr_map,
+    uint64_t base_addr) {
   ArchMode arch = ProcessTracer::get_arch();
 
   for (size_t i = 0; i + 4 <= data.size(); i += 4) {
     uint32_t inst = *(uint32_t *)(data.data() + i);
+    uint64_t call_vaddr = 0;
+    if (!file_offset_to_vaddr(data, i, call_vaddr))
+      continue;
 
     if (arch == ArchMode::ARM64) {
       if ((inst & 0xFC000000) == 0x94000000) {
         int32_t offset = inst & 0x03FFFFFF;
         if (offset & 0x02000000)
           offset |= 0xFC000000;
-        uint64_t target = i + (int64_t)offset * 4;
-
-        auto it = addr_map.find(target);
-        if (it != addr_map.end()) {
-          int64_t new_offset = ((int64_t)it->second - (int64_t)i) / 4;
-          if (new_offset >= -0x2000000 && new_offset < 0x2000000) {
-            uint32_t new_inst = 0x94000000 | (new_offset & 0x03FFFFFF);
-            *(uint32_t *)(data.data() + i) = new_inst;
-          }
-        }
+        uint64_t target_remote =
+            base_addr + call_vaddr + static_cast<int64_t>(offset) * 4;
+        auto it = addr_map.find(target_remote);
+        if (it != addr_map.end())
+          patch_call_site(data, i, it->second, arch);
+      }
+    } else {
+      if ((inst & 0x0F000000) == 0x0B000000) {
+        int32_t imm24 = inst & 0x00FFFFFF;
+        if (imm24 & 0x00800000)
+          imm24 |= 0xFF000000;
+        uint64_t target_remote =
+            base_addr + call_vaddr + 8 + static_cast<int64_t>(imm24) * 4;
+        auto it = addr_map.find(target_remote);
+        if (it != addr_map.end())
+          patch_call_site(data, i, it->second, arch);
+      } else if ((inst & 0xFE000000) == 0xFA000000) {
+        int32_t imm24 = inst & 0x00FFFFFF;
+        if (imm24 & 0x00800000)
+          imm24 |= 0xFF000000;
+        uint32_t h = (inst >> 24) & 1;
+        int64_t rel = static_cast<int64_t>(imm24) * 4 + (h << 1);
+        uint64_t target_remote = base_addr + call_vaddr + 8 + rel;
+        auto it = addr_map.find(target_remote);
+        if (it != addr_map.end())
+          patch_call_site(data, i, it->second, arch);
       }
     }
   }
@@ -2729,10 +2408,18 @@ CryptoAnalyzer::scan_for_keys(const std::vector<uint8_t> &data,
   for (const auto &k : aes_keys) {
     CryptoKeyInfo info;
     info.key_addr = base_addr + k.offset;
-    info.key_data.assign(k.key, k.key + k.key_size);
-    info.algorithm = (k.key_size == 16)   ? "AES-128"
-                     : (k.key_size == 24) ? "AES-192"
-                                          : "AES-256";
+    if (k.key_size > 0)
+      info.key_data.assign(k.key, k.key + k.key_size);
+    if (k.key_size == 16)
+      info.algorithm = "AES-128";
+    else if (k.key_size == 24)
+      info.algorithm = "AES-192";
+    else if (k.key_size == 32)
+      info.algorithm = "AES-256";
+    else if (k.detection_method == "S-BOX")
+      info.algorithm = "AES-SBOX";
+    else
+      info.algorithm = "UNKNOWN";
     info.source = k.detection_method;
     info.confidence = k.confidence;
     info.capture_time = time(nullptr);
@@ -2742,328 +2429,11 @@ CryptoAnalyzer::scan_for_keys(const std::vector<uint8_t> &data,
   return keys;
 }
 
-std::vector<CryptoKeyInfo>
-CryptoAnalyzer::extract_runtime_keys(int pid, uint64_t base,
-                                     const std::vector<uint8_t> &data) {
-  std::vector<CryptoKeyInfo> keys;
+static std::map<uint64_t, std::vector<uint8_t>> g_crypto_original_patches;
 
-  auto static_keys = scan_for_keys(data, base);
-  keys.insert(keys.end(), static_keys.begin(), static_keys.end());
-
-  std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
-  std::string line;
-
-  while (std::getline(maps, line)) {
-    if (line.find("[heap]") != std::string::npos ||
-        line.find("[anon:libc_malloc]") != std::string::npos) {
-      uint64_t start, end;
-      if (sscanf(line.c_str(), "%lx-%lx", (unsigned long *)&start,
-                 (unsigned long *)&end) == 2) {
-
-        const size_t chunk_size = 1024 * 1024;
-        for (uint64_t addr = start; addr < end; addr += chunk_size) {
-          size_t read_size = std::min(chunk_size, (size_t)(end - addr));
-          std::vector<uint8_t> chunk(read_size);
-
-          if (ProcessTracer::read_memory(pid, addr, chunk.data(), read_size)) {
-            auto chunk_keys = scan_for_keys(chunk, addr);
-            for (auto &k : chunk_keys) {
-              k.source = "heap";
-              keys.push_back(k);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  return keys;
-}
-
-std::vector<CryptoKeyInfo>
-CryptoAnalyzer::trace_key_derivation(int pid, uint64_t crypto_func) {
-  std::vector<CryptoKeyInfo> keys;
-
-  if (crypto_func == 0)
-    return keys;
-
-  bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
-  size_t ptr_size = is64 ? 8 : 4;
-
-  uint32_t orig_inst;
-  if (!ProcessTracer::read_memory(pid, crypto_func, &orig_inst, 4))
-    return keys;
-
-  uint32_t brk_inst = is64 ? 0xD4200000 : 0xE1200070;
-  if (!ProcessTracer::write_memory(pid, crypto_func, &brk_inst, 4)) {
-    return keys;
-  }
-
-  ProcessTracer::continue_process(pid);
-
-  int status = 0;
-  time_t start = time(nullptr);
-  bool hit = false;
-
-  while (time(nullptr) - start < 5) {
-    if (ProcessTracer::wait_for_stop(pid, &status)) {
-      if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
-        hit = true;
-        break;
-      }
-    }
-  }
-
-  if (hit) {
-
-    uint64_t key_ptr = ProcessTracer::get_register(pid, is64 ? 1 : 1);
-    uint64_t key_len_hint = ProcessTracer::get_register(pid, is64 ? 2 : 2);
-
-    if (key_len_hint == 0 || key_len_hint > 64)
-      key_len_hint = 32;
-
-    if (key_ptr != 0 && key_ptr > 0x1000) {
-      CryptoKeyInfo info;
-      info.key_addr = key_ptr;
-      info.key_data.resize(key_len_hint);
-
-      if (ProcessTracer::read_memory(pid, key_ptr, info.key_data.data(),
-                                     key_len_hint)) {
-        info.algorithm = (key_len_hint == 16)   ? "AES-128"
-                         : (key_len_hint == 24) ? "AES-192"
-                         : (key_len_hint == 32) ? "AES-256"
-                                                : "Unknown";
-        info.source = "trace_key_derivation";
-        info.confidence = 0.7;
-        info.capture_time = time(nullptr);
-        keys.push_back(info);
-      }
-    }
-  }
-
-  ProcessTracer::write_memory(pid, crypto_func, &orig_inst, 4);
-
-  ProcessTracer::continue_process(pid);
-
-  return keys;
-}
-
-std::vector<CryptoCallInfo>
-CryptoAnalyzer::monitor_crypto_calls(int pid, int duration_sec) {
-  std::vector<CryptoCallInfo> calls;
-
-  struct CryptoTarget {
-    std::string lib;
-    std::string func;
-    int key_arg_idx;
-    int len_arg_idx;
-  };
-
-  std::vector<CryptoTarget> targets = {
-      {"libcrypto.so", "EVP_EncryptInit_ex", 3, -1},
-      {"libcrypto.so", "EVP_DecryptInit_ex", 3, -1},
-      {"libcrypto.so", "AES_encrypt", 0, -1},
-      {"libcrypto.so", "AES_decrypt", 0, -1},
-      {"libcrypto.so", "AES_set_encrypt_key", 0, 1},
-      {"libcrypto.so", "AES_set_decrypt_key", 0, 1},
-  };
-
-  bool is64 = (ProcessTracer::get_arch() == ArchMode::ARM64);
-
-  struct Breakpoint {
-    uint64_t addr;
-    uint32_t orig_inst;
-    CryptoTarget target;
-    bool active;
-  };
-
-  std::vector<Breakpoint> breakpoints;
-
-  for (const auto &t : targets) {
-    uint64_t addr = FunctionHooker::find_remote_symbol(pid, t.lib, t.func);
-    if (addr != 0) {
-      Breakpoint bp;
-      bp.addr = addr;
-      bp.target = t;
-      bp.active = false;
-
-      if (ProcessTracer::read_memory(pid, addr, &bp.orig_inst, 4)) {
-        uint32_t brk_inst = is64 ? 0xD4200000 : 0xE1200070;
-        if (ProcessTracer::write_memory(pid, addr, &brk_inst, 4)) {
-          bp.active = true;
-          breakpoints.push_back(bp);
-        }
-      }
-    }
-  }
-
-  if (breakpoints.empty())
-    return calls;
-
-  ProcessTracer::continue_process(pid);
-
-  time_t start = time(nullptr);
-  while (time(nullptr) - start < duration_sec && calls.size() < 1000) {
-    int status = 0;
-    if (ProcessTracer::wait_for_stop(pid, &status)) {
-      if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
-        uint64_t pc = ProcessTracer::get_pc(pid);
-
-        for (auto &bp : breakpoints) {
-          if (bp.active && bp.addr == pc) {
-            CryptoCallInfo info;
-            info.func_addr = bp.addr;
-            info.func_name = bp.target.func;
-
-            int key_reg = bp.target.key_arg_idx;
-            if (key_reg >= 0 && key_reg < 8) {
-              uint64_t key_ptr = ProcessTracer::get_register(pid, key_reg);
-              if (key_ptr != 0 && key_ptr > 0x1000) {
-                info.key_data.resize(32);
-                ProcessTracer::read_memory(pid, key_ptr, info.key_data.data(),
-                                           32);
-              }
-            }
-
-            if (bp.target.len_arg_idx >= 0) {
-              uint64_t len =
-                  ProcessTracer::get_register(pid, bp.target.len_arg_idx);
-              if (len > 0 && len <= 64) {
-                info.key_data.resize(len);
-              }
-            }
-
-            uint64_t input_ptr = ProcessTracer::get_register(pid, 0);
-            if (input_ptr != 0 && input_ptr > 0x1000) {
-              info.input_data.resize(64);
-              ProcessTracer::read_memory(pid, input_ptr, info.input_data.data(),
-                                         64);
-            }
-
-            calls.push_back(info);
-
-            ProcessTracer::write_memory(pid, bp.addr, &bp.orig_inst, 4);
-            ProcessTracer::single_step(pid);
-            uint32_t brk_inst = is64 ? 0xD4200000 : 0xE1200070;
-            ProcessTracer::write_memory(pid, bp.addr, &brk_inst, 4);
-            break;
-          }
-        }
-      }
-      ProcessTracer::continue_process(pid);
-    }
-  }
-
-  for (auto &bp : breakpoints) {
-    if (bp.active) {
-      ProcessTracer::write_memory(pid, bp.addr, &bp.orig_inst, 4);
-    }
-  }
-
-  return calls;
-}
-
-std::vector<uint8_t> CryptoAnalyzer::dump_ssl_session_keys(int pid) {
-  std::vector<uint8_t> keys;
-
-  uint64_t libssl = 0;
-  auto ranges = ProcessTracer::get_library_ranges(pid);
-  for (const auto &r : ranges) {
-    if (r.name.find("libssl.so") != std::string::npos) {
-      libssl = r.start;
-      break;
-    }
-  }
-
-  std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
-  std::string line;
-
-  while (std::getline(maps, line)) {
-    if (line.find("[heap]") != std::string::npos ||
-        line.find("[anon:libc_malloc]") != std::string::npos ||
-        line.find("libssl") != std::string::npos) {
-      uint64_t start, end;
-      if (sscanf(line.c_str(), "%lx-%lx", (unsigned long *)&start,
-                 (unsigned long *)&end) != 2)
-        continue;
-
-      size_t scan_size =
-          std::min((size_t)(end - start), (size_t)(32 * 1024 * 1024));
-      std::vector<uint8_t> mem(scan_size);
-
-      if (!ProcessTracer::read_memory(pid, start, mem.data(), scan_size))
-        continue;
-
-      for (size_t i = 0; i + 64 < scan_size; i += 8) {
-
-        uint32_t len = *(uint32_t *)(mem.data() + i);
-        if (len == 48) {
-
-          const uint8_t *key_data = mem.data() + i + 4;
-
-          int zero_count = 0;
-          int printable_count = 0;
-          for (int j = 0; j < 48; j++) {
-            if (key_data[j] == 0)
-              zero_count++;
-            if (key_data[j] >= 0x20 && key_data[j] <= 0x7E)
-              printable_count++;
-          }
-
-          if (zero_count < 10 && printable_count < 40) {
-
-            keys.insert(keys.end(), key_data, key_data + 48);
-          }
-        }
-      }
-    }
-  }
-
-  return keys;
-}
-
-std::vector<CryptoKeyInfo> CryptoAnalyzer::extract_openssl_keys(int pid) {
-  std::vector<CryptoKeyInfo> keys;
-
-  uint64_t libcrypto = 0;
-  auto ranges = ProcessTracer::get_library_ranges(pid);
-  for (const auto &r : ranges) {
-    if (r.name.find("libcrypto.so") != std::string::npos) {
-      libcrypto = r.start;
-      break;
-    }
-  }
-
-  if (libcrypto == 0)
-    return keys;
-
-  size_t lib_size = 0;
-  for (const auto &r : ranges) {
-    if (r.name.find("libcrypto.so") != std::string::npos) {
-      if (r.end > libcrypto + lib_size)
-        lib_size = r.end - libcrypto;
-    }
-  }
-
-  if (lib_size > EmbedContext::MAX_TOTAL_SIZE)
-    lib_size = EmbedContext::MAX_TOTAL_SIZE;
-
-  std::vector<uint8_t> data(lib_size);
-  if (ProcessTracer::read_memory(pid, libcrypto, data.data(), lib_size)) {
-    keys = scan_for_keys(data, libcrypto);
-  }
-
-  return keys;
-}
-
-std::vector<CryptoKeyInfo> CryptoAnalyzer::extract_boringssl_keys(int pid) {
-
-  return extract_openssl_keys(pid);
-}
 
 static bool hook_aes_function(int pid, uint64_t *original,
-                              const char *primary_sym,
-                              const char *nohw_sym,
+                              const char *primary_sym, const char *nohw_sym,
                               const char *openssl_sym) {
   uint64_t func_addr =
       FunctionHooker::find_remote_symbol(pid, "libcrypto.so", primary_sym);
@@ -3080,12 +2450,13 @@ static bool hook_aes_function(int pid, uint64_t *original,
   if (original)
     *original = func_addr;
 
-  uint64_t key_storage = FunctionHooker::allocate_remote(pid, 4096);
-  if (key_storage == 0)
-    return false;
-
-  uint64_t zero = 0;
-  ProcessTracer::write_memory(pid, key_storage, &zero, 8);
+  size_t patch_size = (ProcessTracer::get_arch() == ArchMode::ARM64) ? 16 : 8;
+  if (!g_crypto_original_patches.count(func_addr)) {
+    std::vector<uint8_t> saved(patch_size);
+    if (!ProcessTracer::read_memory(pid, func_addr, saved.data(), patch_size))
+      return false;
+    g_crypto_original_patches[func_addr] = saved;
+  }
 
   if (ProcessTracer::get_arch() == ArchMode::ARM64) {
     std::vector<uint8_t> hook_code;
@@ -3095,16 +2466,6 @@ static bool hook_aes_function(int pid, uint64_t *original,
         0xA9010FE0,
     };
     for (auto inst : prologue)
-      hook_code.insert(hook_code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
-
-    uint64_t storage = key_storage;
-    uint32_t mov_x9[] = {
-        static_cast<uint32_t>(0xD2800009 | (((storage >> 0) & 0xFFFF) << 5)),
-        static_cast<uint32_t>(0xF2A00009 | (((storage >> 16) & 0xFFFF) << 5)),
-        static_cast<uint32_t>(0xF2C00009 | (((storage >> 32) & 0xFFFF) << 5)),
-        static_cast<uint32_t>(0xF2E00009 | (((storage >> 48) & 0xFFFF) << 5)),
-    };
-    for (auto inst : mov_x9)
       hook_code.insert(hook_code.end(), (uint8_t *)&inst, (uint8_t *)&inst + 4);
 
     uint32_t epilogue[] = {
@@ -3125,10 +2486,8 @@ static bool hook_aes_function(int pid, uint64_t *original,
 
     uint64_t hook_addr =
         FunctionHooker::allocate_remote(pid, hook_code.size() + 64);
-    if (hook_addr == 0) {
-      FunctionHooker::free_remote(pid, key_storage, 4096);
+    if (hook_addr == 0)
       return false;
-    }
 
     ProcessTracer::write_memory(pid, hook_addr, hook_code.data(),
                                 hook_code.size());
@@ -3136,13 +2495,46 @@ static bool hook_aes_function(int pid, uint64_t *original,
     HookInfo info;
     if (!MemoryInjector::install_inline_hook(pid, func_addr, hook_addr,
                                              &info)) {
-      FunctionHooker::free_remote(pid, key_storage, 4096);
       FunctionHooker::free_remote(pid, hook_addr, hook_code.size() + 64);
       return false;
     }
 
     ProcessTracer::write_memory(pid, hook_addr + hook_code.size() - 8,
                                 &info.trampoline_addr, 8);
+  } else {
+    std::vector<uint8_t> hook_code;
+
+    // Minimal ARM32 pass-through hook body: preserve a small register set and
+    // branch to trampoline literal (patched after inline hook install).
+    uint32_t push = 0xE92D40F0; // push {r4-r7, lr}
+    uint32_t pop = 0xE8BD40F0;  // pop {r4-r7, lr}
+    uint32_t ldr_pc = 0xE51FF004;
+    uint32_t target_placeholder = 0;
+    hook_code.insert(hook_code.end(), (uint8_t *)&push, (uint8_t *)&push + 4);
+    hook_code.insert(hook_code.end(), (uint8_t *)&pop, (uint8_t *)&pop + 4);
+    hook_code.insert(hook_code.end(), (uint8_t *)&ldr_pc,
+                     (uint8_t *)&ldr_pc + 4);
+    hook_code.insert(hook_code.end(), (uint8_t *)&target_placeholder,
+                     (uint8_t *)&target_placeholder + 4);
+
+    uint64_t hook_addr =
+        FunctionHooker::allocate_remote(pid, hook_code.size() + 32);
+    if (hook_addr == 0)
+      return false;
+
+    ProcessTracer::write_memory(pid, hook_addr, hook_code.data(),
+                                hook_code.size());
+
+    HookInfo info;
+    if (!MemoryInjector::install_inline_hook(pid, func_addr, hook_addr,
+                                             &info)) {
+      FunctionHooker::free_remote(pid, hook_addr, hook_code.size() + 32);
+      return false;
+    }
+
+    uint32_t tramp = static_cast<uint32_t>(info.trampoline_addr);
+    ProcessTracer::write_memory(pid, hook_addr + hook_code.size() - 4, &tramp,
+                                sizeof(tramp));
   }
 
   return true;
@@ -3156,6 +2548,20 @@ bool CryptoAnalyzer::hook_aes_encrypt(int pid, uint64_t *original) {
 bool CryptoAnalyzer::hook_aes_decrypt(int pid, uint64_t *original) {
   return hook_aes_function(pid, original, "AES_decrypt", "aes_nohw_decrypt",
                            "OPENSSL_AES_decrypt");
+}
+
+size_t CryptoAnalyzer::restore_aes_hooks(int pid) {
+  size_t restored = 0;
+  for (const auto &kv : g_crypto_original_patches) {
+    if (kv.second.empty())
+      continue;
+    if (ProcessTracer::write_memory(pid, kv.first, kv.second.data(),
+                                    kv.second.size())) {
+      restored++;
+    }
+  }
+  g_crypto_original_patches.clear();
+  return restored;
 }
 
 std::vector<uint8_t>

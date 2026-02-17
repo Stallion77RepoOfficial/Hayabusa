@@ -12,7 +12,9 @@
 #include <iomanip>
 #include <iostream>
 #include <set>
+#include <signal.h>
 #include <sstream>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef EM_AARCH64
@@ -72,54 +74,6 @@ std::vector<uint8_t> Memory::dump(int pid, unsigned long addr, size_t size) {
   return buf;
 }
 
-int Utils::get_pid(const std::string &pkg) {
-  DIR *dir = opendir("/proc");
-  if (!dir)
-    return -1;
-  struct dirent *ent;
-  while ((ent = readdir(dir))) {
-    int pid = atoi(ent->d_name);
-    if (pid <= 0)
-      continue;
-    std::ifstream f("/proc/" + std::string(ent->d_name) + "/cmdline");
-    std::string cmd;
-    std::getline(f, cmd);
-    size_t null_pos = cmd.find('\0');
-    if (null_pos != std::string::npos)
-      cmd = cmd.substr(0, null_pos);
-    if (cmd == pkg) {
-      closedir(dir);
-      return pid;
-    }
-  }
-  closedir(dir);
-  return -1;
-}
-
-std::vector<std::string> Utils::get_apk_paths(const std::string &pkg) {
-  std::vector<std::string> results;
-  FILE *fp = popen(("pm path " + pkg + " 2>/dev/null").c_str(), "r");
-  if (!fp)
-    return results;
-  char buf[512];
-  while (fgets(buf, sizeof(buf), fp)) {
-    std::string line = buf;
-    if (line.substr(0, 8) == "package:")
-      line = line.substr(8);
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-      line.pop_back();
-    if (!line.empty())
-      results.push_back(line);
-  }
-  pclose(fp);
-  return results;
-}
-
-void Utils::launch_app(const std::string &pkg) {
-  system(("monkey -p " + pkg +
-          " -c android.intent.category.LAUNCHER 1 2>/dev/null")
-             .c_str());
-}
 
 std::string Utils::format_size(size_t bytes) {
   const char *u[] = {"B", "KB", "MB", "GB"};
@@ -157,6 +111,8 @@ using SymbolEmit =
 
 static size_t iterate_symbols(const std::vector<uint8_t> &data,
                               const SymbolEmit &emit);
+static bool vaddr_to_offset(const std::vector<uint8_t> &data, uint64_t vaddr,
+                            size_t &offset);
 
 std::vector<ElfSymbol>
 ElfParser::get_symbols(const std::vector<uint8_t> &data) {
@@ -646,6 +602,7 @@ static DynParsed parse_dynamic_tags(Dyn *dyn, size_t dyn_n,
 
 static std::vector<uint8_t> repair_elf32(const std::vector<uint8_t> &data,
                                          uint64_t base_addr) {
+  (void)base_addr;
   std::vector<uint8_t> fixed = data;
   if (fixed.size() < sizeof(Elf32_Ehdr))
     fixed.resize(sizeof(Elf32_Ehdr));
@@ -904,6 +861,7 @@ static std::vector<uint8_t> repair_elf32(const std::vector<uint8_t> &data,
 
 static std::vector<uint8_t> repair_elf64(const std::vector<uint8_t> &data,
                                          uint64_t base_addr) {
+  (void)base_addr;
   std::vector<uint8_t> fixed = data;
   if (fixed.size() < sizeof(Elf64_Ehdr))
     fixed.resize(sizeof(Elf64_Ehdr));
@@ -1207,7 +1165,6 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
     const Elf64_Shdr *dynsym = nullptr;
     const Elf64_Shdr *dynstr = nullptr;
     const Elf64_Shdr *relaplt = nullptr;
-    const Elf64_Shdr *plt = nullptr;
 
     for (int i = 0; i < ehdr->e_shnum; i++) {
       std::string name;
@@ -1221,8 +1178,6 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
       else if (shdrs[i].sh_type == SHT_RELA &&
                (name == ".rela.plt" || name == ".rela.dyn"))
         relaplt = &shdrs[i];
-      else if (name == ".plt" || name == ".plt.got")
-        plt = &shdrs[i];
     }
 
     if (!dynsym || !dynstr || !relaplt)
@@ -1359,7 +1314,6 @@ std::string ElfParser::demangle_symbol(const std::string &mangled) {
 
   std::string result;
   size_t pos = 2;
-  bool is_nested = false;
   bool is_const_method = false;
   bool is_volatile_method = false;
   std::vector<std::string> components;
@@ -1377,7 +1331,6 @@ std::string ElfParser::demangle_symbol(const std::string &mangled) {
   }
 
   if (pos < mangled.size() && mangled[pos] == 'N') {
-    is_nested = true;
     pos++;
     while (
         pos < mangled.size() &&
@@ -1872,7 +1825,6 @@ ElfParser::find_encrypted_strings(const std::vector<uint8_t> &data) {
   std::vector<std::string> results;
 
   for (size_t i = 0; i + 16 < data.size(); i++) {
-    bool high_entropy = true;
     int printable = 0;
     for (size_t j = 0; j < 16; j++) {
       uint8_t b = data[i + j];
@@ -1907,31 +1859,57 @@ ElfParser::find_encrypted_strings(const std::vector<uint8_t> &data) {
 static uint64_t find_dynamic_entry(const std::vector<uint8_t> &data,
                                    int64_t tag, bool is32) {
   if (is32) {
+    if (data.size() < sizeof(Elf32_Ehdr))
+      return 0;
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
+    if (ehdr->e_phoff == 0 || ehdr->e_phentsize != sizeof(Elf32_Phdr) ||
+        ehdr->e_phnum == 0)
+      return 0;
+    size_t ph_end = (size_t)ehdr->e_phoff + (size_t)ehdr->e_phnum * sizeof(Elf32_Phdr);
+    if (ph_end > data.size())
+      return 0;
     const Elf32_Phdr *phdrs = (const Elf32_Phdr *)(data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
-      if (phdrs[i].p_type == PT_DYNAMIC) {
-        const Elf32_Dyn *dyn =
-            (const Elf32_Dyn *)(data.data() + phdrs[i].p_offset);
-        while (dyn->d_tag != DT_NULL) {
-          if (dyn->d_tag == tag)
-            return dyn->d_un.d_val;
-          dyn++;
-        }
+      if (phdrs[i].p_type != PT_DYNAMIC)
+        continue;
+      if (phdrs[i].p_offset >= data.size())
+        continue;
+      size_t dyn_bytes = std::min<size_t>(phdrs[i].p_filesz, data.size() - phdrs[i].p_offset);
+      size_t dyn_count = dyn_bytes / sizeof(Elf32_Dyn);
+      const Elf32_Dyn *dyn =
+          (const Elf32_Dyn *)(data.data() + phdrs[i].p_offset);
+      for (size_t j = 0; j < dyn_count; j++) {
+        if (dyn[j].d_tag == DT_NULL)
+          break;
+        if (dyn[j].d_tag == tag)
+          return dyn[j].d_un.d_val;
       }
     }
   } else {
+    if (data.size() < sizeof(Elf64_Ehdr))
+      return 0;
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
+    if (ehdr->e_phoff == 0 || ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr->e_phnum == 0)
+      return 0;
+    size_t ph_end = (size_t)ehdr->e_phoff + (size_t)ehdr->e_phnum * sizeof(Elf64_Phdr);
+    if (ph_end > data.size())
+      return 0;
     const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
-      if (phdrs[i].p_type == PT_DYNAMIC) {
-        const Elf64_Dyn *dyn =
-            (const Elf64_Dyn *)(data.data() + phdrs[i].p_offset);
-        while (dyn->d_tag != DT_NULL) {
-          if (dyn->d_tag == tag)
-            return dyn->d_un.d_val;
-          dyn++;
-        }
+      if (phdrs[i].p_type != PT_DYNAMIC)
+        continue;
+      if (phdrs[i].p_offset >= data.size())
+        continue;
+      size_t dyn_bytes = std::min<size_t>(phdrs[i].p_filesz, data.size() - phdrs[i].p_offset);
+      size_t dyn_count = dyn_bytes / sizeof(Elf64_Dyn);
+      const Elf64_Dyn *dyn =
+          (const Elf64_Dyn *)(data.data() + phdrs[i].p_offset);
+      for (size_t j = 0; j < dyn_count; j++) {
+        if (dyn[j].d_tag == DT_NULL)
+          break;
+        if (dyn[j].d_tag == tag)
+          return dyn[j].d_un.d_val;
       }
     }
   }
@@ -2005,20 +1983,29 @@ ElfParser::get_init_array(const std::vector<uint8_t> &data) {
   if (init_arr == 0 || init_sz == 0)
     return funcs;
 
+  size_t init_off = 0;
+  if (!vaddr_to_offset(data, init_arr, init_off)) {
+    if (init_arr >= data.size())
+      return funcs;
+    init_off = static_cast<size_t>(init_arr);
+  }
+
   if (is32) {
     size_t count = init_sz / 4;
-    if (init_arr < data.size()) {
-      const uint32_t *arr = (const uint32_t *)(data.data() + init_arr);
-      for (size_t i = 0; i < count && init_arr + i * 4 < data.size(); i++) {
+    if (init_off < data.size()) {
+      const uint32_t *arr = (const uint32_t *)(data.data() + init_off);
+      for (size_t i = 0; i < count && init_off + (i + 1) * 4 <= data.size();
+           i++) {
         if (arr[i] != 0)
           funcs.push_back(arr[i]);
       }
     }
   } else {
     size_t count = init_sz / 8;
-    if (init_arr < data.size()) {
-      const uint64_t *arr = (const uint64_t *)(data.data() + init_arr);
-      for (size_t i = 0; i < count && init_arr + i * 8 < data.size(); i++) {
+    if (init_off < data.size()) {
+      const uint64_t *arr = (const uint64_t *)(data.data() + init_off);
+      for (size_t i = 0; i < count && init_off + (i + 1) * 8 <= data.size();
+           i++) {
         if (arr[i] != 0)
           funcs.push_back(arr[i]);
       }
@@ -2038,20 +2025,29 @@ ElfParser::get_fini_array(const std::vector<uint8_t> &data) {
   if (fini_arr == 0 || fini_sz == 0)
     return funcs;
 
+  size_t fini_off = 0;
+  if (!vaddr_to_offset(data, fini_arr, fini_off)) {
+    if (fini_arr >= data.size())
+      return funcs;
+    fini_off = static_cast<size_t>(fini_arr);
+  }
+
   if (is32) {
     size_t count = fini_sz / 4;
-    if (fini_arr < data.size()) {
-      const uint32_t *arr = (const uint32_t *)(data.data() + fini_arr);
-      for (size_t i = 0; i < count && fini_arr + i * 4 < data.size(); i++) {
+    if (fini_off < data.size()) {
+      const uint32_t *arr = (const uint32_t *)(data.data() + fini_off);
+      for (size_t i = 0; i < count && fini_off + (i + 1) * 4 <= data.size();
+           i++) {
         if (arr[i] != 0)
           funcs.push_back(arr[i]);
       }
     }
   } else {
     size_t count = fini_sz / 8;
-    if (fini_arr < data.size()) {
-      const uint64_t *arr = (const uint64_t *)(data.data() + fini_arr);
-      for (size_t i = 0; i < count && fini_arr + i * 8 < data.size(); i++) {
+    if (fini_off < data.size()) {
+      const uint64_t *arr = (const uint64_t *)(data.data() + fini_off);
+      for (size_t i = 0; i < count && fini_off + (i + 1) * 8 <= data.size();
+           i++) {
         if (arr[i] != 0)
           funcs.push_back(arr[i]);
       }
@@ -2063,6 +2059,7 @@ ElfParser::get_fini_array(const std::vector<uint8_t> &data) {
 uint64_t ElfParser::resolve_plt_symbol(int pid,
                                        const std::vector<uint8_t> &data,
                                        const std::string &symbol_name) {
+  (void)data;
   if (symbol_name.empty())
     return 0;
 
@@ -2464,11 +2461,7 @@ size_t ElfParser::write_rtti(std::ostream &out,
   size_t valid = 0;
   for (const auto *s : sorted) {
     size_t vtable_off = 0;
-    if (vaddr_to_offset(data, s->offset, vtable_off)) {
-      valid++;
-      continue;
-    }
-    if (s->offset < data.size())
+    if (vaddr_to_offset(data, s->offset, vtable_off))
       valid++;
   }
 
@@ -2479,12 +2472,8 @@ size_t ElfParser::write_rtti(std::ostream &out,
   for (size_t i = 0; i < sorted.size(); i++) {
     const auto *s = sorted[i];
     size_t vtable_off = 0;
-    if (!vaddr_to_offset(data, s->offset, vtable_off)) {
-      if (s->offset < data.size())
-        vtable_off = static_cast<size_t>(s->offset);
-      else
-        continue;
-    }
+    if (!vaddr_to_offset(data, s->offset, vtable_off))
+      continue;
 
     uint64_t vtable_addr = base_addr ? base_addr + s->offset : s->offset;
     uint64_t typeinfo_addr = 0;
@@ -2528,6 +2517,8 @@ StringXref ElfParser::find_string_xrefs(const std::vector<uint8_t> &data,
                                         uint64_t base_addr) {
   StringXref result;
   result.string_value = str;
+  if (data.empty())
+    return result;
 
   for (size_t i = 0; i + str.size() <= data.size(); i++) {
     if (memcmp(data.data() + i, str.c_str(), str.size()) == 0) {
@@ -2550,7 +2541,6 @@ StringXref ElfParser::find_string_xrefs(const std::vector<uint8_t> &data,
       if ((inst0 & 0x9F000000) == 0x90000000) {
         if ((inst1 & 0xFF000000) == 0x91000000) {
           uint8_t rd0 = inst0 & 0x1F;
-          uint8_t rd1 = inst1 & 0x1F;
           uint8_t rn1 = (inst1 >> 5) & 0x1F;
 
           if (rd0 == rn1) {
@@ -2990,11 +2980,15 @@ ElfParser::find_encryption_key(const std::vector<uint8_t> &data) {
   std::vector<uint8_t> potential_key;
 
   for (uint64_t func_addr : init_funcs) {
-    if (func_addr >= data.size())
-      continue;
+    size_t func_off = 0;
+    if (!vaddr_to_offset(data, func_addr, func_off)) {
+      if (func_addr >= data.size())
+        continue;
+      func_off = static_cast<size_t>(func_addr);
+    }
 
-    for (size_t i = 0; i < 64 && func_addr + i + 4 <= data.size(); i += 4) {
-      uint32_t inst = *(uint32_t *)(data.data() + func_addr + i);
+    for (size_t i = 0; i < 64 && func_off + i + 4 <= data.size(); i += 4) {
+      uint32_t inst = *(uint32_t *)(data.data() + func_off + i);
 
       if ((inst & 0x7F800000) == 0x52800000) {
         uint16_t imm = (inst >> 5) & 0xFFFF;
@@ -3005,6 +2999,8 @@ ElfParser::find_encryption_key(const std::vector<uint8_t> &data) {
         }
       }
     }
+    if (potential_key.size() >= 16)
+      break;
   }
 
   return potential_key;
@@ -3050,35 +3046,90 @@ RuntimeAnalyzer::find_decrypted_regions(int pid, uint64_t base,
 
 bool RuntimeAnalyzer::trace_init_array(
     int pid, uint64_t base, const std::vector<uint64_t> &init_funcs) {
+  (void)base;
   if (!ProcessTracer::attach(pid))
     return false;
 
+  const bool is32 = ProcessTracer::get_arch() == ArchMode::ARM32;
+  const uint32_t brk_inst = is32 ? 0xE1200070 : 0xD4200000;
   std::map<uint64_t, uint32_t> original_instructions;
 
   for (uint64_t func : init_funcs) {
     uint32_t orig;
     if (ProcessTracer::read_memory(pid, func, &orig, 4)) {
       original_instructions[func] = orig;
-      uint32_t brk = 0xD4200000;
-      ProcessTracer::write_memory(pid, func, &brk, 4);
+      ProcessTracer::write_memory(pid, func, &brk_inst, 4);
     }
   }
 
-  ProcessTracer::continue_process(pid);
+  if (original_instructions.empty()) {
+    ProcessTracer::detach(pid);
+    return false;
+  }
 
-  int status;
-  for (int i = 0; i < (int)init_funcs.size() * 2; i++) {
-    if (!ProcessTracer::wait_for_stop(pid, &status))
-      break;
-
-    uint64_t pc = ProcessTracer::get_pc(pid);
-
-    auto it = original_instructions.find(pc);
-    if (it != original_instructions.end()) {
-      ProcessTracer::write_memory(pid, pc, &it->second, 4);
+  if (!ProcessTracer::continue_process(pid)) {
+    for (const auto &pair : original_instructions) {
+      ProcessTracer::write_memory(pid, pair.first, &pair.second, 4);
     }
+    ProcessTracer::detach(pid);
+    return false;
+  }
 
-    ProcessTracer::continue_process(pid);
+  // Non-blocking wait prevents dump pipeline from hanging forever if init
+  // functions already executed before we attached.
+  const int poll_step_ms = 10;
+  const int max_wait_ms = 1500;
+  int waited_ms = 0;
+  int observed_stops = 0;
+  const int max_stops = static_cast<int>(init_funcs.size()) * 2;
+  while (waited_ms < max_wait_ms && observed_stops < max_stops &&
+         !original_instructions.empty()) {
+    int status = 0;
+    pid_t w = waitpid(pid, &status, WNOHANG);
+    if (w == 0) {
+      usleep(poll_step_ms * 1000);
+      waited_ms += poll_step_ms;
+      continue;
+    }
+    if (w < 0)
+      break;
+    if (WIFEXITED(status) || WIFSIGNALED(status))
+      break;
+    if (!WIFSTOPPED(status))
+      continue;
+
+    observed_stops++;
+    uint64_t pc = ProcessTracer::get_pc(pid);
+    auto restore_at = [&](uint64_t addr) -> bool {
+      auto it = original_instructions.find(addr);
+      if (it == original_instructions.end())
+        return false;
+      ProcessTracer::write_memory(pid, addr, &it->second, 4);
+      original_instructions.erase(it);
+      return true;
+    };
+    if (!restore_at(pc)) {
+      if (pc >= 4)
+        restore_at(pc - 4);
+      if (is32 && pc >= 8)
+        restore_at(pc - 8);
+    }
+    if (!original_instructions.empty() && !ProcessTracer::continue_process(pid))
+      break;
+  }
+
+  // Ensure process is in a stoppable state before restoring all patched bytes.
+  kill(pid, SIGSTOP);
+  int status = 0;
+  for (int i = 0; i < 100; i++) {
+    pid_t w = waitpid(pid, &status, WNOHANG);
+    if (w == pid) {
+      if (WIFSTOPPED(status))
+        break;
+      if (WIFEXITED(status) || WIFSIGNALED(status))
+        break;
+    }
+    usleep(10000);
   }
 
   for (const auto &pair : original_instructions) {
@@ -3096,28 +3147,64 @@ std::vector<uint8_t> RuntimeAnalyzer::dump_after_function(int pid,
   if (!ProcessTracer::attach(pid))
     return {};
 
+  const bool is32 = ProcessTracer::get_arch() == ArchMode::ARM32;
   uint64_t ret_addr = func_addr;
   for (int i = 0; i < 1000; i++) {
     uint32_t inst;
     if (!ProcessTracer::read_memory(pid, func_addr + i * 4, &inst, 4))
       break;
-    if ((inst & 0xFFFFFC1F) == 0xD65F0000) {
-      ret_addr = func_addr + i * 4;
-      break;
+    if (!is32) {
+      if ((inst & 0xFFFFFC1F) == 0xD65F0000) {
+        ret_addr = func_addr + i * 4;
+        break;
+      }
+    } else {
+      bool is_ret =
+          ((inst & 0x0FFF0FFF) == 0x01A0F00E) ||
+          ((inst & 0x0FFF8000) == 0x08BD8000) ||
+          (((inst & 0x0FFFFFF0) == 0x012FFF10) && ((inst & 0xF) == 14));
+      if (is_ret) {
+        ret_addr = func_addr + i * 4;
+        break;
+      }
     }
   }
 
   uint32_t orig;
-  ProcessTracer::read_memory(pid, ret_addr, &orig, 4);
-  uint32_t brk = 0xD4200000;
-  ProcessTracer::write_memory(pid, ret_addr, &brk, 4);
+  if (!ProcessTracer::read_memory(pid, ret_addr, &orig, 4)) {
+    ProcessTracer::detach(pid);
+    return {};
+  }
+  uint32_t brk = is32 ? 0xE1200070 : 0xD4200000;
+  if (!ProcessTracer::write_memory(pid, ret_addr, &brk, 4)) {
+    ProcessTracer::detach(pid);
+    return {};
+  }
 
-  ProcessTracer::continue_process(pid);
+  if (!ProcessTracer::continue_process(pid)) {
+    ProcessTracer::write_memory(pid, ret_addr, &orig, 4);
+    ProcessTracer::detach(pid);
+    return {};
+  }
 
-  int status;
-  ProcessTracer::wait_for_stop(pid, &status);
+  int status = 0;
+  bool stopped = false;
+  for (int i = 0; i < 500; i++) {
+    pid_t w = waitpid(pid, &status, WNOHANG);
+    if (w == pid) {
+      stopped = true;
+      break;
+    }
+    if (w < 0)
+      break;
+    usleep(10000);
+  }
 
   ProcessTracer::write_memory(pid, ret_addr, &orig, 4);
+  if (!stopped) {
+    ProcessTracer::detach(pid);
+    return {};
+  }
 
   std::vector<uint8_t> result(size);
   ProcessTracer::read_memory(pid, target_addr, result.data(), size);
@@ -3129,6 +3216,8 @@ std::vector<uint8_t> RuntimeAnalyzer::dump_after_function(int pid,
 std::vector<uint64_t>
 RuntimeAnalyzer::find_instances_by_vtable(int pid, uint64_t vtable_addr) {
   std::vector<uint64_t> instances;
+  bool is32 = ProcessTracer::get_arch() == ArchMode::ARM32;
+  size_t ptr_size = is32 ? 4 : 8;
 
   auto maps = Memory::get_maps(pid);
 
@@ -3142,8 +3231,9 @@ RuntimeAnalyzer::find_instances_by_vtable(int pid, uint64_t vtable_addr) {
 
     std::vector<uint8_t> region = Memory::dump(pid, m.base, m.size);
 
-    for (size_t i = 0; i + 8 <= region.size(); i += 8) {
-      uint64_t ptr = *(uint64_t *)(region.data() + i);
+    for (size_t i = 0; i + ptr_size <= region.size(); i += ptr_size) {
+      uint64_t ptr = is32 ? *(uint32_t *)(region.data() + i)
+                          : *(uint64_t *)(region.data() + i);
       if (ptr == vtable_addr) {
         instances.push_back(m.base + i);
       }

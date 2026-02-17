@@ -140,7 +140,7 @@ uint64_t resolve_plt_arm64(int pid, uint64_t plt_addr);
 uint64_t resolve_plt_arm32(int pid, uint64_t plt_addr);
 uint64_t resolve_plt(int pid, uint64_t plt_addr, ArchMode arch);
 
-}
+} // namespace InstructionDecoder
 
 class ProcessTracer {
 public:
@@ -183,7 +183,6 @@ public:
                                      int pid, uint64_t base_addr);
   static std::vector<uint8_t> embed_function(int pid, uint64_t addr,
                                              size_t max_size = 0);
-  static void recursive_embed(EmbedContext &ctx, uint64_t addr);
   static bool resolve_symbol(int pid, const std::string &name, uint64_t *addr);
   static std::vector<RelinkEntry>
   find_external_calls(const std::vector<uint8_t> &data, uint64_t base);
@@ -192,9 +191,6 @@ public:
 class ZygoteTracer {
 public:
   static int find_zygote_pid();
-  static bool attach_zygote(int zygote_pid);
-  static int wait_for_fork(int zygote_pid, const std::string &target_pkg);
-  static bool intercept_dlopen(int pid);
 
   static void register_attached_pid(int pid);
   static void unregister_attached_pid(int pid);
@@ -294,19 +290,12 @@ struct SeccompInfo {
 class SeccompBypass {
 public:
   static SeccompInfo get_seccomp_status(int pid);
-
   static bool disable_seccomp(int pid);
-  static bool patch_seccomp_filter(int pid);
-  static bool use_memfd_workaround(int pid);
-
-  static int spawn_without_seccomp(const std::string &cmd);
-  static bool inject_seccomp_disabler(int pid);
 };
 
 struct RelinkConfig {
   int max_depth;
   size_t max_total_size;
-  bool embed_data_refs;
   bool fix_relocations;
   bool inline_plt_calls;
   std::set<std::string> exclude_libs;
@@ -323,7 +312,8 @@ public:
                                                          int max_depth = 8);
 
   static bool patch_relocations(std::vector<uint8_t> &data,
-                                const std::map<uint64_t, uint64_t> &addr_map);
+                                const std::map<uint64_t, uint64_t> &addr_map,
+                                uint64_t base_addr);
 };
 
 struct CryptoKeyInfo {
@@ -335,33 +325,12 @@ struct CryptoKeyInfo {
   time_t capture_time;
 };
 
-struct CryptoCallInfo {
-  uint64_t func_addr;
-  std::string func_name;
-  std::vector<uint8_t> input_data;
-  std::vector<uint8_t> output_data;
-  std::vector<uint8_t> key_data;
-  std::vector<uint8_t> iv_data;
-};
-
 class CryptoAnalyzer {
 public:
   static std::vector<CryptoKeyInfo>
   scan_for_keys(const std::vector<uint8_t> &data, uint64_t base_addr);
 
-  static std::vector<CryptoKeyInfo>
-  extract_runtime_keys(int pid, uint64_t base,
-                       const std::vector<uint8_t> &data);
-  static std::vector<CryptoKeyInfo> trace_key_derivation(int pid,
-                                                         uint64_t crypto_func);
-
-  static std::vector<CryptoCallInfo> monitor_crypto_calls(int pid,
-                                                          int duration_sec);
-
-  static std::vector<uint8_t> dump_ssl_session_keys(int pid);
-  static std::vector<CryptoKeyInfo> extract_openssl_keys(int pid);
-  static std::vector<CryptoKeyInfo> extract_boringssl_keys(int pid);
-
   static bool hook_aes_encrypt(int pid, uint64_t *original);
   static bool hook_aes_decrypt(int pid, uint64_t *original);
+  static size_t restore_aes_hooks(int pid);
 };

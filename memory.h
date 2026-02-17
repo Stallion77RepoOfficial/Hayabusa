@@ -90,9 +90,6 @@ public:
 
 class Utils {
 public:
-  static int get_pid(const std::string &pkg);
-  static std::vector<std::string> get_apk_paths(const std::string &pkg);
-  static void launch_app(const std::string &pkg);
   static std::string format_size(size_t bytes);
 };
 
@@ -108,13 +105,10 @@ public:
                               std::vector<ElfSymbol> *vtables = nullptr);
   static std::vector<ElfString> get_strings(const std::vector<uint8_t> &data,
                                             size_t min_len);
-  static size_t count_strings(const std::vector<uint8_t> &data,
-                              size_t min_len);
+  static size_t count_strings(const std::vector<uint8_t> &data, size_t min_len);
   static size_t write_strings(std::ostream &out,
-                              const std::vector<uint8_t> &data,
-                              size_t min_len);
-  static size_t write_rtti(std::ostream &out,
-                           const std::vector<uint8_t> &data,
+                              const std::vector<uint8_t> &data, size_t min_len);
+  static size_t write_rtti(std::ostream &out, const std::vector<uint8_t> &data,
                            uint64_t base_addr,
                            const std::vector<ElfSymbol> &vtables);
 

@@ -1,9 +1,10 @@
 #include "memory.h"
 #include "tracer.h"
 #include <algorithm>
-#include <ctime>
+#include <cstdlib>
 #include <csignal>
 #include <cstring>
+#include <ctime>
 #include <dirent.h>
 #include <elf.h>
 #include <fcntl.h>
@@ -13,8 +14,8 @@
 #include <iterator>
 #include <limits>
 #include <map>
-#include <sstream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,9 +23,28 @@
 int g_pid = -1;
 const char *g_current_module = nullptr;
 const char *g_current_step = nullptr;
+struct ModuleState {
+  uint64_t hash = 0;
+  uint64_t snapshot_id = 0;
+  std::vector<uint8_t> prev_data;
+  bool has_prev = false;
+  bool init_traced = false;
+};
 
 static constexpr const char *USAGE =
-    "Usage: hayabusa dump <package> --mode <arm32|arm64> [--timeout <sec>]\n";
+    "Usage:\n"
+    "  hayabusa dump    <package> --mode <arm32|arm64> [--timeout <sec>] [--p "
+    "<files>] [--relink] [--relink-depth <n>] [--relink-max-size <bytes>] "
+    "[--relink-exclude <libs>] [--relink-include <libs>] [--relink-no-fix] "
+    "[--relink-no-inline-plt]\n"
+    "  hayabusa hook    <package> <function> --mode <arm32|arm64> [--i "
+    "<count>]\n"
+    "  hayabusa inject  <package> <so_path>  --mode <arm32|arm64>\n"
+    "  hayabusa scan    <package> <pattern>  --mode <arm32|arm64>\n"
+    "  hayabusa extract <package> <function> --mode <arm32|arm64> [--d "
+    "<depth>]\n";
+
+static volatile bool g_hook_running = false;
 
 void cleanup() { ZygoteTracer::cleanup_all_attached(); }
 
@@ -58,6 +78,26 @@ void mkdir_p(const std::string &path) {
     }
   }
   mkdir(path.c_str(), 0755);
+}
+
+std::vector<std::string> split_string(const std::string &s, char delimiter) {
+  std::vector<std::string> tokens;
+  std::string token;
+  std::istringstream tokenStream(s);
+  while (std::getline(tokenStream, token, delimiter)) {
+    if (!token.empty())
+      tokens.push_back(token);
+  }
+  return tokens;
+}
+
+RelinkConfig make_default_relink_config() {
+  RelinkConfig cfg{};
+  cfg.max_depth = 8;
+  cfg.max_total_size = 64 * 1024 * 1024;
+  cfg.fix_relocations = true;
+  cfg.inline_plt_calls = true;
+  return cfg;
 }
 
 bool is_shared_object_name(const std::string &name) {
@@ -148,17 +188,16 @@ bool read_elf_image(int mem_fd, uint64_t base, std::vector<uint8_t> &out,
   unsigned char ident[EI_NIDENT] = {0};
   if (!read_exact(mem_fd, ident, EI_NIDENT, base))
     return false;
-  if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' ||
-      ident[3] != 'F')
+  if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' || ident[3] != 'F')
     return false;
 
   image_size = 0;
   if (ident[EI_CLASS] == ELFCLASS32)
     return read_elf_image_impl<Elf32_Ehdr, Elf32_Phdr>(mem_fd, base, out,
-                                                        image_size);
+                                                       image_size);
   if (ident[EI_CLASS] == ELFCLASS64)
     return read_elf_image_impl<Elf64_Ehdr, Elf64_Phdr>(mem_fd, base, out,
-                                                        image_size);
+                                                       image_size);
   return false;
 }
 
@@ -243,7 +282,8 @@ std::string hex_bytes(const uint8_t *data, size_t len) {
 
 void analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
                     uint64_t base, const std::string &name,
-                    const std::vector<uint8_t> *prev_data) {
+                    const std::vector<uint8_t> *prev_data, int pid,
+                    ModuleState *module_state) {
   static std::string current_name;
   current_name = name;
   g_current_module = current_name.c_str();
@@ -287,12 +327,22 @@ void analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
         f << " (" << s.size << ")";
       f << "\n";
     }
-  } else {
-    auto funcs = ElfParser::find_functions_stripped(data, base);
-    f << "\n=== FUNCTIONS (" << funcs.size() << ") ===\n";
-    for (const auto &fn : funcs) {
-      f << "0x" << std::hex << fn.start_addr << "-0x" << fn.end_addr
-        << std::dec << " (" << fn.size << ")\n";
+  }
+
+  g_current_step = "objc";
+  {
+    std::vector<std::pair<std::string, std::string>> objc_methods;
+    for (const auto &s : func_syms) {
+      if (ElfParser::is_objc_method(s.name)) {
+        auto parsed = ElfParser::parse_objc_method(s.name);
+        if (!parsed.first.empty())
+          objc_methods.push_back(parsed);
+      }
+    }
+    if (!objc_methods.empty()) {
+      f << "\n=== OBJC_METHODS (" << objc_methods.size() << ") ===\n";
+      for (const auto &m : objc_methods)
+        f << m.first << " -> " << m.second << "\n";
     }
   }
 
@@ -376,23 +426,8 @@ void analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
             [](const ElfSymbol &a, const ElfSymbol &b) {
               return a.offset < b.offset;
             });
-  if (!vtables.empty()) {
+  if (!vtables.empty())
     ElfParser::write_rtti(f, data, base, vtables);
-  } else {
-    auto stripped = ElfParser::scan_vtables_stripped(data, base);
-    f << "\n=== VTABLE/RTTI (" << stripped.size() << ") ===\n";
-    for (const auto &info : stripped) {
-      f << "VTABLE 0x" << std::hex << info.vtable_addr << std::dec << " "
-        << info.demangled_name << "\n";
-      if (!info.virtual_functions.empty()) {
-        f << "  virtuals (" << info.virtual_functions.size() << "):";
-        for (auto fn : info.virtual_functions) {
-          f << " 0x" << std::hex << fn;
-        }
-        f << std::dec << "\n";
-      }
-    }
-  }
 
   g_current_step = "strings";
   try {
@@ -431,15 +466,55 @@ void analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
   g_current_step = "init_fini";
   auto init_funcs = ElfParser::get_init_array(data);
   auto fini_funcs = ElfParser::get_fini_array(data);
+  auto to_runtime_addr = [&](uint64_t v) -> uint64_t {
+    if (base == 0)
+      return v;
+    // Values coming from dumped runtime may already be absolute addresses.
+    if (v >= base && v < base + data.size() + 0x1000)
+      return v;
+    // Static ELF values are typically relative to module base.
+    if (v < data.size())
+      return base + v;
+    return v;
+  };
+  std::vector<uint64_t> init_runtime;
+  init_runtime.reserve(init_funcs.size());
+  for (auto fn : init_funcs)
+    init_runtime.push_back(to_runtime_addr(fn));
+  std::vector<uint64_t> fini_runtime;
+  fini_runtime.reserve(fini_funcs.size());
+  for (auto fn : fini_funcs)
+    fini_runtime.push_back(to_runtime_addr(fn));
   f << "\n=== INIT_ARRAY (" << init_funcs.size() << ") ===\n";
-  for (auto fn : init_funcs) {
-    uint64_t addr = base ? base + fn : fn;
-    f << "0x" << std::hex << addr << std::dec << "\n";
+  for (auto fn : init_runtime) {
+    f << "0x" << std::hex << fn << std::dec << "\n";
   }
   f << "\n=== FINI_ARRAY (" << fini_funcs.size() << ") ===\n";
-  for (auto fn : fini_funcs) {
-    uint64_t addr = base ? base + fn : fn;
-    f << "0x" << std::hex << addr << std::dec << "\n";
+  for (auto fn : fini_runtime) {
+    f << "0x" << std::hex << fn << std::dec << "\n";
+  }
+
+  g_current_step = "trace_init";
+  bool already_traced = module_state && module_state->init_traced;
+  if (pid > 0 && !init_runtime.empty() && !already_traced) {
+    try {
+      bool traced = RuntimeAnalyzer::trace_init_array(pid, base, init_runtime);
+      f << "\n=== INIT_ARRAY_TRACE ===\n";
+      if (traced) {
+        f << "Traced " << init_runtime.size()
+          << " init functions (memory effects logged)\n";
+      } else {
+        f << "Trace attempt completed with no captured breakpoints\n";
+      }
+    } catch (...) {
+      f << "\n=== INIT_ARRAY_TRACE ===\n";
+      f << "Trace failed with runtime exception\n";
+    }
+    if (module_state)
+      module_state->init_traced = true;
+  } else if (pid > 0 && !init_runtime.empty() && already_traced) {
+    f << "\n=== INIT_ARRAY_TRACE ===\n";
+    f << "Skipped (already traced earlier for this module)\n";
   }
 
   g_current_step = "entropy";
@@ -462,8 +537,8 @@ void analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
     for (const auto &k : aes_keys) {
       uint64_t addr = base ? base + k.offset : k.offset;
       f << "0x" << std::hex << addr << std::dec << " size=" << k.key_size
-        << " conf=" << std::fixed << std::setprecision(2) << k.confidence
-        << " " << k.detection_method << "\n";
+        << " conf=" << std::fixed << std::setprecision(2) << k.confidence << " "
+        << k.detection_method << "\n";
       f << "  " << hex_bytes(k.key, k.key_size) << "\n";
     }
   }
@@ -567,7 +642,524 @@ void analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
         f << "  " << text << "\n";
     }
   }
+
+  g_current_step = "plt";
+  try {
+    auto plt = ElfParser::get_plt_entries(data);
+    if (!plt.empty()) {
+      f << "\n=== PLT (" << plt.size() << ") ===\n";
+      for (const auto &e : plt) {
+        uint64_t addr = base ? base + e.offset : e.offset;
+        f << "0x" << std::hex << addr << std::dec;
+        if (!e.symbol_name.empty())
+          f << " " << ElfParser::demangle_symbol(e.symbol_name);
+        f << "\n";
+      }
+    }
+  } catch (...) {
+  }
+
+  g_current_step = "got_dump";
+  if (pid > 0) {
+    try {
+      auto got_entries = MemoryInjector::dump_got(pid, base, data);
+      if (!got_entries.empty()) {
+        f << "\n=== GOT (" << got_entries.size() << ") ===\n";
+        for (const auto &e : got_entries) {
+          f << "0x" << std::hex << e.second << std::dec;
+          if (!e.first.empty())
+            f << " " << ElfParser::demangle_symbol(e.first);
+          f << "\n";
+        }
+      }
+    } catch (...) {
+    }
+  }
+
+  g_current_step = "signatures";
+  try {
+    auto &sig_src = func_syms.empty() ? symbols : func_syms;
+    size_t sig_count = std::min(sig_src.size(), (size_t)200);
+    if (sig_count > 0) {
+      f << "\n=== SIGNATURES (" << sig_count << ") ===\n";
+      for (size_t i = 0; i < sig_count; i++) {
+        const auto &s = sig_src[i];
+        if (s.offset > 0 && s.offset + 32 < data.size()) {
+          std::string sig = ElfParser::generate_signature(data, s.offset, 32);
+          if (!sig.empty()) {
+            uint64_t addr = base ? base + s.offset : s.offset;
+            f << "0x" << std::hex << addr << std::dec << " "
+              << ElfParser::demangle_symbol(s.name) << "\n  " << sig << "\n";
+          }
+        }
+      }
+    }
+  } catch (...) {
+  }
+
+  g_current_step = "enc_key";
+  try {
+    auto enc_key = ElfParser::find_encryption_key(data);
+    if (!enc_key.empty()) {
+      f << "\n=== ENCRYPTION_KEY (" << enc_key.size() << " bytes) ===\n";
+      f << hex_bytes(enc_key.data(), enc_key.size()) << "\n";
+    }
+  } catch (...) {
+  }
+
+  g_current_step = "crypto_scan";
+  try {
+    auto crypto_keys = CryptoAnalyzer::scan_for_keys(data, base);
+    if (!crypto_keys.empty()) {
+      f << "\n=== CRYPTO_KEYS (" << crypto_keys.size() << ") ===\n";
+      for (const auto &k : crypto_keys) {
+        f << "0x" << std::hex << k.key_addr << std::dec << " " << k.algorithm
+          << " conf=" << std::fixed << std::setprecision(2) << k.confidence
+          << " " << k.source << "\n";
+        if (!k.key_data.empty())
+          f << "  " << hex_bytes(k.key_data.data(), k.key_data.size()) << "\n";
+      }
+    }
+  } catch (...) {
+  }
+
+  g_current_step = "runtime_diff";
+  if (pid > 0) {
+    try {
+      std::vector<uint8_t> disk_copy;
+      if (read_file_prefix(name, data.size(), disk_copy) &&
+          !disk_copy.empty()) {
+        auto regions =
+            RuntimeAnalyzer::find_decrypted_regions(pid, base, disk_copy);
+        if (!regions.empty()) {
+          f << "\n=== RUNTIME_DECRYPTED (" << regions.size() << ") ===\n";
+          for (const auto &r : regions) {
+            f << "0x" << std::hex << r.first << std::dec << " (" << r.second
+              << " bytes)\n";
+          }
+        }
+      }
+    } catch (...) {
+    }
+  }
+
+  g_current_step = "vtable_instances";
+  if (pid > 0 && !vtables.empty()) {
+    try {
+      size_t vt_scan = std::min(vtables.size(), (size_t)10);
+      std::vector<std::pair<uint64_t, std::vector<uint64_t>>> instances;
+      for (size_t i = 0; i < vt_scan; i++) {
+        uint64_t vt_addr = base ? base + vtables[i].offset : vtables[i].offset;
+        auto found = RuntimeAnalyzer::find_instances_by_vtable(pid, vt_addr);
+        if (!found.empty())
+          instances.push_back({vt_addr, found});
+      }
+      if (!instances.empty()) {
+        f << "\n=== VTABLE_INSTANCES ===\n";
+        for (const auto &kv : instances) {
+          f << "VT 0x" << std::hex << kv.first << std::dec
+            << " instances=" << kv.second.size() << "\n";
+          for (auto a : kv.second)
+            f << "  0x" << std::hex << a << std::dec << "\n";
+        }
+      }
+    } catch (...) {
+    }
+  }
+
   f.close();
+}
+
+void hook_signal_handler(int) { g_hook_running = false; }
+
+void cmd_hook(const std::string &pkg, const std::string &func_name,
+              ArchMode arch, int inst_count) {
+  ProcessTracer::set_arch(arch);
+
+  std::string out_dir = "/data/local/tmp/" + pkg + "_analysis";
+  mkdir_p(out_dir);
+  std::string log_path = out_dir + "/hook_" + func_name + ".txt";
+  std::ofstream log(log_path);
+
+  auto emit = [&](const std::string &msg) {
+    std::cout << msg;
+    if (log)
+      log << msg;
+  };
+
+  emit("\n=== HAYABUSA FUNCTION HOOK ===\n");
+  emit("Target: " + pkg + "\n");
+  emit("Function: " + func_name + "\n");
+  emit("Instructions: " + std::to_string(inst_count) + "\n\n");
+
+  emit("[1] Waiting for process...\n");
+  std::cout.flush();
+  int pid = -1;
+  for (;;) {
+    auto pids = find_pids_by_prefix_all(pkg);
+    if (!pids.empty()) {
+      pid = pids[0];
+      break;
+    }
+    usleep(100000);
+  }
+  emit("[2] Found PID: " + std::to_string(pid) + "\n");
+
+  emit("[3] Attaching...\n");
+  if (!ProcessTracer::attach(pid)) {
+    emit("[!] Failed to attach to " + std::to_string(pid) + "\n");
+    return;
+  }
+
+  emit("[4] Bypassing seccomp...\n");
+  SeccompBypass::disable_seccomp(pid);
+
+  emit("[5] Searching for function '" + func_name + "'...\n");
+  auto ranges = ProcessTracer::get_library_ranges(pid);
+  uint64_t func_addr = 0;
+  std::string found_lib;
+
+  for (const auto &r : ranges) {
+    if (r.name.empty() || r.name.find(".so") == std::string::npos)
+      continue;
+    std::string lib = r.name;
+    size_t slash = lib.rfind('/');
+    if (slash != std::string::npos)
+      lib = lib.substr(slash + 1);
+    size_t dot = lib.find(".so");
+    if (dot == std::string::npos)
+      continue;
+
+    uint64_t a = FunctionHooker::find_remote_symbol(pid, lib, func_name);
+    if (a != 0) {
+      func_addr = a;
+      found_lib = r.name;
+      break;
+    }
+  }
+
+  if (func_addr == 0) {
+    emit("[!] Function '" + func_name + "' not found\n");
+    ProcessTracer::detach(pid);
+    return;
+  }
+
+  {
+    std::ostringstream ss;
+    ss << "    Found at 0x" << std::hex << func_addr << std::dec << " in "
+       << found_lib << "\n";
+    emit(ss.str());
+  }
+
+  // Disassemble instructions
+  {
+    size_t count = static_cast<size_t>(inst_count);
+    const size_t inst_size = 4;
+    std::vector<uint8_t> code_buf(count * inst_size);
+    if (ProcessTracer::read_memory(pid, func_addr, code_buf.data(),
+                                   code_buf.size())) {
+      std::ostringstream ss;
+      ss << "    === DISASSEMBLY (first " << count << " instructions) ===\n";
+      for (size_t i = 0; i < count; i++) {
+        uint32_t raw;
+        memcpy(&raw, code_buf.data() + i * inst_size, 4);
+        uint64_t addr = func_addr + i * inst_size;
+        auto decoded = InstructionDecoder::decode(raw, addr, arch);
+        ss << "    0x" << std::hex << addr << ": ";
+        ss << hex_bytes(code_buf.data() + i * inst_size, 4) << " ";
+        if (decoded.is_return)
+          ss << "RET";
+        else if (decoded.is_call)
+          ss << "BL 0x" << decoded.target_address;
+        else if (decoded.type == InstructionType::Branch)
+          ss << "B 0x" << decoded.target_address;
+        else if (decoded.type == InstructionType::Adrp)
+          ss << "ADRP x" << std::dec << (int)decoded.rd << ", #0x" << std::hex
+             << decoded.immediate;
+        else if (decoded.type == InstructionType::Load)
+          ss << "LDR";
+        else if (decoded.type == InstructionType::Store)
+          ss << "STR";
+        else if (decoded.type == InstructionType::Add)
+          ss << "ADD";
+        else
+          ss << "???";
+        ss << std::dec << "\n";
+      }
+      emit(ss.str());
+    }
+  }
+
+  uint32_t original_bytes = 0;
+  ProcessTracer::read_memory(pid, func_addr, &original_bytes, 4);
+  {
+    std::ostringstream ss;
+    ss << "    Original bytes: " << hex_bytes((uint8_t *)&original_bytes, 4)
+       << "\n";
+    emit(ss.str());
+  }
+
+  uint32_t ret_inst = (arch == ArchMode::ARM64) ? 0xD65F03C0 : 0xE12FFF1E;
+  if (!ProcessTracer::write_memory(pid, func_addr, &ret_inst, 4)) {
+    emit("[!] Failed to write hook\n");
+    ProcessTracer::detach(pid);
+    return;
+  }
+
+  emit("[6] Function hooked (NOP'd with RET)\n");
+
+  // Auto-hook all crypto functions
+  emit("[7] Scanning for crypto functions...\n");
+  {
+    uint64_t orig_enc = 0, orig_dec = 0;
+    bool enc_ok = CryptoAnalyzer::hook_aes_encrypt(pid, &orig_enc);
+    bool dec_ok = CryptoAnalyzer::hook_aes_decrypt(pid, &orig_dec);
+    if (enc_ok) {
+      std::ostringstream ss;
+      ss << "    [+] AES encrypt hooked (orig=0x" << std::hex << orig_enc
+         << std::dec << ")\n";
+      emit(ss.str());
+    }
+    if (dec_ok) {
+      std::ostringstream ss;
+      ss << "    [+] AES decrypt hooked (orig=0x" << std::hex << orig_dec
+         << std::dec << ")\n";
+      emit(ss.str());
+    }
+    if (!enc_ok && !dec_ok)
+      emit("    [!] No crypto functions found to hook\n");
+  }
+
+  emit("    Press Ctrl+C to unhook and exit\n");
+  std::cout.flush();
+
+  g_hook_running = true;
+  struct sigaction sa = {};
+  sa.sa_handler = hook_signal_handler;
+  sigaction(SIGINT, &sa, nullptr);
+
+  ProcessTracer::detach(pid);
+
+  while (g_hook_running)
+    usleep(500000);
+
+  emit("\n[8] Restoring original function...\n");
+  if (ProcessTracer::attach(pid)) {
+    ProcessTracer::write_memory(pid, func_addr, &original_bytes, 4);
+    size_t restored_crypto = CryptoAnalyzer::restore_aes_hooks(pid);
+    ProcessTracer::detach(pid);
+    emit("    Restored\n");
+    if (restored_crypto > 0) {
+      emit("    Restored " + std::to_string(restored_crypto) +
+           " AES hook(s)\n");
+    }
+  } else {
+    emit("    [!] Could not re-attach to restore (process may have exited)\n");
+  }
+
+  emit("=== DONE ===\n");
+  if (log) {
+    log.close();
+    std::cout << "Log saved: " << log_path << "\n";
+  }
+}
+
+void cmd_inject(const std::string &pkg, const std::string &so_path,
+                ArchMode arch) {
+  ProcessTracer::set_arch(arch);
+  std::cout << "\n=== HAYABUSA LIBRARY INJECTION ===\n";
+  std::cout << "Target: " << pkg << "\n";
+  std::cout << "Library: " << so_path << "\n\n";
+
+  std::cout << "[1] Waiting for process...\n";
+  std::cout.flush();
+  int pid = -1;
+  for (;;) {
+    auto pids = find_pids_by_prefix_all(pkg);
+    if (!pids.empty()) {
+      pid = pids[0];
+      break;
+    }
+    usleep(100000);
+  }
+  std::cout << "[2] Found PID: " << pid << "\n";
+
+  std::cout << "[3] Attaching...\n";
+  if (!ProcessTracer::attach(pid)) {
+    std::cout << "[!] Failed to attach to " << pid << "\n";
+    return;
+  }
+
+  std::cout << "[4] Bypassing seccomp...\n";
+  SeccompBypass::disable_seccomp(pid);
+
+  std::cout << "[5] Injecting library...\n";
+  bool ok = FunctionHooker::inject_library(pid, so_path);
+
+  if (ok) {
+    std::cout << "    [+] Library injected successfully\n";
+  } else {
+    std::cout << "    [!] Injection failed\n";
+    std::string err = MemoryInjector::remote_dlerror(pid);
+    if (!err.empty())
+      std::cout << "    dlerror: " << err << "\n";
+  }
+
+  ProcessTracer::detach(pid);
+  std::cout << "=== DONE ===\n";
+}
+
+void cmd_scan(const std::string &pkg, const std::string &pattern,
+              ArchMode arch) {
+  ProcessTracer::set_arch(arch);
+  std::cout << "\n=== HAYABUSA PATTERN SCAN ===\n";
+  std::cout << "Target: " << pkg << "\n";
+  std::cout << "Pattern: " << pattern << "\n\n";
+
+  std::cout << "[1] Waiting for process...\n";
+  std::cout.flush();
+  int pid = -1;
+  for (;;) {
+    auto pids = find_pids_by_prefix_all(pkg);
+    if (!pids.empty()) {
+      pid = pids[0];
+      break;
+    }
+    usleep(100000);
+  }
+  std::cout << "[2] Found PID: " << pid << "\n";
+
+  auto ranges = ProcessTracer::get_library_ranges(pid);
+  int total_matches = 0;
+
+  for (const auto &r : ranges) {
+    if (r.name.empty() || r.name.find(".so") == std::string::npos)
+      continue;
+
+    size_t lib_size = r.end - r.start;
+    if (lib_size > 64 * 1024 * 1024)
+      continue;
+
+    std::vector<uint8_t> mem(lib_size);
+    int mem_fd =
+        open(("/proc/" + std::to_string(pid) + "/mem").c_str(), O_RDONLY);
+    if (mem_fd < 0)
+      continue;
+    bool ok = read_exact(mem_fd, mem.data(), lib_size, r.start);
+    close(mem_fd);
+    if (!ok || !ElfParser::is_elf(mem))
+      continue;
+
+    auto matches = ElfParser::pattern_scan(mem, pattern);
+    if (!matches.empty()) {
+      std::string lib = r.name;
+      size_t slash = lib.rfind('/');
+      if (slash != std::string::npos)
+        lib = lib.substr(slash + 1);
+      std::cout << "\n  [" << lib << "] " << matches.size() << " match(es):\n";
+      for (const auto &m : matches) {
+        uint64_t addr = r.start + m.offset;
+        std::cout << "    0x" << std::hex << addr << std::dec << " offset=0x"
+                  << std::hex << m.offset << std::dec << "\n";
+        total_matches++;
+      }
+    }
+  }
+
+  if (total_matches == 0)
+    std::cout << "[!] No matches found\n";
+  else
+    std::cout << "\nTotal: " << total_matches << " match(es)\n";
+
+  std::cout << "=== DONE ===\n";
+}
+
+void cmd_extract(const std::string &pkg, const std::string &func_name,
+                 ArchMode arch, int max_depth) {
+  ProcessTracer::set_arch(arch);
+  std::cout << "\n=== HAYABUSA FUNCTION EXTRACT ===\n";
+  std::cout << "Target: " << pkg << "\n";
+  std::cout << "Function: " << func_name << "\n";
+  std::cout << "Max depth: " << max_depth << "\n\n";
+
+  std::cout << "[1] Waiting for process...\n";
+  std::cout.flush();
+  int pid = -1;
+  for (;;) {
+    auto pids = find_pids_by_prefix_all(pkg);
+    if (!pids.empty()) {
+      pid = pids[0];
+      break;
+    }
+    usleep(100000);
+  }
+  std::cout << "[2] Found PID: " << pid << "\n";
+
+  std::cout << "[3] Attaching...\n";
+  if (!ProcessTracer::attach(pid)) {
+    std::cout << "[!] Failed to attach to " << pid << "\n";
+    return;
+  }
+
+  std::cout << "[4] Bypassing seccomp...\n";
+  SeccompBypass::disable_seccomp(pid);
+
+  std::cout << "[5] Searching for function '" << func_name << "'...\n";
+  auto ranges = ProcessTracer::get_library_ranges(pid);
+  uint64_t func_addr = 0;
+  std::string found_lib;
+
+  for (const auto &r : ranges) {
+    if (r.name.empty() || r.name.find(".so") == std::string::npos)
+      continue;
+    std::string lib = r.name;
+    size_t slash = lib.rfind('/');
+    if (slash != std::string::npos)
+      lib = lib.substr(slash + 1);
+    size_t dot = lib.find(".so");
+    if (dot == std::string::npos)
+      continue;
+
+    uint64_t a = FunctionHooker::find_remote_symbol(pid, lib, func_name);
+    if (a != 0) {
+      func_addr = a;
+      found_lib = r.name;
+      break;
+    }
+  }
+
+  if (func_addr == 0) {
+    std::cout << "[!] Function '" << func_name << "' not found\n";
+    ProcessTracer::detach(pid);
+    return;
+  }
+
+  std::cout << "    Found at 0x" << std::hex << func_addr << std::dec << " in "
+            << found_lib << "\n";
+
+  std::cout << "[6] Extracting function with dependencies (depth=" << max_depth
+            << ")...\n";
+  auto result =
+      StaticRelinkerEx::extract_function_with_deps(pid, func_addr, max_depth);
+
+  if (result.empty()) {
+    std::cout << "[!] Extraction failed\n";
+    ProcessTracer::detach(pid);
+    return;
+  }
+
+  std::string out_dir = "/data/local/tmp/hayabusa_extract";
+  mkdir_p(out_dir);
+  std::string out_path = out_dir + "/" + func_name + ".bin";
+  std::ofstream out(out_path, std::ios::binary);
+  out.write(reinterpret_cast<const char *>(result.data()), result.size());
+  out.close();
+
+  std::cout << "    [+] Extracted " << result.size() << " bytes to " << out_path
+            << "\n";
+
+  ProcessTracer::detach(pid);
+  std::cout << "=== DONE ===\n";
 }
 
 struct Region {
@@ -581,13 +1173,6 @@ struct Candidate {
   std::string name;
   std::string display_name;
   std::string safe_name;
-};
-
-struct ModuleState {
-  uint64_t hash = 0;
-  uint64_t snapshot_id = 0;
-  std::vector<uint8_t> prev_data;
-  bool has_prev = false;
 };
 
 std::string make_display_name(const std::string &name) {
@@ -631,20 +1216,78 @@ std::vector<Region> get_regions(int pid) {
 }
 
 int dump_analysis(int pid, const std::string &out,
-                  std::map<uint64_t, ModuleState> &state_by_base) {
+                  std::map<uint64_t, ModuleState> &state_by_base,
+                  std::map<std::string, uint64_t> &raw_hash_by_key,
+                  const std::vector<std::string> &priority_files,
+                  uint64_t scan_round, const RelinkConfig *relink_cfg) {
   auto regions = get_regions(pid);
 
-  int mem_fd = open(("/proc/" + std::to_string(pid) + "/mem").c_str(),
-                    O_RDONLY);
+  int mem_fd =
+      open(("/proc/" + std::to_string(pid) + "/mem").c_str(), O_RDONLY);
   if (mem_fd < 0) {
     std::cout << "    [!] Failed to open /proc/" << pid << "/mem\n";
     return 0;
+  }
+
+  // Handle RAW dump for priority files that are NOT ELFs (like
+  // global-metadata.dat)
+  for (const auto &p_file : priority_files) {
+    for (const auto &r : regions) {
+      if (r.perms.find('r') == std::string::npos)
+        continue;
+      if (r.name.find(p_file) != std::string::npos) {
+        // Only treat as non-ELF if magic check fails
+        unsigned char magic[4] = {0};
+        pread(mem_fd, magic, sizeof(magic), r.start);
+        if (magic[0] != 0x7f || magic[1] != 'E' || magic[2] != 'L' ||
+            magic[3] != 'F') {
+          size_t size = r.end - r.start;
+          if (size > 0 && size < 512 * 1024 * 1024) { // 512MB limit for RAW
+            std::vector<uint8_t> data(size);
+            if (read_exact(mem_fd, data.data(), size, r.start)) {
+              std::ostringstream key_ss;
+              key_ss << p_file << "@0x" << std::hex << r.start << "-0x" << r.end
+                     << "@off0x" << r.offset;
+              std::string raw_key = key_ss.str();
+              uint64_t raw_hash = hash_data(data);
+              auto it = raw_hash_by_key.find(raw_key);
+              if (it != raw_hash_by_key.end() && it->second == raw_hash)
+                continue;
+              raw_hash_by_key[raw_key] = raw_hash;
+
+              std::string safe = make_safe_name(p_file);
+              // Append base/offset to avoid collisions if multiple regions
+              // match
+              std::ostringstream ss;
+              ss << out << "/" << safe << "_0x" << std::hex << r.start;
+              if (r.offset != 0)
+                ss << "_off0x" << r.offset;
+              ss << ".bin";
+              std::string dump_path = ss.str();
+
+              std::ofstream fout(dump_path, std::ios::binary);
+              fout.write(reinterpret_cast<const char *>(data.data()),
+                         data.size());
+              fout.close();
+              std::cout << "    [PRIORITY][Scan " << scan_round << "] " << p_file
+                        << " ("
+                        << Utils::format_size(size) << ") (RAW dump) -> "
+                        << dump_path << "\n";
+              std::cout.flush();
+            }
+          }
+        }
+        // Note: We don't break here because a priority file (like metadata)
+        // might be split across multiple mapped regions.
+      }
+    }
   }
 
   std::vector<Candidate> candidates;
   candidates.reserve(regions.size());
 
   std::set<uint64_t> seen_local;
+  std::set<std::string> seen_priority_display;
 
   for (const auto &r : regions) {
     if (r.offset != 0)
@@ -657,7 +1300,22 @@ int dump_analysis(int pid, const std::string &out,
     std::string name = r.name;
     if (name.find(" (deleted)") != std::string::npos)
       name = name.substr(0, name.find(" (deleted)"));
-    if (name.empty() || !is_shared_object_name(name))
+
+    bool is_priority_elf = false;
+    for (const auto &p : priority_files) {
+      if (name.find(p) != std::string::npos) {
+        is_priority_elf = true;
+        break;
+      }
+    }
+    std::string display_name = make_display_name(name);
+    if (is_priority_elf) {
+      if (seen_priority_display.count(display_name))
+        continue;
+      seen_priority_display.insert(display_name);
+    }
+
+    if (name.empty() || (!is_shared_object_name(name) && !is_priority_elf))
       continue;
 
     unsigned char magic[4] = {0};
@@ -670,7 +1328,7 @@ int dump_analysis(int pid, const std::string &out,
     Candidate c;
     c.base = r.start;
     c.name = name;
-    c.display_name = make_display_name(name);
+    c.display_name = display_name;
     c.safe_name = make_safe_name(name);
     candidates.push_back(c);
     seen_local.insert(r.start);
@@ -681,11 +1339,41 @@ int dump_analysis(int pid, const std::string &out,
     return 0;
   }
 
+  // If priority mode, sort candidates by their order in priority_files
+  if (!priority_files.empty()) {
+    std::stable_sort(
+        candidates.begin(), candidates.end(),
+        [&](const Candidate &a, const Candidate &b) {
+          int idx_a = -1, idx_b = -1;
+          for (size_t i = 0; i < priority_files.size(); ++i) {
+            if (a.name.find(priority_files[i]) != std::string::npos) {
+              idx_a = (int)i;
+              break;
+            }
+          }
+          for (size_t i = 0; i < priority_files.size(); ++i) {
+            if (b.name.find(priority_files[i]) != std::string::npos) {
+              idx_b = (int)i;
+              break;
+            }
+          }
+          if (idx_a != idx_b) {
+            if (idx_a == -1)
+              return false;
+            if (idx_b == -1)
+              return true;
+            return idx_a < idx_b;
+          }
+          return false;
+        });
+  }
+
   std::vector<uint8_t> data;
   int count = 0;
   size_t total = candidates.size();
   const size_t bar_width = 20;
   bool printed = false;
+  std::map<std::string, std::set<uint64_t>> seen_hashes_by_name;
 
   for (size_t i = 0; i < candidates.size(); i++) {
     const auto &c = candidates[i];
@@ -719,20 +1407,33 @@ int dump_analysis(int pid, const std::string &out,
     bar.append(bar_width - filled, '.');
     ModuleState &st = state_by_base[c.base];
     uint64_t h = hash_data(analysis_data);
+    auto &seen_hashes = seen_hashes_by_name[c.display_name];
+    if (seen_hashes.count(h))
+      continue;
+    seen_hashes.insert(h);
     bool changed = !st.has_prev || st.hash != h;
     if (!changed)
       continue;
 
     if (!printed) {
-      std::cout << "    Found " << candidates.size()
-                << " ELF .so binaries in mappings\n";
+      std::cout << "    [Scan " << scan_round << "] Found " << candidates.size()
+                << " ELF modules in mappings\n";
       std::cout.flush();
       printed = true;
     }
 
     count++;
-    std::cout << "    [" << (i + 1) << "/" << total << "] [" << bar << "] "
-              << percent << "% " << c.display_name << " ("
+    std::string pri_tag = "";
+    if (!priority_files.empty()) {
+      for (const auto &p : priority_files) {
+        if (c.name.find(p) != std::string::npos) {
+          pri_tag = "[PRIORITY] ";
+          break;
+        }
+      }
+    }
+    std::cout << "    " << pri_tag << "[" << (i + 1) << "/" << total << "] ["
+              << bar << "] " << percent << "% " << c.display_name << " ("
               << Utils::format_size(analysis_data.size()) << ")\n";
     std::cout.flush();
 
@@ -742,7 +1443,30 @@ int dump_analysis(int pid, const std::string &out,
          << std::dec << snap_id << ".txt";
 
     const std::vector<uint8_t> *prev = st.has_prev ? &st.prev_data : nullptr;
-    analyze_to_txt(analysis_data, path.str(), c.base, c.name, prev);
+    analyze_to_txt(analysis_data, path.str(), c.base, c.name, prev, pid, &st);
+
+    if (relink_cfg) {
+      try {
+        auto relinked = StaticRelinkerEx::relink_full(analysis_data, pid, c.base,
+                                                      *relink_cfg);
+        if (!relinked.empty()) {
+          std::ostringstream relink_path;
+          relink_path << out << "/" << c.safe_name << "_0x" << std::hex << c.base
+                      << "_s" << std::dec << snap_id << ".relink.bin";
+          std::ofstream rfile(relink_path.str(), std::ios::binary);
+          rfile.write(reinterpret_cast<const char *>(relinked.data()),
+                      relinked.size());
+          rfile.close();
+          std::cout << "    [RELINK] " << c.display_name << " -> "
+                    << relink_path.str() << " ("
+                    << Utils::format_size(relinked.size()) << ")\n";
+          std::cout.flush();
+        }
+      } catch (...) {
+        std::cout << "    [RELINK] Failed for " << c.display_name << "\n";
+        std::cout.flush();
+      }
+    }
 
     st.prev_data = analysis_data;
     st.hash = h;
@@ -753,23 +1477,48 @@ int dump_analysis(int pid, const std::string &out,
   close(mem_fd);
 
   if (count > 0)
-    std::cout << "    Analyzed " << count << " modules\n";
+    std::cout << "    Dumped " << count << " modules\n";
   return count;
 }
 
-void cmd_dump(const std::string &pkg, ArchMode arch, int timeout_sec) {
+void cmd_dump(const std::string &pkg, ArchMode arch, int timeout_sec,
+              const std::vector<std::string> &priority_files,
+              const RelinkConfig *relink_cfg) {
   ProcessTracer::set_arch(arch);
 
-  std::cout << "\n=== HAYABUSA ELF ANALYZER ===\n";
-  std::cout << "Target: " << pkg << "\n\n";
+  std::cout << "\n=== HAYABUSA DUMPER ===\n";
+  std::cout << "Target: " << pkg << "\n";
+  if (!priority_files.empty()) {
+    std::cout << "Priority list: ";
+    for (size_t i = 0; i < priority_files.size(); i++) {
+      std::cout << priority_files[i]
+                << (i == priority_files.size() - 1 ? "" : ", ");
+    }
+    std::cout << "\n";
+  }
+  if (relink_cfg) {
+    std::cout << "Relink: enabled"
+              << " depth=" << relink_cfg->max_depth
+              << " max_size=" << relink_cfg->max_total_size
+              << " fix_reloc=" << (relink_cfg->fix_relocations ? "yes" : "no")
+              << " inline_plt=" << (relink_cfg->inline_plt_calls ? "yes" : "no")
+              << "\n";
+  }
+  std::cout << "\n";
 
   std::cout << "[1] Waiting for process (launch app)...\n";
+  if (timeout_sec == 0) {
+    std::cout << "    [i] No timeout set; monitoring continues until process "
+                 "exits.\n";
+  }
   std::cout.flush();
 
   std::string out = "/data/local/tmp/" + pkg + "_analysis";
   mkdir_p(out);
 
   std::map<int, std::map<uint64_t, ModuleState>> state_by_pid;
+  std::map<int, std::map<std::string, uint64_t>> raw_state_by_pid;
+  std::map<int, uint64_t> scan_round_by_pid;
   std::set<int> announced;
   bool saw_any = false;
   time_t start_time = time(nullptr);
@@ -785,16 +1534,24 @@ void cmd_dump(const std::string &pkg, ArchMode arch, int timeout_sec) {
     for (int pid : pids) {
       if (!announced.count(pid)) {
         std::cout << "\n[2] Captured PID: " << pid << "\n";
-        std::cout << "\n[3] Analyzing...\n";
+        std::cout << "\n[3] Dumping...\n";
         std::cout.flush();
         announced.insert(pid);
       }
       g_pid = pid;
       std::string out_pid = out + "/pid_" + std::to_string(pid);
       mkdir_p(out_pid);
-      int found = dump_analysis(pid, out_pid, state_by_pid[pid]);
-      if (found > 0)
+      uint64_t round = ++scan_round_by_pid[pid];
+      int found = dump_analysis(pid, out_pid, state_by_pid[pid],
+                                raw_state_by_pid[pid], priority_files, round,
+                                relink_cfg);
+      if (found > 0) {
+        if (round > 1) {
+          std::cout << "    [i] Rescan #" << round << " (PID " << pid << ")\n";
+          std::cout.flush();
+        }
         last_new = time(nullptr);
+      }
       g_pid = -1;
     }
     if (timeout_sec > 0) {
@@ -804,6 +1561,7 @@ void cmd_dump(const std::string &pkg, ArchMode arch, int timeout_sec) {
       if (!saw_any && now - start_time >= timeout_sec)
         break;
     }
+    usleep(200000);
   }
 
   std::cout << "\n=== COMPLETE ===\n";
@@ -818,50 +1576,144 @@ int main(int argc, char *argv[]) {
   signal(SIGABRT, signal_handler);
   atexit(cleanup);
 
-  if (argc < 5) {
+  if (argc < 3) {
     std::cout << USAGE;
     return 1;
   }
 
   std::string cmd = argv[1];
   std::string pkg = argv[2];
-  if (cmd != "dump") {
-    std::cout << USAGE;
-    return 1;
-  }
 
   ArchMode arch = ArchMode::ARM64;
   bool have_mode = false;
   int timeout_sec = 0;
+  std::string extra_arg;
 
-  for (int i = 3; i < argc; i++) {
-    std::string arg = argv[i];
-    if (arg == "--mode" && i + 1 < argc) {
-      std::string mode_value = argv[++i];
-      if (mode_value == "arm32")
-        arch = ArchMode::ARM32;
-      else if (mode_value == "arm64")
-        arch = ArchMode::ARM64;
-      else {
-        std::cout << USAGE;
-        return 1;
-      }
-      have_mode = true;
-    } else if (arg == "--timeout" && i + 1 < argc) {
-      timeout_sec = atoi(argv[++i]);
-      if (timeout_sec < 0)
-        timeout_sec = 0;
-    } else {
+  if (cmd == "hook" || cmd == "inject" || cmd == "scan" || cmd == "extract") {
+    int inst_count = 10;
+    int max_depth = 8;
+    if (argc < 4) {
       std::cout << USAGE;
       return 1;
     }
-  }
-
-  if (!have_mode) {
+    extra_arg = argv[3];
+    for (int i = 4; i < argc; i++) {
+      std::string arg = argv[i];
+      if (arg == "--mode" && i + 1 < argc) {
+        std::string mode_value = argv[++i];
+        if (mode_value == "arm32")
+          arch = ArchMode::ARM32;
+        else if (mode_value == "arm64")
+          arch = ArchMode::ARM64;
+        else {
+          std::cout << USAGE;
+          return 1;
+        }
+        have_mode = true;
+      } else if (arg == "--i" && i + 1 < argc && cmd == "hook") {
+        inst_count = atoi(argv[++i]);
+        if (inst_count < 1)
+          inst_count = 1;
+        if (inst_count > 200)
+          inst_count = 200;
+      } else if (arg == "--d" && i + 1 < argc && cmd == "extract") {
+        max_depth = atoi(argv[++i]);
+        if (max_depth < 1)
+          max_depth = 1;
+        if (max_depth > 32)
+          max_depth = 32;
+      } else {
+        std::cout << USAGE;
+        return 1;
+      }
+    }
+    if (!have_mode) {
+      std::cout << USAGE;
+      return 1;
+    }
+    if (cmd == "hook")
+      cmd_hook(pkg, extra_arg, arch, inst_count);
+    else if (cmd == "inject")
+      cmd_inject(pkg, extra_arg, arch);
+    else if (cmd == "scan")
+      cmd_scan(pkg, extra_arg, arch);
+    else if (cmd == "extract")
+      cmd_extract(pkg, extra_arg, arch, max_depth);
+  } else if (cmd == "dump") {
+    std::vector<std::string> priority_files;
+    bool enable_relink = false;
+    RelinkConfig relink_cfg = make_default_relink_config();
+    for (int i = 3; i < argc; i++) {
+      std::string arg = argv[i];
+      if (arg == "--mode" && i + 1 < argc) {
+        std::string mode_value = argv[++i];
+        if (mode_value == "arm32")
+          arch = ArchMode::ARM32;
+        else if (mode_value == "arm64")
+          arch = ArchMode::ARM64;
+        else {
+          std::cout << USAGE;
+          return 1;
+        }
+        have_mode = true;
+      } else if (arg == "--timeout" && i + 1 < argc) {
+        timeout_sec = atoi(argv[++i]);
+        if (timeout_sec < 0)
+          timeout_sec = 0;
+      } else if (arg == "--p" && i + 1 < argc) {
+        priority_files = split_string(argv[++i], ',');
+      } else if (arg == "--relink") {
+        enable_relink = true;
+      } else if (arg == "--relink-depth" && i + 1 < argc) {
+        enable_relink = true;
+        relink_cfg.max_depth = atoi(argv[++i]);
+        if (relink_cfg.max_depth < 1)
+          relink_cfg.max_depth = 1;
+        if (relink_cfg.max_depth > 32)
+          relink_cfg.max_depth = 32;
+      } else if (arg == "--relink-max-size" && i + 1 < argc) {
+        enable_relink = true;
+        unsigned long long v = strtoull(argv[++i], nullptr, 10);
+        if (v < 1024 * 1024ULL)
+          v = 1024 * 1024ULL;
+        if (v > 512ULL * 1024ULL * 1024ULL)
+          v = 512ULL * 1024ULL * 1024ULL;
+        relink_cfg.max_total_size = static_cast<size_t>(v);
+      } else if (arg == "--relink-exclude" && i + 1 < argc) {
+        enable_relink = true;
+        auto libs = split_string(argv[++i], ',');
+        for (const auto &lib : libs) {
+          if (!lib.empty())
+            relink_cfg.exclude_libs.insert(lib);
+        }
+      } else if (arg == "--relink-include" && i + 1 < argc) {
+        enable_relink = true;
+        auto libs = split_string(argv[++i], ',');
+        for (const auto &lib : libs) {
+          if (!lib.empty())
+            relink_cfg.include_only_libs.insert(lib);
+        }
+      } else if (arg == "--relink-no-fix") {
+        enable_relink = true;
+        relink_cfg.fix_relocations = false;
+      } else if (arg == "--relink-no-inline-plt") {
+        enable_relink = true;
+        relink_cfg.inline_plt_calls = false;
+      } else {
+        std::cout << USAGE;
+        return 1;
+      }
+    }
+    if (!have_mode) {
+      std::cout << USAGE;
+      return 1;
+    }
+    cmd_dump(pkg, arch, timeout_sec, priority_files,
+             enable_relink ? &relink_cfg : nullptr);
+  } else {
     std::cout << USAGE;
     return 1;
   }
 
-  cmd_dump(pkg, arch, timeout_sec);
   return 0;
 }
