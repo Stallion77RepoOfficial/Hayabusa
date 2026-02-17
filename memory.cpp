@@ -63,14 +63,24 @@ std::vector<ModuleInfo> Memory::get_maps(int pid) {
 
 std::vector<uint8_t> Memory::dump(int pid, unsigned long addr, size_t size) {
   std::vector<uint8_t> buf(size, 0);
+  if (size == 0)
+    return buf;
   int fd = open(("/proc/" + std::to_string(pid) + "/mem").c_str(), O_RDONLY);
   if (fd < 0)
-    return buf;
+    return {};
+  bool any_read = false;
   for (size_t off = 0; off < size; off += 4096) {
     size_t len = std::min((size_t)4096, size - off);
-    pread(fd, buf.data() + off, len, addr + off);
+    ssize_t rd = pread(fd, buf.data() + off, len, addr + off);
+    if (rd > 0)
+      any_read = true;
+    if (rd > 0 && static_cast<size_t>(rd) < len) {
+      memset(buf.data() + off + rd, 0, len - static_cast<size_t>(rd));
+    }
   }
   close(fd);
+  if (!any_read)
+    return {};
   return buf;
 }
 
@@ -1154,13 +1164,22 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
 
   if (!is32) {
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
-    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0)
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 ||
+        ehdr->e_shentsize != sizeof(Elf64_Shdr))
+      return entries;
+    size_t sh_end = static_cast<size_t>(ehdr->e_shoff) +
+                    static_cast<size_t>(ehdr->e_shnum) * sizeof(Elf64_Shdr);
+    if (sh_end > data.size())
       return entries;
 
     const Elf64_Shdr *shdrs = (const Elf64_Shdr *)(data.data() + ehdr->e_shoff);
     const Elf64_Shdr *shstrtab = nullptr;
     if (ehdr->e_shstrndx < ehdr->e_shnum)
       shstrtab = &shdrs[ehdr->e_shstrndx];
+    if (shstrtab &&
+        (shstrtab->sh_offset >= data.size() ||
+         shstrtab->sh_offset + shstrtab->sh_size > data.size()))
+      shstrtab = nullptr;
 
     const Elf64_Shdr *dynsym = nullptr;
     const Elf64_Shdr *dynstr = nullptr;
@@ -1181,6 +1200,10 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
     }
 
     if (!dynsym || !dynstr || !relaplt)
+      return entries;
+    if (dynsym->sh_offset + dynsym->sh_size > data.size() ||
+        dynstr->sh_offset + dynstr->sh_size > data.size() ||
+        relaplt->sh_offset + relaplt->sh_size > data.size())
       return entries;
 
     size_t rela_count = relaplt->sh_size / sizeof(Elf64_Rela);
@@ -1209,7 +1232,12 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
     }
   } else {
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
-    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0)
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 ||
+        ehdr->e_shentsize != sizeof(Elf32_Shdr))
+      return entries;
+    size_t sh_end = static_cast<size_t>(ehdr->e_shoff) +
+                    static_cast<size_t>(ehdr->e_shnum) * sizeof(Elf32_Shdr);
+    if (sh_end > data.size())
       return entries;
 
     const Elf32_Shdr *shdrs = (const Elf32_Shdr *)(data.data() + ehdr->e_shoff);
@@ -1227,6 +1255,10 @@ ElfParser::get_plt_entries(const std::vector<uint8_t> &data) {
     }
 
     if (!dynsym || !dynstr || !relplt)
+      return entries;
+    if (dynsym->sh_offset + dynsym->sh_size > data.size() ||
+        dynstr->sh_offset + dynstr->sh_size > data.size() ||
+        relplt->sh_offset + relplt->sh_size > data.size())
       return entries;
 
     size_t rel_count = relplt->sh_size / sizeof(Elf32_Rel);
@@ -1917,19 +1949,37 @@ static uint64_t find_dynamic_entry(const std::vector<uint8_t> &data,
 }
 
 bool ElfParser::has_relro(const std::vector<uint8_t> &data) {
-  if (data.size() < sizeof(Elf64_Ehdr))
+  if (!is_elf(data))
     return false;
   bool is32 = is_elf32(data);
 
   if (is32) {
+    if (data.size() < sizeof(Elf32_Ehdr))
+      return false;
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
+    if (ehdr->e_phoff == 0 || ehdr->e_phentsize != sizeof(Elf32_Phdr) ||
+        ehdr->e_phnum == 0)
+      return false;
+    size_t ph_end = static_cast<size_t>(ehdr->e_phoff) +
+                    static_cast<size_t>(ehdr->e_phnum) * sizeof(Elf32_Phdr);
+    if (ph_end > data.size())
+      return false;
     const Elf32_Phdr *phdrs = (const Elf32_Phdr *)(data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
       if (phdrs[i].p_type == PT_GNU_RELRO)
         return true;
     }
   } else {
+    if (data.size() < sizeof(Elf64_Ehdr))
+      return false;
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
+    if (ehdr->e_phoff == 0 || ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr->e_phnum == 0)
+      return false;
+    size_t ph_end = static_cast<size_t>(ehdr->e_phoff) +
+                    static_cast<size_t>(ehdr->e_phnum) * sizeof(Elf64_Phdr);
+    if (ph_end > data.size())
+      return false;
     const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
       if (phdrs[i].p_type == PT_GNU_RELRO)
@@ -1948,12 +1998,21 @@ bool ElfParser::has_full_relro(const std::vector<uint8_t> &data) {
 
 std::pair<uint64_t, uint64_t>
 ElfParser::get_tls_range(const std::vector<uint8_t> &data) {
-  if (data.size() < sizeof(Elf64_Ehdr))
+  if (!is_elf(data))
     return {0, 0};
   bool is32 = is_elf32(data);
 
   if (is32) {
+    if (data.size() < sizeof(Elf32_Ehdr))
+      return {0, 0};
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data.data();
+    if (ehdr->e_phoff == 0 || ehdr->e_phentsize != sizeof(Elf32_Phdr) ||
+        ehdr->e_phnum == 0)
+      return {0, 0};
+    size_t ph_end = static_cast<size_t>(ehdr->e_phoff) +
+                    static_cast<size_t>(ehdr->e_phnum) * sizeof(Elf32_Phdr);
+    if (ph_end > data.size())
+      return {0, 0};
     const Elf32_Phdr *phdrs = (const Elf32_Phdr *)(data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
       if (phdrs[i].p_type == PT_TLS) {
@@ -1961,7 +2020,16 @@ ElfParser::get_tls_range(const std::vector<uint8_t> &data) {
       }
     }
   } else {
+    if (data.size() < sizeof(Elf64_Ehdr))
+      return {0, 0};
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data.data();
+    if (ehdr->e_phoff == 0 || ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr->e_phnum == 0)
+      return {0, 0};
+    size_t ph_end = static_cast<size_t>(ehdr->e_phoff) +
+                    static_cast<size_t>(ehdr->e_phnum) * sizeof(Elf64_Phdr);
+    if (ph_end > data.size())
+      return {0, 0};
     const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
       if (phdrs[i].p_type == PT_TLS) {
@@ -2098,7 +2166,10 @@ static bool parse_pattern(const std::string &pattern,
       mask.push_back(false);
     } else {
       try {
-        uint8_t b = (uint8_t)std::stoul(token, nullptr, 16);
+        unsigned long v = std::stoul(token, nullptr, 16);
+        if (v > 0xFF)
+          return false;
+        uint8_t b = static_cast<uint8_t>(v);
         bytes.push_back(b);
         mask.push_back(true);
       } catch (...) {
@@ -2160,6 +2231,8 @@ ElfParser::pattern_scan_multi(const std::vector<uint8_t> &data,
 
 std::string ElfParser::generate_signature(const std::vector<uint8_t> &data,
                                           uint64_t offset, size_t length) {
+  if (offset >= data.size() || length == 0)
+    return "";
   if (offset + length > data.size())
     length = data.size() - offset;
 
@@ -3268,10 +3341,10 @@ ElfParser::find_high_entropy_regions(const std::vector<uint8_t> &data,
                                      size_t block_size, double threshold) {
   std::vector<EntropyInfo> results;
 
-  if (data.size() < block_size)
+  if (block_size == 0 || data.size() < block_size)
     return results;
 
-  size_t step = block_size / 2;
+  size_t step = std::max<size_t>(1, block_size / 2);
   uint64_t region_start = 0;
   bool in_high_entropy = false;
   double max_entropy = 0;

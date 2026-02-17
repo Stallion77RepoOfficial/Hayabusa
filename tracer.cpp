@@ -80,51 +80,107 @@ static constexpr int SYS_MPROTECT_32 = 125;
 static uint64_t execute_syscall(int pid, const std::vector<uint64_t> &args,
                                 int syscall_nr) {
   if (g_arch == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
+    user_regs_struct_64 orig_regs{}, regs{};
     struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+      return static_cast<uint64_t>(-1);
     regs = orig_regs;
     for (size_t i = 0; i < args.size() && i < 8; i++)
       regs.regs[i] = args[i];
     regs.regs[8] = syscall_nr;
     uint64_t pc = regs.pc;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
+    uint32_t orig_inst = 0;
+    if (!ProcessTracer::read_memory(pid, pc, &orig_inst, 4))
+      return static_cast<uint64_t>(-1);
     uint32_t svc_inst = 0xD4000001;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
+    if (!ProcessTracer::write_memory(pid, pc, &svc_inst, 4))
+      return static_cast<uint64_t>(-1);
     iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    iov.iov_len = sizeof(regs);
+    if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+      ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+      return static_cast<uint64_t>(-1);
+    }
+    if (ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr) < 0) {
+      ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+      iov.iov_base = &orig_regs;
+      iov.iov_len = sizeof(orig_regs);
+      ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+      return static_cast<uint64_t>(-1);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFSTOPPED(status)) {
+      ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+      iov.iov_base = &orig_regs;
+      iov.iov_len = sizeof(orig_regs);
+      ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+      return static_cast<uint64_t>(-1);
+    }
+    iov.iov_base = &regs;
+    iov.iov_len = sizeof(regs);
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+      ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+      iov.iov_base = &orig_regs;
+      iov.iov_len = sizeof(orig_regs);
+      ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+      return static_cast<uint64_t>(-1);
+    }
     uint64_t result = regs.regs[0];
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+    (void)ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
     iov.iov_base = &orig_regs;
+    iov.iov_len = sizeof(orig_regs);
     ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
     return result;
   } else {
-    user_regs_struct_32 orig_regs, regs;
+    user_regs_struct_32 orig_regs{}, regs{};
     struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+      return static_cast<uint64_t>(-1);
     regs = orig_regs;
     for (size_t i = 0; i < args.size() && i < 6; i++)
       regs.regs[i] = (uint32_t)args[i];
     regs.regs[7] = syscall_nr;
     uint32_t pc = regs.regs[15];
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
+    uint32_t orig_inst = 0;
+    if (!ProcessTracer::read_memory(pid, pc, &orig_inst, 4))
+      return static_cast<uint64_t>(-1);
     uint32_t svc_inst = 0xEF000000;
-    ProcessTracer::write_memory(pid, pc, &svc_inst, 4);
+    if (!ProcessTracer::write_memory(pid, pc, &svc_inst, 4))
+      return static_cast<uint64_t>(-1);
     iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    iov.iov_len = sizeof(regs);
+    if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+      ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+      return static_cast<uint64_t>(-1);
+    }
+    if (ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr) < 0) {
+      ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+      iov.iov_base = &orig_regs;
+      iov.iov_len = sizeof(orig_regs);
+      ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+      return static_cast<uint64_t>(-1);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFSTOPPED(status)) {
+      ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+      iov.iov_base = &orig_regs;
+      iov.iov_len = sizeof(orig_regs);
+      ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+      return static_cast<uint64_t>(-1);
+    }
+    iov.iov_base = &regs;
+    iov.iov_len = sizeof(regs);
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+      ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+      iov.iov_base = &orig_regs;
+      iov.iov_len = sizeof(orig_regs);
+      ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+      return static_cast<uint64_t>(-1);
+    }
     uint32_t result = regs.regs[0];
-    ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
+    (void)ProcessTracer::write_memory(pid, pc, &orig_inst, 4);
     iov.iov_base = &orig_regs;
+    iov.iov_len = sizeof(orig_regs);
     ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
     return result;
   }
@@ -670,16 +726,36 @@ bool ProcessTracer::detach(int pid) {
 }
 
 bool ProcessTracer::read_memory(int pid, uint64_t addr, void *buf, size_t len) {
-  struct iovec local = {buf, len};
-  struct iovec remote = {(void *)addr, len};
-  return process_vm_readv(pid, &local, 1, &remote, 1, 0) == (ssize_t)len;
+  uint8_t *out = static_cast<uint8_t *>(buf);
+  size_t done = 0;
+  while (done < len) {
+    struct iovec local = {out + done, len - done};
+    struct iovec remote = {
+        reinterpret_cast<void *>(static_cast<uintptr_t>(addr + done)),
+        len - done};
+    ssize_t rd = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+    if (rd <= 0)
+      return false;
+    done += static_cast<size_t>(rd);
+  }
+  return true;
 }
 
 bool ProcessTracer::write_memory(int pid, uint64_t addr, const void *buf,
                                  size_t len) {
-  struct iovec local = {(void *)buf, len};
-  struct iovec remote = {(void *)addr, len};
-  return process_vm_writev(pid, &local, 1, &remote, 1, 0) == (ssize_t)len;
+  const uint8_t *in = static_cast<const uint8_t *>(buf);
+  size_t done = 0;
+  while (done < len) {
+    struct iovec local = {const_cast<uint8_t *>(in + done), len - done};
+    struct iovec remote = {
+        reinterpret_cast<void *>(static_cast<uintptr_t>(addr + done)),
+        len - done};
+    ssize_t wr = process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    if (wr <= 0)
+      return false;
+    done += static_cast<size_t>(wr);
+  }
+  return true;
 }
 
 bool ProcessTracer::set_protection(int pid, uint64_t addr, size_t len,
@@ -777,9 +853,29 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
   std::vector<uint8_t> result(size, 0);
   size_t page_count = (size + 4095) / 4096;
   std::vector<bool> captured(page_count, false);
+  std::vector<int> original_prot(page_count, PROT_READ | PROT_EXEC);
 
   if (!attach(pid))
     return result;
+
+  auto maps = Memory::get_maps(pid);
+  for (size_t i = 0; i < page_count; i++) {
+    uint64_t page_addr = base + i * 4096;
+    for (const auto &m : maps) {
+      uint64_t mend = m.base + m.size;
+      if (page_addr < m.base || page_addr >= mend)
+        continue;
+      int prot = 0;
+      if (m.perms.find('r') != std::string::npos)
+        prot |= PROT_READ;
+      if (m.perms.find('w') != std::string::npos)
+        prot |= PROT_WRITE;
+      if (m.perms.find('x') != std::string::npos)
+        prot |= PROT_EXEC;
+      original_prot[i] = prot;
+      break;
+    }
+  }
 
   read_memory(pid, base, result.data(), size);
 
@@ -798,11 +894,22 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
   for (size_t i = 0; i < page_count; i++) {
     if (!captured[i]) {
       size_t page_size = std::min<size_t>(4096, size - i * 4096);
-      set_protection(pid, base + i * 4096, page_size, PROT_NONE);
+      if (!set_protection(pid, base + i * 4096, page_size, PROT_NONE))
+        captured[i] = true;
     }
   }
 
-  continue_process(pid);
+  if (!continue_process(pid)) {
+    for (size_t i = 0; i < captured.size(); i++) {
+      if (!captured[i]) {
+        set_protection(pid, base + i * 4096,
+                       std::min<size_t>(4096, size - i * 4096),
+                       original_prot[i]);
+      }
+    }
+    detach(pid);
+    return result;
+  }
   time_t start = time(nullptr);
 
   while (time(nullptr) - start < duration_sec) {
@@ -823,8 +930,10 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
             if (page_idx < captured.size() && !captured[page_idx]) {
               size_t page_size = std::min<size_t>(4096, size - page_idx * 4096);
 
-              set_protection(pid, base + page_idx * 4096, page_size,
-                             PROT_READ | PROT_EXEC);
+              if (!set_protection(pid, base + page_idx * 4096, page_size,
+                                  original_prot[page_idx])) {
+                continue;
+              }
 
               std::vector<uint8_t> page_data(page_size);
               read_memory(pid, base + page_idx * 4096, page_data.data(),
@@ -838,13 +947,14 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
               if (!captured[i]) {
                 set_protection(pid, base + i * 4096,
                                std::min<size_t>(4096, size - i * 4096),
-                               PROT_READ | PROT_EXEC);
+                               original_prot[i]);
                 captured[i] = true;
               }
             }
           }
         }
-        continue_process(pid);
+        if (!continue_process(pid))
+          break;
       } else {
         ptrace(PTRACE_CONT, pid, nullptr, (void *)(long)sig);
       }
@@ -859,7 +969,7 @@ std::vector<uint8_t> ProcessTracer::dump_on_demand(int pid, uint64_t base,
     if (!captured[i]) {
       set_protection(pid, base + i * 4096,
                      std::min<size_t>(4096, size - i * 4096),
-                     PROT_READ | PROT_EXEC);
+                     original_prot[i]);
     }
   }
 
@@ -885,8 +995,7 @@ std::vector<LibraryRange> ProcessTracer::get_library_ranges(int pid) {
       std::string path = line.substr(path_pos);
       while (!path.empty() && (path.back() == ' ' || path.back() == '\n'))
         path.pop_back();
-      size_t slash = path.rfind('/');
-      name = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+      name = path;
     } else {
       size_t bracket = line.find('[');
       if (bracket != std::string::npos) {
@@ -924,8 +1033,8 @@ uint64_t FunctionHooker::allocate_remote(int pid, size_t size) {
 
 bool FunctionHooker::free_remote(int pid, uint64_t addr, size_t size) {
   int syscall_nr = (g_arch == ArchMode::ARM64) ? SYS_MUNMAP_64 : SYS_MUNMAP_32;
-  execute_syscall(pid, {addr, (uint64_t)size}, syscall_nr);
-  return true;
+  uint64_t ret = execute_syscall(pid, {addr, (uint64_t)size}, syscall_nr);
+  return ret == 0;
 }
 
 template <typename Ehdr, typename Phdr, typename Dyn, typename Sym>
@@ -1018,7 +1127,8 @@ static uint64_t parse_remote_symbol_impl(int pid, uint64_t lib_base,
       if (max_bucket > 0) {
         uint64_t chain_addr = buckets_addr + nbuckets * 4;
         uint32_t idx = max_bucket - symoffset;
-        while (true) {
+        uint32_t guard = 0;
+        while (guard++ < (1u << 20)) {
           uint32_t chain_val;
           if (!ProcessTracer::read_memory(pid, chain_addr + idx * 4, &chain_val,
                                           4))
@@ -1038,6 +1148,25 @@ static uint64_t parse_remote_symbol_impl(int pid, uint64_t lib_base,
   if (nchain == 0)
     nchain = 4096;
 
+  auto read_remote_cstr = [&](uint64_t addr, size_t max_len) -> std::string {
+    std::string out;
+    out.reserve(std::min<size_t>(max_len, 256));
+    size_t off = 0;
+    while (off < max_len) {
+      char chunk[64];
+      size_t to_read = std::min(sizeof(chunk), max_len - off);
+      if (!ProcessTracer::read_memory(pid, addr + off, chunk, to_read))
+        break;
+      for (size_t i = 0; i < to_read; i++) {
+        if (chunk[i] == '\0')
+          return out;
+        out.push_back(chunk[i]);
+      }
+      off += to_read;
+    }
+    return out;
+  };
+
   for (size_t i = 0; i < nchain; i++) {
     uint8_t sym_buf[sym_sz];
     if (!ProcessTracer::read_memory(pid, symtab + i * sym_sz, sym_buf, sym_sz))
@@ -1045,9 +1174,8 @@ static uint64_t parse_remote_symbol_impl(int pid, uint64_t lib_base,
     Sym *s = (Sym *)sym_buf;
     if (s->st_name == 0 || s->st_value == 0)
       continue;
-    char name_buf[256] = {0};
-    ProcessTracer::read_memory(pid, strtab + s->st_name, name_buf, 255);
-    if (strcmp(name_buf, sym.c_str()) == 0)
+    std::string name = read_remote_cstr(strtab + s->st_name, 4096);
+    if (name == sym)
       return s->st_value;
   }
   return 0;
@@ -1059,10 +1187,19 @@ uint64_t FunctionHooker::find_remote_symbol(int pid, const std::string &lib,
   std::string line;
   std::vector<uint64_t> candidate_bases;
   while (std::getline(maps, line)) {
-    if (line.find(lib) == std::string::npos)
-      continue;
     if (line.find("r-xp") == std::string::npos &&
         line.find("r--p") == std::string::npos)
+      continue;
+    size_t path_pos = line.find('/');
+    if (path_pos == std::string::npos)
+      continue;
+    std::string path = line.substr(path_pos);
+    while (!path.empty() && (path.back() == ' ' || path.back() == '\n'))
+      path.pop_back();
+    size_t slash = path.rfind('/');
+    std::string base_name =
+        (slash != std::string::npos) ? path.substr(slash + 1) : path;
+    if (base_name != lib && path.find("/" + lib) == std::string::npos)
       continue;
     uint64_t base = 0;
     uint64_t map_off = 0;
@@ -1104,13 +1241,21 @@ bool FunctionHooker::hook_function(int pid, uint64_t target, uint64_t hook,
     memcpy(tramp_code + 16, jmp_back, 8);
     uint64_t ret_addr = target + 16;
     memcpy(tramp_code + 24, &ret_addr, 8);
-    ProcessTracer::write_memory(pid, trampoline, tramp_code, 32);
-    *original = trampoline;
+    if (!ProcessTracer::write_memory(pid, trampoline, tramp_code, 32)) {
+      free_remote(pid, trampoline, 64);
+      return false;
+    }
+    if (original)
+      *original = trampoline;
     uint32_t hook_jmp[2] = {0x58000050, 0xD61F0200};
     uint8_t patch[16];
     memcpy(patch, hook_jmp, 8);
     memcpy(patch + 8, &hook, 8);
-    return ProcessTracer::write_memory(pid, target, patch, sizeof(patch));
+    if (!ProcessTracer::write_memory(pid, target, patch, sizeof(patch))) {
+      free_remote(pid, trampoline, 64);
+      return false;
+    }
+    return true;
   } else {
     uint32_t orig_bytes[2];
     if (!ProcessTracer::read_memory(pid, target, orig_bytes, 8))
@@ -1122,10 +1267,18 @@ bool FunctionHooker::hook_function(int pid, uint64_t target, uint64_t hook,
     memcpy(tramp_code, orig_bytes, 8);
     uint32_t br_back[2] = {0xE51FF004, (uint32_t)(target + 8)};
     memcpy(tramp_code + 8, br_back, 8);
-    ProcessTracer::write_memory(pid, trampoline, tramp_code, 16);
-    *original = trampoline;
+    if (!ProcessTracer::write_memory(pid, trampoline, tramp_code, 16)) {
+      free_remote(pid, trampoline, 32);
+      return false;
+    }
+    if (original)
+      *original = trampoline;
     uint32_t hook_jmp[2] = {0xE51FF004, (uint32_t)hook};
-    return ProcessTracer::write_memory(pid, target, hook_jmp, 8);
+    if (!ProcessTracer::write_memory(pid, target, hook_jmp, 8)) {
+      free_remote(pid, trampoline, 32);
+      return false;
+    }
+    return true;
   }
 }
 
@@ -1140,69 +1293,10 @@ bool FunctionHooker::unhook_function(int pid, uint64_t target,
 }
 
 bool FunctionHooker::inject_library(int pid, const std::string &lib_path) {
-  uint64_t dlopen_addr = find_remote_symbol(pid, "libdl.so", "dlopen");
-  if (dlopen_addr == 0)
-    dlopen_addr = find_remote_symbol(pid, "libc.so", "__loader_dlopen");
-  if (dlopen_addr == 0)
+  if (lib_path.empty())
     return false;
-  size_t path_len = lib_path.size() + 1;
-  uint64_t remote_path = allocate_remote(pid, path_len);
-  if (remote_path == 0)
-    return false;
-  ProcessTracer::write_memory(pid, remote_path, lib_path.c_str(), path_len);
-  if (g_arch == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-    regs.regs[0] = remote_path;
-    regs.regs[1] = RTLD_NOW;
-    regs.pc = dlopen_addr;
-    regs.regs[30] = 0;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, dlopen_addr, &orig_inst, 4);
-    uint32_t brk_inst = 0xD4200000;
-    ProcessTracer::write_memory(pid, dlopen_addr, &brk_inst, 4);
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    uint64_t result = regs.regs[0];
-    ProcessTracer::write_memory(pid, dlopen_addr, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    free_remote(pid, remote_path, path_len);
-    return result != 0;
-  } else {
-    user_regs_struct_32 orig_regs, regs;
-    struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    regs = orig_regs;
-    uint32_t sp = regs.regs[13] - 16;
-    regs.regs[13] = sp;
-    uint32_t args[2] = {(uint32_t)remote_path, RTLD_NOW};
-    ProcessTracer::write_memory(pid, sp, args, 8);
-    regs.regs[15] = (uint32_t)dlopen_addr;
-    regs.regs[14] = 0;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, dlopen_addr, &orig_inst, 4);
-    uint32_t brk_inst = 0xE1200070;
-    ProcessTracer::write_memory(pid, dlopen_addr, &brk_inst, 4);
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    uint32_t result = regs.regs[0];
-    ProcessTracer::write_memory(pid, dlopen_addr, &orig_inst, 4);
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    free_remote(pid, remote_path, path_len);
-    return result != 0;
-  }
+  uint64_t handle = MemoryInjector::remote_dlopen(pid, lib_path, RTLD_NOW);
+  return handle != 0;
 }
 
 std::vector<RelinkEntry>
@@ -1217,20 +1311,28 @@ StaticRelinker::find_external_calls(const std::vector<uint8_t> &data,
     const Elf32_Ehdr *ehdr = reinterpret_cast<const Elf32_Ehdr *>(data.data());
     if (memcmp(ehdr->e_ident, ELFMAG, 4) != 0)
       return entries;
-    if (ehdr->e_phoff == 0)
+    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0 ||
+        ehdr->e_phentsize != sizeof(Elf32_Phdr))
+      return entries;
+    size_t ph_end = static_cast<size_t>(ehdr->e_phoff) +
+                    static_cast<size_t>(ehdr->e_phnum) * sizeof(Elf32_Phdr);
+    if (ph_end > data.size())
       return entries;
     uint32_t dyn_off = 0, dyn_sz = 0;
+    const Elf32_Phdr *phdrs = reinterpret_cast<const Elf32_Phdr *>(
+        data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
-      auto ph = reinterpret_cast<const Elf32_Phdr *>(
-          data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
+      const Elf32_Phdr *ph = &phdrs[i];
       if (ph->p_type == PT_DYNAMIC) {
         dyn_off = ph->p_offset;
         dyn_sz = ph->p_filesz;
         break;
       }
     }
-    if (dyn_off == 0)
+    if (dyn_off == 0 || dyn_off >= data.size())
       return entries;
+    if (dyn_off + dyn_sz > data.size())
+      dyn_sz = data.size() - dyn_off;
     uint32_t jmprel = 0, pltrelsz = 0, symtab = 0, strtab = 0;
     const Elf32_Dyn *dyn =
         reinterpret_cast<const Elf32_Dyn *>(data.data() + dyn_off);
@@ -1252,44 +1354,82 @@ StaticRelinker::find_external_calls(const std::vector<uint8_t> &data,
     }
     if (jmprel == 0 || symtab == 0 || strtab == 0)
       return entries;
+
+    auto vaddr_to_off = [&](uint32_t vaddr, uint32_t &out) -> bool {
+      if (vaddr < data.size()) {
+        out = vaddr;
+        return true;
+      }
+      for (int i = 0; i < ehdr->e_phnum; i++) {
+        const Elf32_Phdr *ph = &phdrs[i];
+        if (ph->p_type != PT_LOAD)
+          continue;
+        uint64_t seg_start = ph->p_vaddr;
+        uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
+        if (vaddr < seg_start || vaddr >= seg_end)
+          continue;
+        uint64_t off = ph->p_offset + (static_cast<uint64_t>(vaddr) - seg_start);
+        if (off >= data.size())
+          return false;
+        out = static_cast<uint32_t>(off);
+        return true;
+      }
+      return false;
+    };
+
+    uint32_t jmprel_off = 0, symtab_off = 0, strtab_off = 0;
+    if (!vaddr_to_off(jmprel, jmprel_off) || !vaddr_to_off(symtab, symtab_off) ||
+        !vaddr_to_off(strtab, strtab_off))
+      return entries;
+
     size_t count = pltrelsz / sizeof(Elf32_Rel);
     for (size_t i = 0; i < count; i++) {
-      uint32_t rel_off = jmprel + i * sizeof(Elf32_Rel);
+      uint64_t rel_off = static_cast<uint64_t>(jmprel_off) +
+                         i * sizeof(Elf32_Rel);
       if (rel_off + sizeof(Elf32_Rel) > data.size())
         break;
       auto rel = reinterpret_cast<const Elf32_Rel *>(data.data() + rel_off);
       uint32_t sym_idx = ELF32_R_SYM(rel->r_info);
-      uint32_t sym_off = symtab + sym_idx * sizeof(Elf32_Sym);
+      uint64_t sym_off = static_cast<uint64_t>(symtab_off) +
+                         static_cast<uint64_t>(sym_idx) * sizeof(Elf32_Sym);
       if (sym_off + sizeof(Elf32_Sym) > data.size())
         continue;
       auto sym = reinterpret_cast<const Elf32_Sym *>(data.data() + sym_off);
-      if (sym->st_name == 0 || strtab + sym->st_name >= data.size())
+      uint64_t name_off = static_cast<uint64_t>(strtab_off) + sym->st_name;
+      if (sym->st_name == 0 || name_off >= data.size())
         continue;
       RelinkEntry entry;
       entry.call_site = rel->r_offset;
       entry.target_addr = 0;
-      entry.symbol_name =
-          reinterpret_cast<const char *>(data.data() + strtab + sym->st_name);
+      entry.symbol_name = reinterpret_cast<const char *>(data.data() + name_off);
       entries.push_back(entry);
     }
   } else {
     const Elf64_Ehdr *ehdr = reinterpret_cast<const Elf64_Ehdr *>(data.data());
     if (memcmp(ehdr->e_ident, ELFMAG, 4) != 0)
       return entries;
-    if (ehdr->e_phoff == 0)
+    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0 ||
+        ehdr->e_phentsize != sizeof(Elf64_Phdr))
+      return entries;
+    size_t ph_end = static_cast<size_t>(ehdr->e_phoff) +
+                    static_cast<size_t>(ehdr->e_phnum) * sizeof(Elf64_Phdr);
+    if (ph_end > data.size())
       return entries;
     uint64_t dyn_off = 0, dyn_sz = 0;
+    const Elf64_Phdr *phdrs = reinterpret_cast<const Elf64_Phdr *>(
+        data.data() + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
-      auto ph = reinterpret_cast<const Elf64_Phdr *>(
-          data.data() + ehdr->e_phoff + i * ehdr->e_phentsize);
+      const Elf64_Phdr *ph = &phdrs[i];
       if (ph->p_type == PT_DYNAMIC) {
         dyn_off = ph->p_offset;
         dyn_sz = ph->p_filesz;
         break;
       }
     }
-    if (dyn_off == 0)
+    if (dyn_off == 0 || dyn_off >= data.size())
       return entries;
+    if (dyn_off + dyn_sz > data.size())
+      dyn_sz = data.size() - dyn_off;
     uint64_t jmprel = 0, pltrelsz = 0, symtab = 0, strtab = 0;
     const Elf64_Dyn *dyn =
         reinterpret_cast<const Elf64_Dyn *>(data.data() + dyn_off);
@@ -1311,24 +1451,52 @@ StaticRelinker::find_external_calls(const std::vector<uint8_t> &data,
     }
     if (jmprel == 0 || symtab == 0 || strtab == 0)
       return entries;
+
+    auto vaddr_to_off = [&](uint64_t vaddr, uint64_t &out) -> bool {
+      if (vaddr < data.size()) {
+        out = vaddr;
+        return true;
+      }
+      for (int i = 0; i < ehdr->e_phnum; i++) {
+        const Elf64_Phdr *ph = &phdrs[i];
+        if (ph->p_type != PT_LOAD)
+          continue;
+        uint64_t seg_start = ph->p_vaddr;
+        uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
+        if (vaddr < seg_start || vaddr >= seg_end)
+          continue;
+        uint64_t off = ph->p_offset + (vaddr - seg_start);
+        if (off >= data.size())
+          return false;
+        out = off;
+        return true;
+      }
+      return false;
+    };
+
+    uint64_t jmprel_off = 0, symtab_off = 0, strtab_off = 0;
+    if (!vaddr_to_off(jmprel, jmprel_off) || !vaddr_to_off(symtab, symtab_off) ||
+        !vaddr_to_off(strtab, strtab_off))
+      return entries;
+
     size_t count = pltrelsz / sizeof(Elf64_Rela);
     for (size_t i = 0; i < count; i++) {
-      uint64_t rel_off = jmprel + i * sizeof(Elf64_Rela);
+      uint64_t rel_off = jmprel_off + i * sizeof(Elf64_Rela);
       if (rel_off + sizeof(Elf64_Rela) > data.size())
         break;
       auto rela = reinterpret_cast<const Elf64_Rela *>(data.data() + rel_off);
       uint32_t sym_idx = ELF64_R_SYM(rela->r_info);
-      uint64_t sym_off = symtab + sym_idx * sizeof(Elf64_Sym);
+      uint64_t sym_off = symtab_off + sym_idx * sizeof(Elf64_Sym);
       if (sym_off + sizeof(Elf64_Sym) > data.size())
         continue;
       auto sym = reinterpret_cast<const Elf64_Sym *>(data.data() + sym_off);
-      if (sym->st_name == 0 || strtab + sym->st_name >= data.size())
+      uint64_t name_off = strtab_off + sym->st_name;
+      if (sym->st_name == 0 || name_off >= data.size())
         continue;
       RelinkEntry entry;
       entry.call_site = rela->r_offset;
       entry.target_addr = 0;
-      entry.symbol_name =
-          reinterpret_cast<const char *>(data.data() + strtab + sym->st_name);
+      entry.symbol_name = reinterpret_cast<const char *>(data.data() + name_off);
       entries.push_back(entry);
     }
   }
@@ -1436,122 +1604,191 @@ MemoryInjector::call_remote(int pid, uint64_t func_addr,
   }
 
   if (ProcessTracer::get_arch() == ArchMode::ARM64) {
-    user_regs_struct_64 orig_regs, regs;
+    user_regs_struct_64 orig_regs{}, regs{};
     struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
-      result.error_message = "Failed to get registers";
-      ProcessTracer::detach(pid);
-      return result;
-    }
-    regs = orig_regs;
+    uint64_t stub_addr = 0;
+    bool have_orig_regs = false;
 
-    for (size_t i = 0; i < args.size() && i < 8; i++) {
-      regs.regs[i] = args[i];
-    }
-
-    if (args.size() > 8) {
-      size_t stack_args = args.size() - 8;
-      regs.sp -= stack_args * 8;
-      regs.sp &= ~0xFULL;
-      for (size_t i = 8; i < args.size(); i++) {
-        uint64_t val = args[i];
-        ProcessTracer::write_memory(pid, regs.sp + (i - 8) * 8, &val, 8);
+    do {
+      if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+        result.error_message = "Failed to get registers";
+        break;
       }
+      have_orig_regs = true;
+      regs = orig_regs;
+
+      for (size_t i = 0; i < args.size() && i < 8; i++) {
+        regs.regs[i] = args[i];
+      }
+
+      if (args.size() > 8) {
+        size_t stack_args = args.size() - 8;
+        regs.sp -= stack_args * 8;
+        regs.sp &= ~0xFULL;
+        for (size_t i = 8; i < args.size(); i++) {
+          uint64_t val = args[i];
+          if (!ProcessTracer::write_memory(pid, regs.sp + (i - 8) * 8, &val, 8)) {
+            result.error_message = "Failed to write stack args";
+            break;
+          }
+        }
+        if (!result.error_message.empty())
+          break;
+      }
+
+      stub_addr = FunctionHooker::allocate_remote(pid, 32);
+      if (stub_addr == 0) {
+        result.error_message = "Failed to allocate stub";
+        break;
+      }
+
+      uint32_t stub_code[] = {
+          0x58000049,
+          0xD63F0120,
+          0xD4200000,
+          0x00000000,
+      };
+      if (!ProcessTracer::write_memory(pid, stub_addr, stub_code, sizeof(stub_code)) ||
+          !ProcessTracer::write_memory(pid, stub_addr + 16, &func_addr,
+                                      sizeof(func_addr))) {
+        result.error_message = "Failed to write stub";
+        break;
+      }
+
+      regs.regs[30] = stub_addr + 8;
+      regs.pc = stub_addr;
+
+      iov.iov_base = &regs;
+      iov.iov_len = sizeof(regs);
+      if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+        result.error_message = "Failed to set registers";
+        break;
+      }
+      if (ptrace(PTRACE_CONT, pid, nullptr, nullptr) < 0) {
+        result.error_message = "Failed to continue process";
+        break;
+      }
+
+      int status = 0;
+      if (waitpid(pid, &status, 0) != pid) {
+        result.error_message = "waitpid failed";
+        break;
+      }
+      if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
+        result.error_message = "Unexpected stop signal";
+        break;
+      }
+
+      iov.iov_base = &regs;
+      iov.iov_len = sizeof(regs);
+      if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+        result.error_message = "Failed to read result registers";
+        break;
+      }
+      result.return_value = regs.regs[0];
+      result.success = true;
+    } while (false);
+
+    if (have_orig_regs) {
+      iov.iov_base = &orig_regs;
+      iov.iov_len = sizeof(orig_regs);
+      ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
     }
-
-    uint64_t pc = regs.pc;
-    uint32_t orig_inst;
-    ProcessTracer::read_memory(pid, pc, &orig_inst, 4);
-
-    uint64_t stub_addr = FunctionHooker::allocate_remote(pid, 32);
-    if (stub_addr == 0) {
-      result.error_message = "Failed to allocate stub";
-      ProcessTracer::detach(pid);
-      return result;
-    }
-
-    uint32_t stub_code[] = {
-        0x58000049,
-        0xD63F0120,
-        0xD4200000,
-        0x00000000,
-    };
-    ProcessTracer::write_memory(pid, stub_addr, stub_code, 16);
-    ProcessTracer::write_memory(pid, stub_addr + 16, &func_addr, 8);
-
-    regs.regs[30] = stub_addr + 8;
-    regs.pc = stub_addr;
-
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-
-    int status;
-    waitpid(pid, &status, 0);
-
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    result.return_value = regs.regs[0];
-    result.success = true;
-
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    FunctionHooker::free_remote(pid, stub_addr, 32);
+    if (stub_addr != 0)
+      FunctionHooker::free_remote(pid, stub_addr, 32);
   } else {
-    user_regs_struct_32 orig_regs, regs;
+    user_regs_struct_32 orig_regs{}, regs{};
     struct iovec iov = {&orig_regs, sizeof(orig_regs)};
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
-      result.error_message = "Failed to get registers";
-      ProcessTracer::detach(pid);
-      return result;
-    }
-    regs = orig_regs;
+    uint64_t stub_addr = 0;
+    bool have_orig_regs = false;
 
-    for (size_t i = 0; i < args.size() && i < 4; i++) {
-      regs.regs[i] = (uint32_t)args[i];
-    }
-
-    if (args.size() > 4) {
-      size_t stack_args = args.size() - 4;
-      regs.regs[13] -= stack_args * 4;
-      regs.regs[13] &= ~0x7;
-      for (size_t i = 4; i < args.size(); i++) {
-        uint32_t val = (uint32_t)args[i];
-        ProcessTracer::write_memory(pid, regs.regs[13] + (i - 4) * 4, &val, 4);
+    do {
+      if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+        result.error_message = "Failed to get registers";
+        break;
       }
+      have_orig_regs = true;
+      regs = orig_regs;
+
+      for (size_t i = 0; i < args.size() && i < 4; i++) {
+        regs.regs[i] = static_cast<uint32_t>(args[i]);
+      }
+
+      if (args.size() > 4) {
+        size_t stack_args = args.size() - 4;
+        regs.regs[13] -= stack_args * 4;
+        regs.regs[13] &= ~0x7;
+        for (size_t i = 4; i < args.size(); i++) {
+          uint32_t val = static_cast<uint32_t>(args[i]);
+          if (!ProcessTracer::write_memory(pid, regs.regs[13] + (i - 4) * 4,
+                                           &val, 4)) {
+            result.error_message = "Failed to write stack args";
+            break;
+          }
+        }
+        if (!result.error_message.empty())
+          break;
+      }
+
+      stub_addr = FunctionHooker::allocate_remote(pid, 16);
+      if (stub_addr == 0) {
+        result.error_message = "Failed to allocate stub";
+        break;
+      }
+
+      uint32_t stub_code[] = {
+          0xE59FC004,
+          0xE12FFF3C,
+          0xE1200070,
+          static_cast<uint32_t>(func_addr),
+      };
+      if (!ProcessTracer::write_memory(pid, stub_addr, stub_code,
+                                       sizeof(stub_code))) {
+        result.error_message = "Failed to write stub";
+        break;
+      }
+
+      regs.regs[14] = static_cast<uint32_t>(stub_addr + 8);
+      regs.regs[15] = static_cast<uint32_t>(stub_addr);
+
+      iov.iov_base = &regs;
+      iov.iov_len = sizeof(regs);
+      if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+        result.error_message = "Failed to set registers";
+        break;
+      }
+      if (ptrace(PTRACE_CONT, pid, nullptr, nullptr) < 0) {
+        result.error_message = "Failed to continue process";
+        break;
+      }
+
+      int status = 0;
+      if (waitpid(pid, &status, 0) != pid) {
+        result.error_message = "waitpid failed";
+        break;
+      }
+      if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
+        result.error_message = "Unexpected stop signal";
+        break;
+      }
+
+      iov.iov_base = &regs;
+      iov.iov_len = sizeof(regs);
+      if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
+        result.error_message = "Failed to read result registers";
+        break;
+      }
+      result.return_value = regs.regs[0];
+      result.success = true;
+    } while (false);
+
+    if (have_orig_regs) {
+      iov.iov_base = &orig_regs;
+      iov.iov_len = sizeof(orig_regs);
+      ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
     }
-
-    uint64_t stub_addr = FunctionHooker::allocate_remote(pid, 16);
-    if (stub_addr == 0) {
-      result.error_message = "Failed to allocate stub";
-      ProcessTracer::detach(pid);
-      return result;
-    }
-
-    uint32_t stub_code[] = {
-        0xE59FC004,
-        0xE12FFF3C,
-        0xE1200070,
-        (uint32_t)func_addr,
-    };
-    ProcessTracer::write_memory(pid, stub_addr, stub_code, 16);
-
-    regs.regs[14] = (uint32_t)(stub_addr + 8);
-    regs.regs[15] = (uint32_t)stub_addr;
-
-    iov.iov_base = &regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-
-    int status;
-    waitpid(pid, &status, 0);
-
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-    result.return_value = regs.regs[0];
-    result.success = true;
-
-    iov.iov_base = &orig_regs;
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-    FunctionHooker::free_remote(pid, stub_addr, 16);
+    if (stub_addr != 0)
+      FunctionHooker::free_remote(pid, stub_addr, 16);
   }
 
   ProcessTracer::detach(pid);
@@ -1577,17 +1814,27 @@ uint64_t MemoryInjector::remote_dlopen(int pid, const std::string &path,
   if (dlopen_addr == 0)
     return 0;
 
-  size_t path_len = path.size() + 1;
-  uint64_t path_addr = FunctionHooker::allocate_remote(pid, path_len);
-  if (path_addr == 0)
+  if (!ProcessTracer::attach(pid))
     return 0;
 
-  ProcessTracer::write_memory(pid, path_addr, path.c_str(), path_len);
+  size_t path_len = path.size() + 1;
+  uint64_t path_addr = FunctionHooker::allocate_remote(pid, path_len);
+  if (path_addr == 0) {
+    ProcessTracer::detach(pid);
+    return 0;
+  }
+
+  if (!ProcessTracer::write_memory(pid, path_addr, path.c_str(), path_len)) {
+    FunctionHooker::free_remote(pid, path_addr, path_len);
+    ProcessTracer::detach(pid);
+    return 0;
+  }
 
   std::vector<uint64_t> args = {path_addr, (uint64_t)flags};
   auto result = call_remote(pid, dlopen_addr, args);
 
   FunctionHooker::free_remote(pid, path_addr, path_len);
+  ProcessTracer::detach(pid);
 
   return result.success ? result.return_value : 0;
 }
@@ -1602,17 +1849,27 @@ uint64_t MemoryInjector::remote_dlsym(int pid, uint64_t handle,
   if (dlsym_addr == 0)
     return 0;
 
-  size_t sym_len = symbol.size() + 1;
-  uint64_t sym_addr = FunctionHooker::allocate_remote(pid, sym_len);
-  if (sym_addr == 0)
+  if (!ProcessTracer::attach(pid))
     return 0;
 
-  ProcessTracer::write_memory(pid, sym_addr, symbol.c_str(), sym_len);
+  size_t sym_len = symbol.size() + 1;
+  uint64_t sym_addr = FunctionHooker::allocate_remote(pid, sym_len);
+  if (sym_addr == 0) {
+    ProcessTracer::detach(pid);
+    return 0;
+  }
+
+  if (!ProcessTracer::write_memory(pid, sym_addr, symbol.c_str(), sym_len)) {
+    FunctionHooker::free_remote(pid, sym_addr, sym_len);
+    ProcessTracer::detach(pid);
+    return 0;
+  }
 
   std::vector<uint64_t> args = {handle, sym_addr};
   auto result = call_remote(pid, dlsym_addr, args);
 
   FunctionHooker::free_remote(pid, sym_addr, sym_len);
+  ProcessTracer::detach(pid);
 
   return result.success ? result.return_value : 0;
 }
@@ -2072,11 +2329,17 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
     std::string lib = ProcessTracer::find_library_for_address(lib_ranges, addr);
     if (lib == ctx.self_library)
       return;
+    std::string lib_base = lib;
+    size_t lib_slash = lib_base.rfind('/');
+    if (lib_slash != std::string::npos)
+      lib_base = lib_base.substr(lib_slash + 1);
 
-    if (!config.exclude_libs.empty() && config.exclude_libs.count(lib))
+    if (!config.exclude_libs.empty() &&
+        (config.exclude_libs.count(lib) || config.exclude_libs.count(lib_base)))
       return;
     if (!config.include_only_libs.empty() &&
-        !config.include_only_libs.count(lib))
+        !config.include_only_libs.count(lib) &&
+        !config.include_only_libs.count(lib_base))
       return;
 
     auto code = StaticRelinker::embed_function(pid, addr, 0);
@@ -2430,6 +2693,8 @@ CryptoAnalyzer::scan_for_keys(const std::vector<uint8_t> &data,
 }
 
 static std::map<uint64_t, std::vector<uint8_t>> g_crypto_original_patches;
+static std::map<uint64_t, std::pair<uint64_t, size_t>>
+    g_crypto_hook_allocations;
 
 
 static bool hook_aes_function(int pid, uint64_t *original,
@@ -2449,6 +2714,8 @@ static bool hook_aes_function(int pid, uint64_t *original,
 
   if (original)
     *original = func_addr;
+  if (g_crypto_hook_allocations.count(func_addr))
+    return true;
 
   size_t patch_size = (ProcessTracer::get_arch() == ArchMode::ARM64) ? 16 : 8;
   if (!g_crypto_original_patches.count(func_addr)) {
@@ -2499,8 +2766,13 @@ static bool hook_aes_function(int pid, uint64_t *original,
       return false;
     }
 
-    ProcessTracer::write_memory(pid, hook_addr + hook_code.size() - 8,
-                                &info.trampoline_addr, 8);
+    if (!ProcessTracer::write_memory(pid, hook_addr + hook_code.size() - 8,
+                                     &info.trampoline_addr, 8)) {
+      MemoryInjector::remove_inline_hook(pid, info);
+      FunctionHooker::free_remote(pid, hook_addr, hook_code.size() + 64);
+      return false;
+    }
+    g_crypto_hook_allocations[func_addr] = {hook_addr, hook_code.size() + 64};
   } else {
     std::vector<uint8_t> hook_code;
 
@@ -2533,8 +2805,13 @@ static bool hook_aes_function(int pid, uint64_t *original,
     }
 
     uint32_t tramp = static_cast<uint32_t>(info.trampoline_addr);
-    ProcessTracer::write_memory(pid, hook_addr + hook_code.size() - 4, &tramp,
-                                sizeof(tramp));
+    if (!ProcessTracer::write_memory(pid, hook_addr + hook_code.size() - 4,
+                                     &tramp, sizeof(tramp))) {
+      MemoryInjector::remove_inline_hook(pid, info);
+      FunctionHooker::free_remote(pid, hook_addr, hook_code.size() + 32);
+      return false;
+    }
+    g_crypto_hook_allocations[func_addr] = {hook_addr, hook_code.size() + 32};
   }
 
   return true;
@@ -2560,7 +2837,14 @@ size_t CryptoAnalyzer::restore_aes_hooks(int pid) {
       restored++;
     }
   }
+  for (const auto &kv : g_crypto_hook_allocations) {
+    uint64_t hook_addr = kv.second.first;
+    size_t hook_size = kv.second.second;
+    if (hook_addr != 0 && hook_size != 0)
+      FunctionHooker::free_remote(pid, hook_addr, hook_size);
+  }
   g_crypto_original_patches.clear();
+  g_crypto_hook_allocations.clear();
   return restored;
 }
 
