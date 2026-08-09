@@ -1,0 +1,687 @@
+diff --git a/src/ArchMap.cpp b/src/ArchMap.cpp
+index 764e118..38be03c 100644
+--- a/src/ArchMap.cpp
++++ b/src/ArchMap.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "ArchMap.h"
+ #include <error.hh>
++#include <cstring>
+ #include <map>
+ #include <functional>
+ 
+@@ -89,6 +90,32 @@ class ArchMapper {
+ #define CUSTOM_FLAVOR(lambda) std::function<std::string(RzCore *)>([] lambda)
+ #define CUSTOM_BITS(lambda) std::function<ut64(RzCore *)>([] lambda)
+ 
++static std::string DalvikFlavorFromMagic(RzCore *core)
++{
++	ut8 magic[8] = {};
++	if(!core || !core->io || !rz_io_read_at_mapped(core->io, 0, magic, sizeof(magic)) ||
++		memcmp(magic, "dex\n", 4) != 0 || magic[7] != 0)
++		return "DEX_Base";
++
++	if(magic[4] < '0' || magic[4] > '9' || magic[5] < '0' || magic[5] > '9' ||
++		magic[6] < '0' || magic[6] > '9')
++		return "DEX_Base";
++	const int version = (magic[4] - '0') * 100 + (magic[5] - '0') * 10 + (magic[6] - '0');
++
++	switch(version) {
++	// 035 is shared by KitKat, Lollipop and Marshmallow. The magic cannot
++	// distinguish them; Marshmallow is the compatible superset and recognizes
++	// later valid opcodes which the KitKat language marks unused.
++	case 35: return "Marshmallow";
++	case 37: return "DEX_Nougat";
++	case 38: return "DEX_Oreo";
++	case 39: return "DEX_Pie";
++	case 40: return "DEX_Android10";
++	case 41: return "DEX_Android13";
++	default: return "DEX_Base";
++	}
++}
++
+ // keys = asm.arch values
+ static const std::map<std::string, ArchMapper> arch_map = {
+ 	{ "x86", { "x86", CUSTOM_FLAVOR((RzCore *core) {
+@@ -96,7 +123,9 @@ static const std::map<std::string, ArchMapper> arch_map = {
+ 		   }) } },
+ 
+ 	{ "mips", { "MIPS" } },
+-	{ "dalvik", { "Dalvik" } },
++	{ "dalvik", { "Dalvik", CUSTOM_FLAVOR((RzCore *core) {
++				 return DalvikFlavorFromMagic(core);
++			 }), 32 } },
+ 	{ "6502", { "6502", "default", 16 } },
+ 	{ "8051", { "8051", "default", 16, true } },
+ 	{ "java", { "JVM", "default", bits_mapper_default, true } },
+diff --git a/src/RizinArchitecture.cpp b/src/RizinArchitecture.cpp
+index fd3a146..147045c 100644
+--- a/src/RizinArchitecture.cpp
++++ b/src/RizinArchitecture.cpp
+@@ -11,9 +11,19 @@
+ 
+ #include <funcdata.hh>
+ #include <coreaction.hh>
++#include <cpool.hh>
++#include <inject_sleigh.hh>
++#include <marshal.hh>
+ 
+-#include <iostream>
++#include <rz_analysis.h>
++#include <rz_io.h>
++
++#include <algorithm>
+ #include <cassert>
++#include <iomanip>
++#include <iostream>
++#include <limits>
++#include <sstream>
+ 
+ using namespace ghidra;
+ 
+@@ -31,6 +41,569 @@ static const std::map<std::string, std::string> cc_map = {
+ 		{ "arm16", "__stdcall" } /* not actually __stdcall */
+ };
+ 
++namespace {
++
++constexpr uintb kDexInputRegisterStart = 0x100;
++constexpr uintb kDexVirtualRegisterStart = 0x1000;
++constexpr uintb kDexCodeItemHeaderSize = 16;
++constexpr uintb kDexMaxRegisterWords = 0xffff;
++
++constexpr uintb kDexCpoolMethod = 0;
++constexpr uintb kDexCpoolField = 1;
++constexpr uintb kDexCpoolStaticField = 2;
++constexpr uintb kDexCpoolStaticMethod = 3;
++constexpr uintb kDexCpoolString = 4;
++constexpr uintb kDexCpoolClass = 5;
++constexpr uintb kDexCpoolArrayLength = 6;
++constexpr uintb kDexCpoolSuper = 7;
++constexpr uintb kDexCpoolInstanceOf = 8;
++
++size_t decodeDexMutf8(const vector<uint1> &input, size_t cursor, uint4 &codepoint)
++{
++	const uint1 first = input[cursor];
++	if(first > 0 && first < 0x80) {
++		codepoint = first;
++		return 1;
++	}
++	if(cursor + 1 < input.size() && (first & 0xe0) == 0xc0 &&
++		(input[cursor + 1] & 0xc0) == 0x80) {
++		codepoint = static_cast<uint4>(first & 0x1f) << 6 |
++			static_cast<uint4>(input[cursor + 1] & 0x3f);
++		if(codepoint == 0 || codepoint >= 0x80)
++			return 2;
++		return 0;
++	}
++	if(cursor + 2 < input.size() && (first & 0xf0) == 0xe0 &&
++		(input[cursor + 1] & 0xc0) == 0x80 && (input[cursor + 2] & 0xc0) == 0x80) {
++		codepoint = static_cast<uint4>(first & 0x0f) << 12 |
++			static_cast<uint4>(input[cursor + 1] & 0x3f) << 6 |
++			static_cast<uint4>(input[cursor + 2] & 0x3f);
++		return codepoint >= 0x800 ? 3 : 0;
++	}
++	return 0;
++}
++
++void appendUtf8(vector<uint1> &output, uint4 codepoint)
++{
++	if(codepoint <= 0x7f) {
++		output.push_back(static_cast<uint1>(codepoint));
++	}
++	else if(codepoint <= 0x7ff) {
++		output.push_back(static_cast<uint1>(0xc0 | (codepoint >> 6)));
++		output.push_back(static_cast<uint1>(0x80 | (codepoint & 0x3f)));
++	}
++	else if(codepoint <= 0xffff) {
++		if(codepoint >= 0xd800 && codepoint <= 0xdfff)
++			throw LowlevelError("Unpaired surrogate in Dalvik string");
++		output.push_back(static_cast<uint1>(0xe0 | (codepoint >> 12)));
++		output.push_back(static_cast<uint1>(0x80 | ((codepoint >> 6) & 0x3f)));
++		output.push_back(static_cast<uint1>(0x80 | (codepoint & 0x3f)));
++	}
++	else if(codepoint <= 0x10ffff) {
++		output.push_back(static_cast<uint1>(0xf0 | (codepoint >> 18)));
++		output.push_back(static_cast<uint1>(0x80 | ((codepoint >> 12) & 0x3f)));
++		output.push_back(static_cast<uint1>(0x80 | ((codepoint >> 6) & 0x3f)));
++		output.push_back(static_cast<uint1>(0x80 | (codepoint & 0x3f)));
++	}
++	else {
++		throw LowlevelError("Invalid Unicode code point in Dalvik string");
++	}
++}
++
++class RizinDalvikConstantPool final : public ConstantPool
++{
++	private:
++		struct RecordDescription {
++			string tag;
++			string token;
++			vector<uint1> bytes;
++			Datatype *type = nullptr;
++			bool hasBytes = false;
++		};
++
++		RizinArchitecture *const arch;
++		mutable ConstantPoolInternal cache;
++
++		CPoolRecord *createRecord(const vector<uintb> &refs) override
++		{
++			throw LowlevelError("Dalvik constant-pool records must be created through the resolver");
++		}
++
++		Datatype *pointerTo(Datatype *type) const
++		{
++			AddrSpace *space = arch->getDefaultCodeSpace();
++			if(space == nullptr || type == nullptr)
++				throw LowlevelError("Unable to construct a Dalvik pointer type");
++			return arch->types->getTypePointer(space->getAddrSize(), type, space->getWordSize());
++		}
++
++		static string normalizedClassName(const string &descriptor)
++		{
++			if(descriptor.size() < 3 || descriptor.front() != 'L' || descriptor.back() != ';')
++				return string();
++			string name = descriptor.substr(1, descriptor.size() - 2);
++			std::replace(name.begin(), name.end(), '/', '.');
++			return name;
++		}
++
++		static string simpleClassName(const string &descriptor)
++		{
++			string name = normalizedClassName(descriptor);
++			const size_t separator = name.find_last_of('.');
++			if(separator != string::npos)
++				name.erase(0, separator + 1);
++			return name;
++		}
++
++		Datatype *parseType(const string &descriptor, size_t &cursor, bool allowVoid) const
++		{
++			if(cursor >= descriptor.size())
++				throw LowlevelError("Truncated Dalvik type descriptor");
++
++			const char code = descriptor[cursor++];
++			switch(code) {
++			case 'B': return arch->types->getBase(1, TYPE_INT);
++			case 'C': return arch->types->getBase(2, TYPE_UINT);
++			case 'D': return arch->types->getBase(8, TYPE_FLOAT);
++			case 'F': return arch->types->getBase(4, TYPE_FLOAT);
++			case 'I': return arch->types->getBase(4, TYPE_INT);
++			case 'J': return arch->types->getBase(8, TYPE_INT);
++			case 'S': return arch->types->getBase(2, TYPE_INT);
++			case 'Z': return arch->types->getBase(1, TYPE_BOOL);
++			case 'V':
++				if(!allowVoid)
++					throw LowlevelError("Void is not valid at this Dalvik descriptor position");
++				return arch->types->getTypeVoid();
++			case 'L': {
++				const size_t end = descriptor.find(';', cursor);
++				if(end == string::npos || end == cursor)
++					throw LowlevelError("Invalid Dalvik class descriptor");
++				string name = descriptor.substr(cursor, end - cursor);
++				std::replace(name.begin(), name.end(), '/', '.');
++				cursor = end + 1;
++				return pointerTo(arch->types->getTypeStruct(name));
++			}
++			case '[':
++				return pointerTo(parseType(descriptor, cursor, false));
++			default:
++				throw LowlevelError("Unsupported Dalvik type descriptor");
++			}
++		}
++
++		Datatype *parseCompleteType(const string &descriptor, bool allowVoid = false) const
++		{
++			size_t cursor = 0;
++			Datatype *type = parseType(descriptor, cursor, allowVoid);
++			if(cursor != descriptor.size())
++				throw LowlevelError("Trailing data in Dalvik type descriptor: " + descriptor);
++			return type;
++		}
++
++		static int checkedIndex(uintb index)
++		{
++			if(index > static_cast<uintb>(std::numeric_limits<int>::max()))
++				throw LowlevelError("Dalvik constant-pool index is out of range");
++			return static_cast<int>(index);
++		}
++
++		string resolveName(int kind, uintb index) const
++		{
++			char *raw = nullptr;
++			{
++				RzCoreLock core(arch->getCore());
++				RzBinBind *bin = rz_analysis_get_bin_bind(core->analysis);
++				if(bin != nullptr && bin->bin != nullptr && bin->get_name != nullptr)
++					raw = bin->get_name(bin->bin, kind, checkedIndex(index));
++			}
++			if(raw == nullptr)
++				throw LowlevelError("Unable to resolve Dalvik constant-pool index " + std::to_string(index));
++			string result(raw);
++			rz_mem_free(raw);
++			return result;
++		}
++
++		vector<uint1> resolveString(uintb index) const
++		{
++			vector<uint1> encoded;
++			uintb utf16Length = 0;
++			{
++				RzCoreLock core(arch->getCore());
++				RzBinBind *bin = rz_analysis_get_bin_bind(core->analysis);
++				const ut64 offset = bin != nullptr && bin->bin != nullptr && bin->get_offset != nullptr
++					? bin->get_offset(bin->bin, 's', checkedIndex(index)) : UT64_MAX;
++				if(offset == UT64_MAX)
++					throw LowlevelError("Unable to locate Dalvik string index " + std::to_string(index));
++
++				size_t prefixLength = 0;
++				bool lengthTerminated = false;
++				for(; prefixLength < 5; ++prefixLength) {
++					uint1 byte = 0;
++					if(!rz_io_read_at_mapped(core->io, offset + prefixLength, &byte, 1))
++						throw LowlevelError("Unable to read Dalvik string length");
++					if(prefixLength == 4 && (byte & 0xf0) != 0)
++						throw LowlevelError("Dalvik string length exceeds ULEB128-32");
++					utf16Length |= static_cast<uintb>(byte & 0x7f) << (7 * prefixLength);
++					if((byte & 0x80) == 0) {
++						++prefixLength;
++						lengthTerminated = true;
++						break;
++					}
++				}
++				if(!lengthTerminated)
++					throw LowlevelError("Invalid Dalvik string length");
++				if(utf16Length > (std::numeric_limits<size_t>::max() - 1) / 3)
++					throw LowlevelError("Dalvik string is too large");
++
++				const size_t encodedLimit = static_cast<size_t>(utf16Length) * 3 + 1;
++				encoded.reserve(std::min<size_t>(encodedLimit, 4096));
++				bool terminated = false;
++				for(size_t i = 0; i < encodedLimit; ++i) {
++					uint1 byte = 0;
++					if(!rz_io_read_at_mapped(core->io, offset + prefixLength + i, &byte, 1))
++						throw LowlevelError("Unable to read Dalvik string data");
++					if(byte == 0) {
++						terminated = true;
++						break;
++					}
++					encoded.push_back(byte);
++				}
++				if(!terminated)
++					throw LowlevelError("Unterminated Dalvik string data");
++			}
++
++			vector<uint1> utf8;
++			utf8.reserve(encoded.size());
++			uintb decodedUnits = 0;
++			for(size_t cursor = 0; cursor < encoded.size();) {
++				uint4 codepoint = 0;
++				size_t consumed = decodeDexMutf8(encoded, cursor, codepoint);
++				if(consumed == 0)
++					throw LowlevelError("Invalid modified UTF-8 in Dalvik string");
++				cursor += consumed;
++
++				if(codepoint >= 0xd800 && codepoint <= 0xdbff) {
++					if(cursor >= encoded.size())
++						throw LowlevelError("Truncated Dalvik UTF-16 surrogate pair");
++					uint4 low = 0;
++					consumed = decodeDexMutf8(encoded, cursor, low);
++					if(consumed == 0 || low < 0xdc00 || low > 0xdfff)
++						throw LowlevelError("Invalid Dalvik UTF-16 surrogate pair");
++					cursor += consumed;
++					codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
++					decodedUnits += 2;
++				}
++				else {
++					if(codepoint >= 0xdc00 && codepoint <= 0xdfff)
++						throw LowlevelError("Unpaired Dalvik UTF-16 low surrogate");
++					decodedUnits += codepoint > 0xffff ? 2 : 1;
++				}
++
++				appendUtf8(utf8, codepoint);
++			}
++			if(decodedUnits != utf16Length)
++				throw LowlevelError("Dalvik string UTF-16 length mismatch");
++			return utf8;
++		}
++
++		RecordDescription resolveField(uintb index, bool isStatic) const
++		{
++			const string field = resolveName('f', index);
++			const size_t arrow = field.find("->");
++			const size_t separator = field.rfind(' ');
++			if(arrow == string::npos || separator == string::npos || separator <= arrow + 2)
++				throw LowlevelError("Invalid resolved Dalvik field: " + field);
++
++			const string owner = field.substr(0, arrow);
++			const string name = field.substr(arrow + 2, separator - arrow - 2);
++			RecordDescription record;
++			record.tag = "field";
++			record.token = isStatic ? simpleClassName(owner) + '.' + name : name;
++			record.type = pointerTo(parseCompleteType(field.substr(separator + 1)));
++			return record;
++		}
++
++		RecordDescription resolveMethod(uintb index, bool isStatic) const
++		{
++			const string method = resolveName('m', index);
++			const size_t arrow = method.find("->");
++			const size_t open = method.find('(', arrow == string::npos ? 0 : arrow + 2);
++			const size_t close = method.find(')', open == string::npos ? 0 : open + 1);
++			if(arrow == string::npos || open == string::npos || close == string::npos || open <= arrow + 2)
++				throw LowlevelError("Invalid resolved Dalvik method: " + method);
++
++			const string owner = method.substr(0, arrow);
++			const string name = method.substr(arrow + 2, open - arrow - 2);
++			ProtoModel *model = arch->protoModelFromRizinCC("stdcall");
++			if(model == nullptr)
++				throw LowlevelError("Dalvik calling convention is unavailable");
++
++			PrototypePieces pieces = { 0 };
++			pieces.model = model;
++			pieces.name = name;
++			pieces.firstVarArgSlot = -1;
++			if(!isStatic)
++				pieces.intypes.push_back(arch->types->getBase(4, TYPE_UNKNOWN));
++
++			size_t cursor = open + 1;
++			while(cursor < close)
++				pieces.intypes.push_back(parseType(method, cursor, false));
++			if(cursor != close)
++				throw LowlevelError("Invalid argument list in resolved Dalvik method: " + method);
++			cursor = close + 1;
++			pieces.outtype = parseType(method, cursor, true);
++			if(cursor != method.size())
++				throw LowlevelError("Invalid return type in resolved Dalvik method: " + method);
++
++			RecordDescription record;
++			record.tag = "method";
++			record.token = isStatic ? simpleClassName(owner) + '.' + name : name;
++			TypeCode *functionType = arch->types->getTypeCode(pieces);
++			const string typeName = "__dex_method_" + std::to_string(isStatic ? kDexCpoolStaticMethod : kDexCpoolMethod) +
++				'_' + std::to_string(index);
++			Datatype *namedFunctionType = arch->types->getTypedef(functionType, typeName, 0, 0);
++			record.type = pointerTo(namedFunctionType);
++			return record;
++		}
++
++		RecordDescription resolve(const vector<uintb> &refs) const
++		{
++			const uintb index = refs[0];
++			switch(refs[1]) {
++			case kDexCpoolMethod:
++				return resolveMethod(index, false);
++			case kDexCpoolField:
++				return resolveField(index, false);
++			case kDexCpoolStaticField:
++				return resolveField(index, true);
++			case kDexCpoolStaticMethod:
++				return resolveMethod(index, true);
++			case kDexCpoolString: {
++				RecordDescription record;
++				record.tag = "string";
++				record.bytes = resolveString(index);
++				record.hasBytes = true;
++				record.type = pointerTo(arch->types->getBase(1, TYPE_UNKNOWN));
++				return record;
++			}
++			case kDexCpoolClass: {
++				const string descriptor = resolveName('c', index);
++				RecordDescription record;
++				record.tag = "classref";
++				record.type = parseCompleteType(descriptor);
++				record.token = normalizedClassName(descriptor);
++				if(record.token.empty())
++					record.token = record.type->getDisplayName();
++				return record;
++			}
++			case kDexCpoolArrayLength: {
++				RecordDescription record;
++				record.tag = "arraylength";
++				record.token = "length";
++				record.type = arch->types->getBase(4, TYPE_INT);
++				return record;
++			}
++			case kDexCpoolSuper: {
++				RecordDescription record;
++				record.tag = "method";
++				record.token = "super";
++				record.type = arch->types->getBase(4, TYPE_UNKNOWN);
++				return record;
++			}
++			case kDexCpoolInstanceOf: {
++				RecordDescription record;
++				record.tag = "instanceof";
++				record.token = "instanceof";
++				record.type = parseCompleteType(resolveName('c', index));
++				return record;
++			}
++			default:
++				throw LowlevelError("Unsupported Dalvik constant-pool kind " + std::to_string(refs[1]));
++			}
++		}
++
++		const CPoolRecord *cacheRecord(const vector<uintb> &refs, const RecordDescription &record) const
++		{
++			if(record.type == nullptr)
++				throw LowlevelError("Dalvik constant-pool record has no data type");
++
++			std::stringstream stream;
++			PackedEncode encoder(stream);
++			encoder.openElement(ELEM_CPOOLREC);
++			encoder.writeString(ATTRIB_TAG, record.tag);
++			if(record.hasBytes) {
++				encoder.openElement(ELEM_DATA);
++				encoder.writeSignedInteger(ATTRIB_LENGTH, record.bytes.size());
++				std::ostringstream bytes;
++				bytes << std::hex << std::setfill('0');
++				for(uint1 byte : record.bytes)
++					bytes << std::setw(2) << static_cast<unsigned int>(byte) << ' ';
++				encoder.writeString(ATTRIB_CONTENT, bytes.str());
++				encoder.closeElement(ELEM_DATA);
++			}
++			else {
++				encoder.openElement(ELEM_TOKEN);
++				encoder.writeString(ATTRIB_CONTENT, record.token);
++				encoder.closeElement(ELEM_TOKEN);
++			}
++			record.type->encodeRef(encoder);
++			encoder.closeElement(ELEM_CPOOLREC);
++
++			stream.seekg(0);
++			PackedDecode decoder(arch);
++			decoder.ingestStream(stream);
++			return cache.decodeRecord(refs, decoder, *arch->types);
++		}
++
++	public:
++		explicit RizinDalvikConstantPool(RizinArchitecture *arch) : arch(arch) {}
++
++		const CPoolRecord *getRecord(const vector<uintb> &refs) const override
++		{
++			if(refs.size() < 2)
++				throw LowlevelError("Dalvik constant-pool reference has fewer than two indices");
++			const vector<uintb> key { refs[0], refs[1] };
++			const CPoolRecord *record = cache.getRecord(key);
++			if(record == nullptr)
++				record = cacheRecord(key, resolve(key));
++			return record;
++		}
++
++		bool empty() const override { return false; }
++		void clear() override { cache.clear(); }
++		void encode(Encoder &encoder) const override
++		{
++			throw LowlevelError("Dalvik constant pool cannot be encoded as a complete table");
++		}
++		void decode(Decoder &decoder, TypeFactory &typegrp) override
++		{
++			throw LowlevelError("Dalvik constant pool cannot be replaced from a stream");
++		}
++};
++
++class RizinDalvikParameters final : public InjectPayloadSleigh
++{
++	private:
++		RizinArchitecture *const arch;
++
++	public:
++		RizinDalvikParameters(RizinArchitecture *arch, const string &source, const string &name)
++			: InjectPayloadSleigh(source, name, CALLMECHANISM_TYPE), arch(arch) {}
++
++		void inject(InjectContext &context, PcodeEmit &emit) const override
++		{
++			const uintb method = context.baseaddr.getOffset();
++			if(method < kDexCodeItemHeaderSize)
++				throw LowlevelError("Invalid Dalvik method address for parameter injection");
++
++			uint1 sizes[4] = {};
++			{
++				RzCoreLock core(arch->getCore());
++				if(!rz_io_read_at_mapped(core->io, method - kDexCodeItemHeaderSize, sizes, sizeof(sizes)))
++					throw LowlevelError("Unable to read Dalvik code_item header for parameter injection");
++			}
++
++			const uintb registersSize = static_cast<uintb>(sizes[0]) |
++				(static_cast<uintb>(sizes[1]) << 8);
++			const uintb incomingSize = static_cast<uintb>(sizes[2]) |
++				(static_cast<uintb>(sizes[3]) << 8);
++			if(registersSize > kDexMaxRegisterWords || incomingSize > registersSize)
++				throw LowlevelError("Invalid Dalvik code_item register sizes");
++
++			AddrSpace *registerSpace = context.glb->getSpaceByName("register");
++			if(registerSpace == nullptr)
++				throw LowlevelError("Dalvik register address space is unavailable");
++
++			uintb source = kDexInputRegisterStart;
++			uintb destination = kDexVirtualRegisterStart + 4 * (registersSize - incomingSize);
++			for(uintb i = 0; i < incomingSize; ++i) {
++				VarnodeData input { registerSpace, source, 4 };
++				VarnodeData output { registerSpace, destination, 4 };
++				emit.dump(context.baseaddr, CPUI_COPY, &output, &input, 1);
++				source += 4;
++				destination += 4;
++			}
++		}
++
++		void printTemplate(ostream &stream) const override { stream << "dynamic Dalvik parameters"; }
++};
++
++class RizinDalvikRange final : public InjectPayloadCallother
++{
++	public:
++		explicit RizinDalvikRange(const string &source) : InjectPayloadCallother(source) {}
++
++		void inject(InjectContext &context, PcodeEmit &emit) const override
++		{
++			if(context.inputlist.size() != 2)
++				throw LowlevelError("moveRangeToIV requires exactly two inputs");
++
++			AddrSpace *registerSpace = context.glb->getSpaceByName("register");
++			if(registerSpace == nullptr || context.inputlist[0].space != context.glb->getConstantSpace() ||
++				context.inputlist[1].space != registerSpace)
++				throw LowlevelError("moveRangeToIV received invalid input address spaces");
++
++			const uintb count = context.inputlist[0].offset;
++			if(count > 0xff)
++				throw LowlevelError("moveRangeToIV register count is out of range");
++
++			uintb source = context.inputlist[1].offset;
++			uintb destination = kDexInputRegisterStart;
++			for(uintb i = 0; i < count; ++i) {
++				VarnodeData input { registerSpace, source, 4 };
++				VarnodeData output { registerSpace, destination, 4 };
++				emit.dump(context.baseaddr, CPUI_COPY, &output, &input, 1);
++				source += 4;
++				destination += 4;
++			}
++		}
++
++		void printTemplate(ostream &stream) const override { stream << "dynamic Dalvik register range"; }
++};
++
++class RizinDalvikInjectLibrary final : public PcodeInjectLibrarySleigh
++{
++	private:
++		RizinArchitecture *const arch;
++
++	protected:
++		int4 allocateInject(const string &sourceName, const string &name, int4 type) override
++		{
++			if(type == InjectPayload::CALLMECHANISM_TYPE) {
++				const int4 injectId = injection.size();
++				injection.push_back(new RizinDalvikParameters(arch, sourceName, name));
++				return injectId;
++			}
++			if(type == InjectPayload::CALLOTHERFIXUP_TYPE) {
++				const int4 injectId = injection.size();
++				injection.push_back(new RizinDalvikRange(sourceName));
++				return injectId;
++			}
++			return PcodeInjectLibrarySleigh::allocateInject(sourceName, name, type);
++		}
++
++		void registerInject(int4 injectId) override
++		{
++			InjectPayload *payload = injection.at(injectId);
++			if(dynamic_cast<RizinDalvikParameters *>(payload) != nullptr) {
++				registerCallMechanism(payload->getName(), injectId);
++				return;
++			}
++			if(dynamic_cast<RizinDalvikRange *>(payload) != nullptr) {
++				if(payload->getName() != "moveRangeToIV")
++					throw LowlevelError("Unsupported dynamic Dalvik callother injection: " + payload->getName());
++				registerCallOtherFixup(payload->getName(), injectId);
++				return;
++			}
++			PcodeInjectLibrarySleigh::registerInject(injectId);
++		}
++
++	public:
++		explicit RizinDalvikInjectLibrary(RizinArchitecture *arch)
++			: PcodeInjectLibrarySleigh(arch), arch(arch) {}
++};
++
++} // namespace
++
+ std::string FilenameFromCore(RzCore *core)
+ {
+ 	if(core && core->bin && core->bin->file)
+@@ -104,6 +677,22 @@ Translate *RizinArchitecture::buildTranslator(DocumentStorage &store)
+ 	return ret;
+ }
+ 
++PcodeInjectLibrary *RizinArchitecture::buildPcodeInjectLibrary()
++{
++	if(getTarget().rfind("Dalvik:", 0) == 0)
++		return new RizinDalvikInjectLibrary(this);
++	return SleighArchitecture::buildPcodeInjectLibrary();
++}
++
++void RizinArchitecture::buildConstantPool(DocumentStorage &store)
++{
++	if(getTarget().rfind("Dalvik:", 0) == 0) {
++		cpool = new RizinDalvikConstantPool(this);
++		return;
++	}
++	SleighArchitecture::buildConstantPool(store);
++}
++
+ ContextDatabase *RizinArchitecture::getContextDatabase()
+ {
+ 	return context;
+diff --git a/src/RizinArchitecture.h b/src/RizinArchitecture.h
+index 6bd0b73..c3ef46b 100644
+--- a/src/RizinArchitecture.h
++++ b/src/RizinArchitecture.h
+@@ -43,6 +43,8 @@ class RizinArchitecture : public ghidra::SleighArchitecture
+ 
+ 	protected:
+ 		ghidra::Translate *buildTranslator(ghidra::DocumentStorage &store) override;
++		ghidra::PcodeInjectLibrary *buildPcodeInjectLibrary() override;
++		void buildConstantPool(ghidra::DocumentStorage &store) override;
+ 		void buildLoader(ghidra::DocumentStorage &store) override;
+ 		ghidra::Scope *buildDatabase(ghidra::DocumentStorage &store) override;
+ 		void buildTypegrp(ghidra::DocumentStorage &store) override;

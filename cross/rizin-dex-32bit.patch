@@ -1,0 +1,23 @@
+diff --git a/librz/bin/format/dex/dex.h b/librz/bin/format/dex/dex.h
+index d88f469f2..d436a2335 100644
+--- a/librz/bin/format/dex/dex.h
++++ b/librz/bin/format/dex/dex.h
+@@ -10,8 +10,16 @@
+ #include <rz_bin.h>
+ 
+ #define RZ_DEX_RELOC_TARGETS "reloc-targets"
+-#define RZ_DEX_VIRT_ADDRESS  0x0100000000
+-#define RZ_DEX_RELOC_ADDRESS 0x8000000000
++/*
++ * Dalvik Sleigh uses a 32-bit RAM space.  The old synthetic bases were above
++ * 4 GiB, so rz-ghidra wrapped every concrete method address and rejected the
++ * resulting function symbol as extending past the address space.  Keep the
++ * file-backed and relocation windows separate but representable by Dalvik.
++ * Hayabusa accepts DEX images up to 256 MiB, leaving a full 256 MiB gap before
++ * the relocation window.
++ */
++#define RZ_DEX_VIRT_ADDRESS  0x20000000
++#define RZ_DEX_RELOC_ADDRESS 0x40000000
+ 
+ typedef enum {
+ 	DEX_MAP_ITEM_TYPE_HEADER_ITEM = 0x0000,

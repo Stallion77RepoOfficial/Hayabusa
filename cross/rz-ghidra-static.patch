@@ -1,0 +1,86 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 19bb6a5..34fe5a6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -82,7 +82,19 @@ set(ANALYSIS_SOURCE
+ 		src/analysis_ghidra.cpp)
+ endif()
+ 
+-add_library(core_ghidra SHARED ${CORE_SOURCE})
++# hayabusa patch: build the rizin plugins as static archives so they can be
++# linked straight into a single binary. The sources already support this -- each
++# plugin guards its `RzLibStruct rizin_plugin` loader shim with `#ifndef
++# CORELIB` and exports the bare plugin struct otherwise -- upstream just never
++# exposes a switch for it.
++if(RZ_GHIDRA_STATIC)
++	set(RZ_GHIDRA_LIBTYPE STATIC)
++	add_compile_definitions(CORELIB)
++else()
++	set(RZ_GHIDRA_LIBTYPE SHARED)
++endif()
++
++add_library(core_ghidra ${RZ_GHIDRA_LIBTYPE} ${CORE_SOURCE})
+ target_link_libraries(core_ghidra ghidra_libdecomp)
+ target_link_libraries(core_ghidra pugixml)
+ target_link_libraries(core_ghidra Rizin::Core)
+@@ -107,7 +119,7 @@ else()
+ endif()
+ 
+ if(BUILD_SLEIGH_PLUGIN)
+-add_library(asm_ghidra SHARED ${ASM_SOURCE})
++add_library(asm_ghidra ${RZ_GHIDRA_LIBTYPE} ${ASM_SOURCE})
+ target_link_libraries(asm_ghidra core_ghidra)
+ set_target_properties(asm_ghidra PROPERTIES
+ 		OUTPUT_NAME asm_ghidra
+@@ -115,7 +127,7 @@ set_target_properties(asm_ghidra PROPERTIES
+ 		INSTALL_RPATH "${LD_RPATH_STR}"
+ 		PREFIX "")
+ 
+-add_library(analysis_ghidra SHARED ${ANALYSIS_SOURCE})
++add_library(analysis_ghidra ${RZ_GHIDRA_LIBTYPE} ${ANALYSIS_SOURCE})
+ target_link_libraries(analysis_ghidra core_ghidra)
+ set_target_properties(analysis_ghidra PROPERTIES
+ 		OUTPUT_NAME analysis_ghidra
+diff --git a/ghidra/CMakeLists.txt b/ghidra/CMakeLists.txt
+index c4f50bc..2a29a87 100644
+--- a/ghidra/CMakeLists.txt
++++ b/ghidra/CMakeLists.txt
+@@ -254,10 +254,34 @@ target_link_libraries(sleighc ghidra_sleigh)
+ target_include_directories(sleighc PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/flex")
+ 
+ if(BUILD_SLASPECS)
+-	file(GLOB_RECURSE SLASPEC_FILES "ghidra/Ghidra/Processors/*.slaspec")
+-	file(GLOB_RECURSE CPEC_FILES "ghidra/Ghidra/Processors/*.cspec")
+-	file(GLOB_RECURSE LDEFS_FILES "ghidra/Ghidra/Processors/*.ldefs")
+-	file(GLOB_RECURSE PSPEC_FILES "ghidra/Ghidra/Processors/*.pspec")
++	# hayabusa patch: SLASPEC_PROCESSORS restricts the build to one processor
++	# directory. Upstream compiles all ~40 of Ghidra's architectures, which is
++	# many minutes of sleighc and hundreds of megabytes we would then have to
++	# embed. Empty (the default) keeps upstream's behaviour.
++	if(SLASPEC_PROCESSORS)
++		set(SLASPEC_FILES "")
++		set(CPEC_FILES "")
++		set(LDEFS_FILES "")
++		set(PSPEC_FILES "")
++		foreach(proc ${SLASPEC_PROCESSORS})
++			file(GLOB_RECURSE _sla "ghidra/Ghidra/Processors/${proc}/*.slaspec")
++			file(GLOB_RECURSE _cspec "ghidra/Ghidra/Processors/${proc}/*.cspec")
++			file(GLOB_RECURSE _ldefs "ghidra/Ghidra/Processors/${proc}/*.ldefs")
++			file(GLOB_RECURSE _pspec "ghidra/Ghidra/Processors/${proc}/*.pspec")
++			list(APPEND SLASPEC_FILES ${_sla})
++			list(APPEND CPEC_FILES ${_cspec})
++			list(APPEND LDEFS_FILES ${_ldefs})
++			list(APPEND PSPEC_FILES ${_pspec})
++		endforeach()
++		if(NOT SLASPEC_FILES)
++			message(FATAL_ERROR "SLASPEC_PROCESSORS matched no .slaspec files: ${SLASPEC_PROCESSORS}")
++		endif()
++	else()
++		file(GLOB_RECURSE SLASPEC_FILES "ghidra/Ghidra/Processors/*.slaspec")
++		file(GLOB_RECURSE CPEC_FILES "ghidra/Ghidra/Processors/*.cspec")
++		file(GLOB_RECURSE LDEFS_FILES "ghidra/Ghidra/Processors/*.ldefs")
++		file(GLOB_RECURSE PSPEC_FILES "ghidra/Ghidra/Processors/*.pspec")
++	endif()
+ 	set(SLAFILES "")
+ 	set(SLEIGH_BASE "${CMAKE_CURRENT_BINARY_DIR}/sleigh")
+ 	file(MAKE_DIRECTORY "${SLEIGH_BASE}")

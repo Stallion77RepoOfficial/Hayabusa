@@ -1,0 +1,17 @@
+<?xml version="1.1" encoding="UTF-8"?>
+<language_definitions>
+  <language processor="AARCH64"
+            endian="little"
+            size="64"
+            variant="v8A"
+            version="1.6"
+            slafile="AARCH64.sla"
+            processorspec="AARCH64.pspec"
+            id="AARCH64:LE:64:v8A">
+    <description>Android AArch64 little-endian 64-bit</description>
+    <compiler name="default" spec="AARCH64.cspec" id="default"/>
+    <external_name tool="gnu" name="aarch64"/>
+    <external_name tool="qemu" name="qemu-aarch64"/>
+    <external_name tool="qemu_system" name="qemu-system-aarch64"/>
+  </language>
+</language_definitions>
