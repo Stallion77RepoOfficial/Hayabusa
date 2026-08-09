@@ -228,7 +228,8 @@ public:
                               const std::vector<uint8_t> &data, size_t min_len);
   static size_t write_rtti(std::ostream &out, const std::vector<uint8_t> &data,
                            uint64_t base_addr,
-                           const std::vector<ElfSymbol> &vtables);
+                           const std::vector<ElfSymbol> &vtables,
+                           size_t max_results);
 
   struct PltEntry {
     uint64_t offset;
@@ -349,6 +350,7 @@ public:
                         uint64_t base_addr = 0,
                         size_t max_strings = 100000,
                         size_t max_xrefs = 100000,
+                        size_t max_string_bytes = 16U * 1024U * 1024U,
                         bool *truncated = nullptr);
 
   static std::vector<DecryptResult>

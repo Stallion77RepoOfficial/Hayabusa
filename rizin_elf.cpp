@@ -103,6 +103,8 @@ ElfParser::recover_struct_layouts(const std::vector<uint8_t> &data,
     return out;
 
   for (const auto &cls : img->rtti_classes()) {
+    if (img->budget_exhausted())
+      break;
     if (cls.vfuncs.empty())
       continue;
 
@@ -111,6 +113,8 @@ ElfParser::recover_struct_layouts(const std::vector<uint8_t> &data,
     // methods is a much better picture of the layout than any single one.
     std::map<uint64_t, FieldAccess> merged;
     for (uint64_t fn : cls.vfuncs) {
+      if (img->budget_exhausted())
+        break;
       for (const auto &fa : img->field_accesses(fn)) {
         FieldAccess &slot = merged[fa.offset];
         slot.offset = fa.offset;
@@ -229,6 +233,8 @@ ElfParser::find_encryption_key(const std::vector<uint8_t> &data,
   };
 
   for (uint64_t fn : get_init_array(data)) {
+    if (img->budget_exhausted())
+      break;
     // The entries were relocated by the loader before the image was lifted, so
     // they are live addresses, while rizin holds the module at zero. Emulating
     // at the unadjusted address ran off the end of the image and returned
@@ -279,7 +285,8 @@ ElfParser::find_encryption_key(const std::vector<uint8_t> &data,
 std::map<uint64_t, std::vector<uint64_t>>
 ElfParser::build_string_xref_map(const std::vector<uint8_t> &data,
                                  uint64_t base_addr, size_t max_strings,
-                                 size_t max_xrefs, bool *truncated) {
+                                 size_t max_xrefs, size_t max_string_bytes,
+                                 bool *truncated) {
   (void)base_addr; // map keys are file offsets; sites are ELF virtual addresses
   std::map<uint64_t, std::vector<uint64_t>> out;
   if (truncated)
@@ -289,12 +296,18 @@ ElfParser::build_string_xref_map(const std::vector<uint8_t> &data,
     return out;
   StringScanLimits limits;
   limits.max_results = max_strings;
+  limits.max_retained_bytes = max_string_bytes;
   StringScanStatus string_status;
   auto strings = get_strings(data, 4, limits, &string_status);
   if (string_status.truncated && truncated)
     *truncated = true;
   size_t examined_remaining = std::max(max_strings, max_xrefs);
   for (size_t index = 0; index < strings.size(); index++) {
+    if (img->budget_exhausted()) {
+      if (truncated)
+        *truncated = true;
+      break;
+    }
     const auto &s = strings[index];
     if (max_xrefs == 0 || examined_remaining == 0) {
       if (truncated)
@@ -358,6 +371,8 @@ ElfParser::recover_names(const std::vector<uint8_t> &data, uint64_t base_addr) {
 
   std::set<uint64_t> seen;
   for (uint64_t addr : img->functions()) {
+    if (img->budget_exhausted())
+      break;
     if (!seen.insert(addr).second)
       continue;
     std::string name = img->name_at(addr);
@@ -377,6 +392,8 @@ ElfParser::recover_names(const std::vector<uint8_t> &data, uint64_t base_addr) {
   // Anything reachable through a class vtable gets attributed to its class,
   // which is the binding a reader actually wants out of a stripped image.
   for (const auto &cls : img->rtti_classes()) {
+    if (img->budget_exhausted())
+      break;
     for (size_t i = 0; i < cls.vfuncs.size(); i++) {
       if (!cls.vfuncs[i] || !seen.insert(cls.vfuncs[i]).second)
         continue;

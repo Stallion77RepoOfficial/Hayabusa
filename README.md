@@ -140,26 +140,60 @@ and not be group/other-writable; Hayabusa creates and validates the final
 private anchor itself. Embedded module images are passed to Rizin through
 anonymous `memfd` descriptors, so analysis leaves no per-module temp files.
 
-## Verification suite
+The most important `dump` controls are:
 
-The tier suite is generated from source and checks exact known answers rather
-than accepting non-empty output. It covers a simple symbol-rich SO, a stripped
-crypto/JNI SO, a stripped self-unpacking multi-threaded SO, runtime encrypted
-DEX, named Dalvik containers, malformed inputs, every CLI command/option path,
-and repeated fork/vfork/clone patch-lifecycle races.
+- `--only a.so,b.so`: capture only matching mapped module names/SONAMEs;
+- `--rz-analysis off|basic|full`: parse only, run function analysis, or run the
+  full xref/type pass;
+- `--analysis-timeout N`: one shared per-module budget for the primary Rizin
+  pass and every dependent RTTI/xref/table/emulation/decompilation query;
+  `0` disables this deadline;
+- `--memory-limit N`: aggregate readable anonymous/writable snapshot MiB;
+  `0` removes the policy limit (device storage and addressability still apply);
+- `--image-limit N`: maximum reconstructed module/container MiB; `0` removes
+  the policy limit;
+- `--string-limit N`, `--limit N`, `--listing N`: retained string bytes,
+  records printed per report category, and functions/methods decompiled;
+- `--deobf --deobf-timeout N --deobf-probes N`: enable and budget speculative
+  string deobfuscation;
+- `--relink --relink-limit N --rd N`: enable dependency relinking and set its
+  aggregate MiB and recursion depth;
+- `--require-complete`: return failure if any requested module is absent or a
+  capture/analysis budget makes the result partial.
+
+`extract` accepts `--d N` for dependency depth and `--size-limit N` for the
+aggregate extracted MiB. `scan` streams every eligible mapping in overlapping
+chunks, so large OAT/DEX/SO mappings are not silently skipped because of their
+size.
+
+`raw/name.so` is the exact file-layout view reconstructed from stopped process
+memory. For an uncompressed ELF stored inside an APK, `name.so.disk` is read
+from the exact backing APK inode/entry and includes section metadata that is
+not mapped into memory. `name_fixed.so` combines the runtime image with the
+complete file layout and normalizes loader relocations. A raw image can
+therefore be intentionally section-truncated while `.disk` and `_fixed.so`
+must pass an ELF section/dynamic-symbol reader.
+
+## Verification
+
+This checkout does not currently bundle the old `testbed/tiers` fixture tree,
+so do not treat nonexistent tier commands as evidence. The reproducible checks
+available in this repository are dependency validation, a strict compile, and
+device-side artifact validation:
 
 ```sh
-./testbed/tiers/build.sh
-./testbed/tiers/run_tiers.sh everything
+make check-deps
+make -j2
 
-# Reuse binaries already staged on the device:
-PUSH=0 RACE_ITERS=3 ./testbed/tiers/run_tiers.sh everything
+# After a device dump, validate every rebuilt ELF with the NDK toolchain:
+llvm-readelf -h -S --dyn-syms path/to/module_fixed.so
 ```
 
-The exact fixture contract is in
-[testbed/tiers/ground_truth.txt](testbed/tiers/ground_truth.txt). A full
-reference run on an Android API 36 AArch64 emulator prints the exact assertion
-total and persists every evidence gate under `testbed/tiers/results/`.
+For a real application, also verify that the target PID survives capture, every
+requested mapped module has raw/disk/fixed artifacts, every `_fixed.so` passes
+the command above without diagnostics, missing `--only` names are explicitly
+reported, and the final status says either `COMPLETE` or `PARTIAL RESULT` rather
+than inferring success from non-empty files.
 
 ## Honest limits
 
@@ -178,6 +212,11 @@ total and persists every evidence gate under `testbed/tiers/results/`.
 - Static analysis and decompilation remain bounded heuristics. Virtualization,
   control-flow flattening, opaque predicates, JIT-only code, anti-debug logic,
   and very short plaintext lifetimes can require target-specific work.
+- A whole-process anonymous snapshot can be several GiB even when the selected
+  libraries are small. Reaching `--memory-limit` does not invalidate the exact
+  selected-module ELF capture, but it does make the overall process snapshot
+  partial. Raise the limit only after checking free device storage, or use
+  `--require-complete` when partial results are unacceptable.
 - `hook`, `stub`, and `extract` resolve named functions in mapped `.so` files;
   stripped private routines first need an address-aware workflow or analysis
   result rather than a nonexistent symbol name.
@@ -188,6 +227,5 @@ total and persists every evidence gate under `testbed/tiers/results/`.
   In particular, a deliberately hostile root `--launch-cmd` payload remains
   outside its trust guarantee; use `--launch` for untrusted executables.
 
-Passing the suite proves the documented fixture contracts on the tested
-environment. It is strong regression evidence, not a proof that every Android
-binary or adversarial schedule is handled.
+Successful compilation and one device run are regression evidence, not proof
+that every Android binary or adversarial schedule is handled.

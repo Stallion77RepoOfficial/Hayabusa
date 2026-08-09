@@ -22,8 +22,22 @@ enum class AnalysisLevel {
   Full,  // rizin `aaa` -- adds data/string cross-references and type matching
 };
 
+// Work limits are policy, not format facts.  Keep them configurable so a
+// large game is not silently analysed with the tiny fixture-oriented budgets
+// that are useful during development.  A zero timeout disables that deadline.
+struct AnalysisLimits {
+  uint32_t module_timeout_seconds = 60;
+  uint32_t table_timeout_seconds = 60;
+  uint64_t pointer_scan_bytes = 2048ull * 1024 * 1024;
+  size_t pointer_slots = 100000;
+  size_t pointer_tables = 100000;
+  size_t analysis_targets = 100000;
+};
+
 // Applies to every Image opened afterwards. Set once at startup.
 void set_analysis_level(AnalysisLevel level);
+AnalysisLevel analysis_level();
+void set_analysis_limits(const AnalysisLimits &limits);
 
 // Directory used only for the content-addressed embedded Sleigh cache. The
 // caller supplies a trusted, private directory before opening the first image;
@@ -82,6 +96,9 @@ public:
   // it did not complete. Analysis-backed queries still answer from the partial
   // database, but their results are incomplete rather than "no findings".
   bool analysis_failed() const;
+  // True once the shared per-module deadline has elapsed. The timer starts
+  // with the first analysis pass and covers every later Rizin-backed query.
+  bool budget_exhausted();
 
   // The address the module is mapped at in the target, or 0 when unknown.
   // rizin always holds the image at zero; this is what relocated pointers read

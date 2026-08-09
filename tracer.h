@@ -357,8 +357,9 @@ public:
                                           int pid, uint64_t base_addr,
                                           const RelinkConfig &config);
 
-  static std::vector<uint8_t> extract_function_with_deps(int pid, uint64_t addr,
-                                                         int max_depth = 8);
+  static std::vector<uint8_t>
+  extract_function_with_deps(int pid, uint64_t addr, int max_depth = 8,
+                             size_t max_total_size = 512U * 1024U * 1024U);
 
   static bool patch_relocations(std::vector<uint8_t> &data,
                                 const std::map<uint64_t, uint64_t> &addr_map,

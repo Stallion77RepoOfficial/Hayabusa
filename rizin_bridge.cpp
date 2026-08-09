@@ -354,6 +354,32 @@ void set_analysis_level(AnalysisLevel level) {
   g_level.store(level, std::memory_order_relaxed);
 }
 
+AnalysisLevel analysis_level() {
+  return g_level.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::atomic<uint32_t> g_module_timeout_seconds{60};
+std::atomic<uint32_t> g_table_timeout_seconds{60};
+std::atomic<uint64_t> g_pointer_scan_bytes{2048ull * 1024 * 1024};
+std::atomic<size_t> g_pointer_slots{100000};
+std::atomic<size_t> g_pointer_tables{100000};
+std::atomic<size_t> g_analysis_targets{100000};
+} // namespace
+
+void set_analysis_limits(const AnalysisLimits &limits) {
+  g_module_timeout_seconds.store(limits.module_timeout_seconds,
+                                 std::memory_order_relaxed);
+  g_table_timeout_seconds.store(limits.table_timeout_seconds,
+                                std::memory_order_relaxed);
+  g_pointer_scan_bytes.store(limits.pointer_scan_bytes,
+                             std::memory_order_relaxed);
+  g_pointer_slots.store(limits.pointer_slots, std::memory_order_relaxed);
+  g_pointer_tables.store(limits.pointer_tables, std::memory_order_relaxed);
+  g_analysis_targets.store(limits.analysis_targets,
+                           std::memory_order_relaxed);
+}
+
 void set_scratch_directory(const std::string &directory) {
   if (directory.empty())
     return;
@@ -372,17 +398,45 @@ const std::string &sleigh_home() {
 }
 
 struct Image::Impl {
+  using Clock = std::chrono::steady_clock;
   std::once_flag rtti_once;
   RzCore *core = nullptr;
   uint64_t base = 0;
   AnalysisLevel level = AnalysisLevel::Full;
+  AnalysisLimits limits;
   bool analyzed = false;
   bool analysis_failed = false;
+  bool deadline_started = false;
+  bool deadline_reported = false;
+  Clock::time_point work_deadline = Clock::time_point::max();
   std::map<size_t, std::vector<Image::PointerRun>> function_table_cache;
   std::map<size_t, bool> function_table_truncated_cache;
   std::string decompiler_error;
   int tmp_fd = -1; // anonymous backing memfd held for Rizin's pathname view
   std::string tmp_path;
+
+  void start_deadline() {
+    if (deadline_started)
+      return;
+    deadline_started = true;
+    if (limits.module_timeout_seconds != 0)
+      work_deadline = Clock::now() +
+                      std::chrono::seconds(limits.module_timeout_seconds);
+  }
+
+  uint32_t remaining_seconds() const {
+    if (work_deadline == Clock::time_point::max())
+      return 0;
+    const auto now = Clock::now();
+    if (now >= work_deadline)
+      return 0;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        work_deadline - now);
+    const uint64_t rounded =
+        (static_cast<uint64_t>(remaining.count()) + 999U) / 1000U;
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        std::max<uint64_t>(rounded, 1U), UINT32_MAX));
+  }
 
   ~Impl() {
     if (core)
@@ -406,6 +460,18 @@ std::unique_ptr<Image> Image::open(const std::vector<uint8_t> &data,
   // Snapshot it here so a later global change cannot turn a parse-only image
   // into one that unexpectedly performs RTTI or function recovery.
   img->p->level = g_level.load(std::memory_order_relaxed);
+  img->p->limits.module_timeout_seconds =
+      g_module_timeout_seconds.load(std::memory_order_relaxed);
+  img->p->limits.table_timeout_seconds =
+      g_table_timeout_seconds.load(std::memory_order_relaxed);
+  img->p->limits.pointer_scan_bytes =
+      g_pointer_scan_bytes.load(std::memory_order_relaxed);
+  img->p->limits.pointer_slots =
+      g_pointer_slots.load(std::memory_order_relaxed);
+  img->p->limits.pointer_tables =
+      g_pointer_tables.load(std::memory_order_relaxed);
+  img->p->limits.analysis_targets =
+      g_analysis_targets.load(std::memory_order_relaxed);
 
   // Rizin's construction, plugin registration and file-open path all touch
   // process-wide registries/current-plugin state. Serialising only
@@ -439,7 +505,8 @@ std::unique_ptr<Image> Image::open(const std::vector<uint8_t> &data,
   // analysis routines directly. Keep the config in sync with the explicit
   // non-signal break scope in Image::analyze() below so a hostile module
   // cannot turn one report into an unbounded whole-core analysis pass.
-  rz_config_set_i(img->p->core->config, "analysis.timeout", 5);
+  rz_config_set_i(img->p->core->config, "analysis.timeout",
+                  img->p->limits.module_timeout_seconds);
 
   rz_config_set_i(img->p->core->config, "scr.color", 0);
   rz_config_set_b(img->p->core->config, "scr.interactive", false);
@@ -450,10 +517,12 @@ std::unique_ptr<Image> Image::open(const std::vector<uint8_t> &data,
   // core they interleave into unreadable soup, and hayabusa prints its own
   // progress anyway.
   rz_config_set_b(img->p->core->config, "scr.prompt", false);
-  // Malformed section headers are the normal case for an image lifted out of
-  // memory, so RZ_LOG_WARN fires constantly and says nothing actionable.
-  // Errors still come through.
-  rz_log_set_level(RZ_LOGLVL_ERROR);
+  // Malformed/memory-lifted images routinely have no file entrypoint or a
+  // partial section table. Rizin prints those expected parser diagnostics to
+  // the user's terminal even when the load succeeds. Hayabusa reports every
+  // actionable open/analysis/decompiler failure explicitly below, so suppress
+  // the library's unstructured global log stream.
+  rz_log_set_level(RZ_LOGLVL_NONE);
 
   // The image goes through a temp file rather than rz_io_open_buffer.
   // Opening a bare RzIODesc bypasses RzCore's file bookkeeping, and
@@ -530,6 +599,9 @@ void Image::analyze() {
   // observable analysis side effect despite running no pass.
   if (p->level == AnalysisLevel::None)
     return;
+  p->start_deadline();
+  if (budget_exhausted())
+    return;
 
   // Rizin's normal CLI wrapper installs its own SIGINT handler while applying
   // analysis.timeout. Hayabusa must retain its fatal handler because it may be
@@ -539,7 +611,9 @@ void Image::analyze() {
   RzConsContext *context = cons ? cons->context : nullptr;
   if (context)
     rz_cons_context_break_push(context, nullptr, nullptr, false);
-  rz_cons_break_timeout(5);
+  const uint32_t remaining_seconds = p->remaining_seconds();
+  if (p->work_deadline != Impl::Clock::time_point::max())
+    rz_cons_break_timeout(remaining_seconds);
   switch (p->level) {
   case AnalysisLevel::None:
     break; // handled by the early return above
@@ -568,11 +642,8 @@ void Image::analyze() {
   if (!rz_cons_is_breaked())
     function_tables();
 
-  if (rz_cons_is_breaked()) {
+  if (rz_cons_is_breaked() || budget_exhausted()) {
     p->analysis_failed = true;
-    fprintf(stderr,
-            "[rizin] analysis exceeded its five-second module budget; its "
-            "findings are incomplete\n");
   }
   rz_cons_break_timeout(0);
   if (context)
@@ -639,6 +710,10 @@ std::string Image::decompile(uint64_t addr) {
   }
   analyze();
   p->decompiler_error.clear();
+  if (budget_exhausted()) {
+    p->decompiler_error = "shared analysis deadline exhausted";
+    return {};
+  }
 
   const std::string &home = sleigh_home();
   if (home.empty()) {
@@ -651,7 +726,25 @@ std::string Image::decompile(uint64_t addr) {
   rz_config_set_i(p->core->config, "scr.color", 0);
   rz_config_set_b(p->core->config, "scr.html", false);
 
+  RzCons *cons = rz_cons_singleton();
+  RzConsContext *context = cons ? cons->context : nullptr;
+  if (context)
+    rz_cons_context_break_push(context, nullptr, nullptr, false);
+  const uint32_t remaining = p->remaining_seconds();
+  if (p->work_deadline != Impl::Clock::time_point::max())
+    rz_cons_break_timeout(remaining);
   RzAnnotatedCode *code = rz_ghidra_decompile_annotated_code(p->core, addr);
+  const bool interrupted = rz_cons_is_breaked();
+  rz_cons_break_timeout(0);
+  if (context)
+    rz_cons_context_break_pop(context, false);
+  if (interrupted || budget_exhausted()) {
+    if (code)
+      rz_annotated_code_free(code);
+    p->analysis_failed = true;
+    p->decompiler_error = "shared analysis deadline exhausted";
+    return {};
+  }
   if (!code || !code->code) {
     if (code)
       rz_annotated_code_free(code);
@@ -723,7 +816,26 @@ void Image::adopt_base(uint64_t base) {
 
 uint64_t Image::base() const { return p->base; }
 
-bool Image::analysis_failed() const { return p->analysis_failed; }
+bool Image::analysis_failed() const {
+  (void)const_cast<Image *>(this)->budget_exhausted();
+  return p->analysis_failed;
+}
+
+bool Image::budget_exhausted() {
+  if (!p->deadline_started ||
+      p->work_deadline == Impl::Clock::time_point::max() ||
+      Impl::Clock::now() < p->work_deadline)
+    return false;
+  p->analysis_failed = true;
+  if (!p->deadline_reported) {
+    p->deadline_reported = true;
+    fprintf(stderr,
+            "[rizin] analysis exceeded its shared %u-second module budget; "
+            "remaining findings are incomplete\n",
+            p->limits.module_timeout_seconds);
+  }
+  return true;
+}
 
 const std::string &Image::decompiler_error() const {
   return p->decompiler_error;
@@ -733,6 +845,8 @@ std::vector<uint64_t> Image::functions() {
   if (p->level == AnalysisLevel::None)
     return {};
   analyze();
+  if (budget_exhausted())
+    return {};
   std::vector<uint64_t> out;
   list_for_each<RzAnalysisFunction>(
       rz_analysis_function_list(p->core->analysis),
@@ -759,6 +873,8 @@ std::vector<Call> Image::import_call_sites() {
   if (p->level == AnalysisLevel::None)
     return {};
   analyze();
+  if (budget_exhausted())
+    return {};
   std::vector<Call> out;
   RzBinObject *obj = rz_bin_cur_object(p->core->bin);
   if (!obj)
@@ -769,6 +885,8 @@ std::vector<Call> Image::import_call_sites() {
 
   void **iter = nullptr;
   rz_pvector_foreach(imports, iter) {
+    if (budget_exhausted())
+      break;
     RzBinImport *imp = static_cast<RzBinImport *>(*iter);
     if (!imp || !imp->name)
       continue;
@@ -805,11 +923,29 @@ std::vector<Image::RttiClass> Image::rtti_classes() {
   if (p->level == AnalysisLevel::None)
     return {};
   analyze();
+  if (budget_exhausted())
+    return {};
   // `aaa` recovers the classes but not their vtable addresses; that is a
   // separate pass (rizin's `avrr`). Without it every class came back with no
   // vtable, which is the one field the runtime instance scan needs.
-  std::call_once(p->rtti_once,
-                 [&] { rz_analysis_rtti_recover_all(p->core->analysis); });
+  std::call_once(p->rtti_once, [&] {
+    RzCons *cons = rz_cons_singleton();
+    RzConsContext *context = cons ? cons->context : nullptr;
+    if (context)
+      rz_cons_context_break_push(context, nullptr, nullptr, false);
+    const uint32_t remaining = p->remaining_seconds();
+    if (p->work_deadline != Impl::Clock::time_point::max())
+      rz_cons_break_timeout(remaining);
+    rz_analysis_rtti_recover_all(p->core->analysis);
+    const bool interrupted = rz_cons_is_breaked();
+    rz_cons_break_timeout(0);
+    if (context)
+      rz_cons_context_break_pop(context, false);
+    if (interrupted)
+      p->analysis_failed = true;
+  });
+  if (budget_exhausted() || p->analysis_failed)
+    return {};
   std::vector<RttiClass> out;
   RzBinObject *obj = rz_bin_cur_object(p->core->bin);
   if (!obj)
@@ -820,6 +956,8 @@ std::vector<Image::RttiClass> Image::rtti_classes() {
 
   void **iter = nullptr;
   rz_pvector_foreach(classes, iter) {
+    if (budget_exhausted())
+      break;
     RzBinClass *cls = static_cast<RzBinClass *>(*iter);
     if (!cls || !cls->name)
       continue;
@@ -950,6 +1088,11 @@ std::vector<uint64_t> Image::xrefs_to(uint64_t target, size_t max_results,
     return {};
   }
   analyze();
+  if (budget_exhausted()) {
+    if (truncated)
+      *truncated = true;
+    return {};
+  }
   if (truncated)
     *truncated = p->analysis_failed;
   if (target == UINT64_MAX) {
@@ -963,6 +1106,11 @@ std::vector<uint64_t> Image::xrefs_to(uint64_t target, size_t max_results,
   if (!xrefs)
     return {};
   for (RzListIter *it = xrefs->head; it; it = it->next) {
+    if (budget_exhausted()) {
+      if (truncated)
+        *truncated = true;
+      break;
+    }
     if (examined_remaining && *examined_remaining == 0) {
       if (truncated)
         *truncated = true;
@@ -1072,6 +1220,11 @@ std::vector<Image::PointerRun> Image::function_tables(size_t min_run,
   if (p->level == AnalysisLevel::None)
     return {};
   analyze();
+  if (budget_exhausted()) {
+    if (truncated)
+      *truncated = true;
+    return {};
+  }
   auto cached = p->function_table_cache.find(min_run);
   if (cached != p->function_table_cache.end()) {
     if (truncated)
@@ -1080,12 +1233,14 @@ std::vector<Image::PointerRun> Image::function_tables(size_t min_run,
     return cached->second;
   }
   std::vector<PointerRun> out;
-  constexpr uint64_t kMaxPointerTableScanBytes = 64ull * 1024 * 1024;
   constexpr size_t kPointerTableReadBlockBytes = 256U * 1024U;
   constexpr size_t kDeadlineCheckSlots = 4096;
-  constexpr size_t kMaxPointerTableSlots = 65536;
-  constexpr size_t kMaxPointerTables = 4096;
-  constexpr size_t kMaxAnalysisTargets = 1024;
+  const uint64_t max_scan_bytes = p->limits.pointer_scan_bytes == 0
+                                      ? std::numeric_limits<uint64_t>::max()
+                                      : p->limits.pointer_scan_bytes;
+  const size_t max_slots = p->limits.pointer_slots;
+  const size_t max_tables = p->limits.pointer_tables;
+  const size_t max_targets = p->limits.analysis_targets;
   bool was_truncated = p->analysis_failed;
 
   // A run is accepted on the strength of where the pointers land, not on
@@ -1182,8 +1337,12 @@ std::vector<Image::PointerRun> Image::function_tables(size_t min_run,
   uint64_t scan_work_bytes = 0;
   size_t retained_slots = 0;
   bool stop_scan = false;
-  const auto scan_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  auto scan_deadline = p->work_deadline;
+  if (p->limits.table_timeout_seconds != 0)
+    scan_deadline = std::min(
+        scan_deadline, std::chrono::steady_clock::now() +
+                           std::chrono::seconds(
+                               p->limits.table_timeout_seconds));
   for (const auto &range : merged_ranges) {
     if (stop_scan)
       break;
@@ -1194,16 +1353,16 @@ std::vector<Image::PointerRun> Image::function_tables(size_t min_run,
       // PT_LOAD and PT_GNU_RELRO describe the same bytes, so the same table is
       // reached twice; keep the first sighting.
       if (run >= min_run && seen_runs.insert(run_start).second) {
-        const size_t available = kMaxPointerTableSlots - retained_slots;
+        const size_t available = max_slots - retained_slots;
         const size_t keep = std::min(available, run_targets.size());
-        if (keep != 0 && out.size() < kMaxPointerTables) {
+        if (keep != 0 && out.size() < max_tables) {
           run_targets.resize(keep);
           out.push_back({run_start, keep, run_targets});
           targets.insert(targets.end(), run_targets.begin(), run_targets.end());
           retained_slots += keep;
         }
-        if (keep < run || out.size() >= kMaxPointerTables ||
-            retained_slots >= kMaxPointerTableSlots) {
+        if (keep < run || out.size() >= max_tables ||
+            retained_slots >= max_slots) {
           was_truncated = true;
           stop_scan = true;
         }
@@ -1214,7 +1373,7 @@ std::vector<Image::PointerRun> Image::function_tables(size_t min_run,
 
     uint64_t cursor = range.first;
     while (cursor < range.second && !stop_scan) {
-      if (scan_work_bytes >= kMaxPointerTableScanBytes ||
+      if (scan_work_bytes >= max_scan_bytes ||
           rz_cons_is_breaked() ||
           std::chrono::steady_clock::now() >= scan_deadline) {
         was_truncated = true;
@@ -1224,7 +1383,7 @@ std::vector<Image::PointerRun> Image::function_tables(size_t min_run,
 
       const uint64_t range_remaining = range.second - cursor;
       const uint64_t work_remaining =
-          kMaxPointerTableScanBytes - scan_work_bytes;
+          max_scan_bytes - scan_work_bytes;
       size_t request = static_cast<size_t>(std::min<uint64_t>(
           std::min<uint64_t>(range_remaining, work_remaining),
           read_block.size()));
@@ -1274,7 +1433,7 @@ std::vector<Image::PointerRun> Image::function_tables(size_t min_run,
           run++;
           run_targets.push_back(ptr);
           if (retained_slots + run_targets.size() >=
-              kMaxPointerTableSlots) {
+              max_slots) {
             was_truncated = true;
             stop_scan = true;
           }
@@ -1298,12 +1457,16 @@ std::vector<Image::PointerRun> Image::function_tables(size_t min_run,
   // branches to it. Defining them here is what makes a table-dispatched helper
   // show up in FUNCTIONS and get decompiled.
   std::set<uint64_t> analyzed_targets;
-  const auto analysis_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  auto analysis_deadline = p->work_deadline;
+  if (p->limits.table_timeout_seconds != 0)
+    analysis_deadline = std::min(
+        analysis_deadline, std::chrono::steady_clock::now() +
+                               std::chrono::seconds(
+                                   p->limits.table_timeout_seconds));
   for (uint64_t t : targets) {
     if (!analyzed_targets.insert(t).second)
       continue;
-    if (analyzed_targets.size() > kMaxAnalysisTargets ||
+    if (analyzed_targets.size() > max_targets ||
         rz_cons_is_breaked() ||
         std::chrono::steady_clock::now() >= analysis_deadline) {
       was_truncated = true;
@@ -1327,6 +1490,8 @@ Image::materialised_constants(uint64_t func_addr, size_t max_insns) {
   if (p->level == AnalysisLevel::None)
     return {};
   analyze();
+  if (budget_exhausted())
+    return {};
   std::vector<uint64_t> out;
 
   if (max_insns == 0 ||
@@ -1345,6 +1510,8 @@ Image::materialised_constants(uint64_t func_addr, size_t max_insns) {
   uint64_t pc = func_addr;
   size_t off = 0;
   while (off + 4 <= code.size()) {
+    if (budget_exhausted())
+      break;
     RzAnalysisOp op;
     rz_analysis_op_init(&op);
     int len = rz_analysis_op(p->core->analysis, &op, pc, code.data() + off,
@@ -1406,6 +1573,8 @@ std::vector<Image::RegValue> Image::emulate(uint64_t func_addr,
   if (p->level == AnalysisLevel::None)
     return {};
   analyze();
+  if (budget_exhausted())
+    return {};
   std::vector<RegValue> out;
 
   if (!rz_analysis_il_vm_setup(p->core->analysis)) {
@@ -1427,6 +1596,8 @@ std::vector<Image::RegValue> Image::emulate(uint64_t func_addr,
 
   size_t steps = 0;
   for (; steps < max_steps; steps++) {
+    if (budget_exhausted())
+      break;
     RzAnalysisILStepResult r =
         rz_analysis_il_vm_step(p->core->analysis, vm, nullptr);
     if (r == RZ_ANALYSIS_IL_STEP_RESULT_SUCCESS)
@@ -1465,6 +1636,8 @@ std::vector<Image::FieldAccess> Image::field_accesses(uint64_t func_addr) {
   if (p->level == AnalysisLevel::None)
     return {};
   analyze();
+  if (budget_exhausted())
+    return {};
   std::vector<FieldAccess> out;
   uint64_t size = function_size(func_addr);
   if (!size || size > 1u << 20)
@@ -1481,6 +1654,8 @@ std::vector<Image::FieldAccess> Image::field_accesses(uint64_t func_addr) {
   uint64_t pc = func_addr;
   size_t off = 0;
   while (off + 4 <= code.size()) {
+    if (budget_exhausted())
+      break;
     RzAnalysisOp op;
     rz_analysis_op_init(&op);
     int len = rz_analysis_op(p->core->analysis, &op, pc, code.data() + off,

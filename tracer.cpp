@@ -4077,8 +4077,12 @@ bool StaticRelinker::resolve_symbol(int pid, const std::string &name,
 
 std::vector<uint8_t> StaticRelinker::embed_function(int pid, uint64_t addr,
                                                     size_t max_size) {
-  static constexpr size_t DEFAULT_MAX_FUNC_SIZE = 64 * 1024;
-  size_t read_size = (max_size == 0) ? DEFAULT_MAX_FUNC_SIZE : max_size;
+  // max_size is a policy limit supplied by the relink/extract caller.  With no
+  // explicit value retain a generous standalone API default, but read in small
+  // chunks so ordinary functions do not allocate that complete window.
+  static constexpr size_t kDefaultMaxFunctionSize = 16U * 1024U * 1024U;
+  static constexpr size_t kFunctionReadChunk = 64U * 1024U;
+  size_t read_size = max_size == 0 ? kDefaultMaxFunctionSize : max_size;
 
   // Never read past the end of the mapping the function lives in.
   //
@@ -4098,17 +4102,24 @@ std::vector<uint8_t> StaticRelinker::embed_function(int pid, uint64_t addr,
   if (read_size < 4)
     return {};
 
-  std::vector<uint8_t> func_data(read_size);
-  if (!ProcessTracer::read_memory(pid, addr, func_data.data(), read_size))
-    return {};
-
-  size_t actual_size =
-      InstructionDecoder::find_function_end(func_data.data(), read_size);
-
-  if (actual_size < 4)
-    actual_size = 4;
-
-  func_data.resize(actual_size);
+  std::vector<uint8_t> func_data;
+  func_data.reserve(std::min(read_size, kFunctionReadChunk));
+  for (size_t cursor = 0; cursor < read_size;) {
+    const size_t chunk = std::min(kFunctionReadChunk, read_size - cursor);
+    const size_t old_size = func_data.size();
+    func_data.resize(old_size + chunk);
+    if (!ProcessTracer::read_memory(pid, addr + cursor,
+                                    func_data.data() + old_size, chunk))
+      return {};
+    for (size_t off = old_size; off + 4 <= func_data.size(); off += 4) {
+      if (InstructionDecoder::is_function_end(func_data.data(), off,
+                                              func_data.size())) {
+        func_data.resize(off + 4);
+        return func_data;
+      }
+    }
+    cursor += chunk;
+  }
   return func_data;
 }
 
@@ -5700,7 +5711,7 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
   auto calls = StaticRelinker::find_external_calls(elf_data, base_addr);
 
   const size_t max_size =
-      config.max_total_size > 0 ? config.max_total_size : (64 * 1024 * 1024);
+      config.max_total_size > 0 ? config.max_total_size : (512U * 1024U * 1024U);
 
   size_t align = 16;
   uint64_t embed_offset = result.size();
@@ -5735,7 +5746,8 @@ StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
         !config.include_only_libs.count(lib_base))
       return;
 
-    auto code = StaticRelinker::embed_function(pid, addr, 0);
+    auto code = StaticRelinker::embed_function(pid, addr,
+                                               max_size - result.size());
     if (code.empty() || code.size() < 8)
       return;
 
@@ -5829,12 +5841,14 @@ static void patch_embedded_calls(std::vector<uint8_t> &blob, int pid,
 
 std::vector<uint8_t>
 StaticRelinkerEx::extract_function_with_deps(int pid, uint64_t addr,
-                                             int max_depth) {
+                                             int max_depth,
+                                             size_t max_total_size) {
   if (max_depth < 0)
     max_depth = 0;
 
   const size_t align = 16;
-  const size_t max_total_size = 64 * 1024 * 1024;
+  if (max_total_size == 0)
+    return {};
 
   auto ranges = ProcessTracer::get_library_ranges(pid);
   std::string root_lib = ProcessTracer::find_library_for_address(ranges, addr);
@@ -5863,7 +5877,10 @@ StaticRelinkerEx::extract_function_with_deps(int pid, uint64_t addr,
     if (depth > max_depth)
       continue;
 
-    auto code = StaticRelinker::embed_function(pid, current_addr, 0);
+    if (result.size() >= max_total_size)
+      continue;
+    auto code = StaticRelinker::embed_function(
+        pid, current_addr, max_total_size - result.size());
     if (code.empty() || code.size() < 4) {
       if (current_addr == addr)
         return {};
@@ -5873,7 +5890,8 @@ StaticRelinkerEx::extract_function_with_deps(int pid, uint64_t addr,
     while (result.size() % align)
       result.push_back(0);
 
-    if (result.size() + code.size() > max_total_size) {
+    if (result.size() > max_total_size ||
+        code.size() > max_total_size - result.size()) {
       if (current_addr == addr)
         return {};
       continue;

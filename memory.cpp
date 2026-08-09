@@ -3140,9 +3140,11 @@ ElfParser::find_encrypted_strings(const std::vector<uint8_t> &data,
     return results;
   }
 
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(
-                            std::min<uint64_t>(deadline_ms, 600000));
+  const auto deadline =
+      deadline_ms == 0
+          ? std::chrono::steady_clock::time_point::max()
+          : std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(deadline_ms);
 
   std::set<std::string> seen;
   const size_t MIN_LEN = 12;
@@ -3449,7 +3451,8 @@ ElfParser::get_vtable_functions(const std::vector<uint8_t> &data,
 size_t ElfParser::write_rtti(std::ostream &out,
                              const std::vector<uint8_t> &data,
                              uint64_t base_addr,
-                             const std::vector<ElfSymbol> &vtables) {
+                             const std::vector<ElfSymbol> &vtables,
+                             size_t max_results) {
   if (data.size() < 64 || vtables.empty()) {
     out << "\n=== VTABLE/RTTI (0) ===\n";
     return 0;
@@ -3476,11 +3479,17 @@ size_t ElfParser::write_rtti(std::ostream &out,
   if (valid == 0)
     return 0;
 
+  size_t shown_tables = 0;
+  size_t shown_virtuals = 0;
+  bool virtuals_truncated = false;
   for (size_t i = 0; i < sorted.size(); i++) {
     const auto *s = sorted[i];
     size_t vtable_off = 0;
     if (!vaddr_to_offset(data, s->offset, vtable_off))
       continue;
+    if (shown_tables >= max_results)
+      break;
+    shown_tables++;
 
     uint64_t vtable_addr = base_addr ? base_addr + s->offset : s->offset;
     // Itanium layout: a _ZTV symbol addresses the vtable object, which starts
@@ -3534,11 +3543,22 @@ size_t ElfParser::write_rtti(std::ostream &out,
     if (!virtuals.empty()) {
       out << "  virtuals (" << std::dec << virtuals.size() << "):";
       for (auto fn : virtuals) {
+        if (shown_virtuals >= max_results) {
+          virtuals_truncated = true;
+          break;
+        }
         out << " 0x" << std::hex << fn;
+        shown_virtuals++;
       }
       out << std::dec << "\n";
     }
   }
+
+  if (shown_tables < valid)
+    out << "... (" << (valid - shown_tables)
+        << " vtables suppressed by --limit)\n";
+  if (virtuals_truncated)
+    out << "... (additional virtual slots suppressed by --limit)\n";
 
   return valid;
 }
@@ -3826,7 +3846,9 @@ ElfParser::auto_decrypt_strings(const std::vector<uint8_t> &data,
                                 AutoDecryptStatus *status) {
   std::vector<DecryptResult> results;
   AutoDecryptStatus scan;
-  const size_t input_limit = std::min(data.size(), limits.max_input_bytes);
+  const size_t input_limit = limits.max_input_bytes == 0
+                                 ? data.size()
+                                 : std::min(data.size(), limits.max_input_bytes);
   scan.input_bytes = input_limit;
   scan.input_truncated = input_limit < data.size();
 
@@ -3845,8 +3867,10 @@ ElfParser::auto_decrypt_strings(const std::vector<uint8_t> &data,
       uint64_t{10} * 365U * 24U * 60U * 60U * 1000U;
   const uint64_t deadline_ms =
       std::min<uint64_t>(limits.deadline_ms, kMaxDeadlineMs);
-  const auto deadline = MonotonicClock::now() +
-                        std::chrono::milliseconds(deadline_ms);
+  const auto deadline = deadline_ms == 0
+                            ? MonotonicClock::time_point::max()
+                            : MonotonicClock::now() +
+                                  std::chrono::milliseconds(deadline_ms);
 
   auto should_stop = [&]() {
     if (limits.cancel && limits.cancel->load(std::memory_order_relaxed)) {
@@ -3867,7 +3891,7 @@ ElfParser::auto_decrypt_strings(const std::vector<uint8_t> &data,
   for (size_t i = 0; i <= input_limit - WINDOW;) {
     if (should_stop())
       break;
-    if (scan.probes >= limits.max_probes) {
+    if (limits.max_probes != 0 && scan.probes >= limits.max_probes) {
       scan.probe_limit_reached = true;
       break;
     }
@@ -3891,19 +3915,25 @@ ElfParser::auto_decrypt_strings(const std::vector<uint8_t> &data,
       continue;
     }
 
-    if (scan.candidates >= limits.max_candidates) {
+    if (limits.max_candidates != 0 &&
+        scan.candidates >= limits.max_candidates) {
       scan.candidate_limit_reached = true;
       break;
     }
     ++scan.candidates;
     auto decrypted = try_decrypt(data, i, WINDOW);
     if (!decrypted.empty()) {
-      const size_t remaining = limits.max_results -
-                               std::min(limits.max_results, results.size());
+      const size_t remaining =
+          limits.max_results == 0
+              ? decrypted.size()
+              : limits.max_results -
+                    std::min(limits.max_results, results.size());
       const size_t retain = std::min(remaining, decrypted.size());
       results.insert(results.end(), decrypted.begin(),
                      decrypted.begin() + static_cast<ptrdiff_t>(retain));
-      if (retain < decrypted.size() || results.size() >= limits.max_results) {
+      if (retain < decrypted.size() ||
+          (limits.max_results != 0 &&
+           results.size() >= limits.max_results)) {
         scan.result_limit_reached = true;
         break;
       }
