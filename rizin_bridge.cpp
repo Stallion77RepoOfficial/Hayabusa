@@ -569,10 +569,20 @@ std::unique_ptr<Image> Image::open(const std::vector<uint8_t> &data,
       return false;
     }
     *out_fd = fd;
-    // Rizin's fd:// plugin consumes the already-open descriptor directly.
-    // Routing a memfd back through the ordinary pathname plugin as
-    // /proc/self/fd/N fails on Android even though the same ELF is valid.
-    *out_path = "fd://" + std::to_string(fd);
+    // ELF loads correctly through rizin's fd:// plugin, which consumes the
+    // already-open descriptor directly. The DEX bin parser does not: it seeks
+    // and reads at scattered absolute offsets (string/type/proto/field/method
+    // id tables and every class_data item), and over the fd:// (or malloc://)
+    // io buffer those random-access reads fail, so rz_bin_dex_new returns NULL,
+    // no RzBinObject is built, and every class/method/decompilation is empty.
+    // The identical bytes parse when the same memfd is opened through its
+    // /proc/self/fd/N path, which rizin backs with a seekable file buffer; that
+    // path stays valid for lazy reopens because *out_fd is kept open with the
+    // Image. Route Dalvik there and leave the proven ELF path on fd://.
+    const bool is_dalvik =
+        bytes.size() >= 4 && memcmp(bytes.data(), "dex\n", 4) == 0;
+    *out_path = is_dalvik ? "/proc/self/fd/" + std::to_string(fd)
+                          : "fd://" + std::to_string(fd);
     return true;
   };
 
