@@ -1,12 +1,21 @@
 ANDROID_NDK ?= $(if $(ANDROID_NDK_HOME),$(ANDROID_NDK_HOME),$(ANDROID_NDK_ROOT))
 HOST_OS := $(shell uname -s)
 NDK_HOST_TAG ?= $(if $(filter Darwin,$(HOST_OS)),darwin-x86_64,linux-x86_64)
-NDK ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(NDK_HOST_TAG)/bin
+NDK_ROOT_CANDIDATES := $(wildcard $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(NDK_HOST_TAG) $(ANDROID_NDK)/android-ndk-*/toolchains/llvm/prebuilt/$(NDK_HOST_TAG))
+ifneq ($(word 2,$(NDK_ROOT_CANDIDATES)),)
+$(error multiple Android NDKs found under ANDROID_NDK; point it at one revision)
+endif
+NDK_ROOT := $(firstword $(NDK_ROOT_CANDIDATES))
+NDK ?= $(NDK_ROOT)/bin
 CXX = $(NDK)/aarch64-linux-android36-clang++
 STRIP = $(NDK)/llvm-strip
 TARGET = hayabusa
+TEST_TARGET = hayabusa_tests
 .DEFAULT_GOAL := $(TARGET)
-SOURCES = main.cpp memory.cpp tracer.cpp rizin_bridge.cpp rizin_elf.cpp sleigh_data.cpp
+CORE_SOURCES = memory.cpp tracer.cpp rizin_bridge.cpp rizin_elf.cpp sleigh_data.cpp
+SOURCES = main.cpp $(CORE_SOURCES)
+TEST_SOURCES = tests.cpp $(CORE_SOURCES)
+OWNED_SOURCES = main.cpp memory.cpp tracer.cpp rizin_bridge.cpp rizin_elf.cpp tests.cpp
 HEADERS = memory.h tracer.h rizin_bridge.h sleigh_data.h
 
 # Everything analysis-related is statically linked in: rizin for parsing and
@@ -67,6 +76,14 @@ RZ_LIBS = $(wildcard $(RZ_PREFIX)/lib/*.a)
 
 CXXFLAGS = -O3 -std=c++23 -static-libstdc++ -ffunction-sections \
            -fdata-sections $(RZ_INCLUDES)
+WARNING_FLAGS = -std=c++23 -fsyntax-only -Wall -Wextra -Wpedantic -Werror \
+                -Wformat=2 -Wimplicit-fallthrough -Wno-unused-parameter \
+                -isystem $(RZ_PREFIX)/include/librz \
+                -isystem $(RZ_PREFIX)/include/librz/sdb
+ANALYZE_FLAGS = --analyze -o /dev/null -std=c++23 -Werror \
+                -Wno-unused-command-line-argument \
+                -isystem $(RZ_PREFIX)/include/librz \
+                -isystem $(RZ_PREFIX)/include/librz/sdb
 # rizin's modules and the ghidra archives reference each other both ways, so the
 # whole set goes in one --start-group rather than being ordered by hand.
 LDFLAGS = -Wl,--whole-archive $(RZG_WHOLE) -Wl,--no-whole-archive \
@@ -79,6 +96,40 @@ sleigh_data.cpp: cross/embed_sleigh.py $(SLEIGH_STAMP)
 $(TARGET): $(SOURCES) $(HEADERS) $(RZ_LIBS) $(RZG_LIBS) $(RZG_WHOLE)
 	$(CXX) $(CXXFLAGS) $(SOURCES) $(LDFLAGS) -o $(TARGET)
 	$(STRIP) $(TARGET)
+
+$(TEST_TARGET): $(TEST_SOURCES) $(HEADERS) $(RZ_LIBS) $(RZG_LIBS) $(RZG_WHOLE)
+	$(CXX) $(CXXFLAGS) $(TEST_SOURCES) $(LDFLAGS) -o $(TEST_TARGET)
+
+test-build: $(TEST_TARGET)
+
+warning-check:
+	@for source in $(OWNED_SOURCES); do \
+	  echo "warning-check $$source"; \
+	  $(CXX) $(WARNING_FLAGS) $$source || exit 1; \
+	done
+
+analyze-check:
+	@for source in $(OWNED_SOURCES); do \
+	  echo "analyze-check $$source"; \
+	  $(CXX) $(ANALYZE_FLAGS) $$source || exit 1; \
+	done
+
+verify: check-deps warning-check analyze-check test-build
+
+ADB ?= adb
+DEVICE_TEST_DIR ?= /data/local/tmp/hayabusa-tests
+DEVICE_OUTPUT_ROOT = $(DEVICE_TEST_DIR)/output
+device-test: $(TEST_TARGET) $(TARGET)
+	$(ADB) shell 'mkdir -p $(DEVICE_TEST_DIR) && chmod 700 $(DEVICE_TEST_DIR)'
+	$(ADB) push $(TEST_TARGET) $(DEVICE_TEST_DIR)/$(TEST_TARGET)
+	$(ADB) push $(TARGET) $(DEVICE_TEST_DIR)/$(TARGET)
+	$(ADB) shell 'cd $(DEVICE_TEST_DIR) && chmod 700 $(TEST_TARGET) $(TARGET) && HAYABUSA_TEST_SCRATCH=$(DEVICE_TEST_DIR) ./$(TEST_TARGET)'
+	$(ADB) shell 'cd $(DEVICE_TEST_DIR) && if ./$(TARGET) dump invalid --threads nope >/dev/null 2>&1; then exit 1; fi'
+	$(ADB) shell 'cd $(DEVICE_TEST_DIR) && ./$(TARGET) dump invalid --relink 2>&1 | grep -q "was removed"'
+	$(ADB) shell 'cd $(DEVICE_TEST_DIR) && mkdir -p $(DEVICE_OUTPUT_ROOT) && chmod 700 $(DEVICE_OUTPUT_ROOT) && HAYABUSA_OUTPUT_ROOT=$(DEVICE_OUTPUT_ROOT) ./$(TARGET) dump /system/bin/sleep --launch-cmd "/system/bin/sleep 4" --snapshots 1 --timeout 20 --only libdl.so --limit 1 --listing 1 --threads 1 --rz-analysis basic --analysis-timeout 30 --require-complete'
+	$(ADB) shell 'find $(DEVICE_OUTPUT_ROOT)/sleep_analysis -type f -name "*_fixed.so" -print -quit | grep -q . && grep -R -q "^COMPLETE for the requested analysis level" $(DEVICE_OUTPUT_ROOT)/sleep_analysis'
+	$(ADB) shell 'cd $(DEVICE_TEST_DIR) && HAYABUSA_OUTPUT_ROOT=$(DEVICE_OUTPUT_ROOT) ./$(TARGET) unpack /system/bin/sleep --launch-cmd "/system/bin/sleep 2" --timeout 10 --limit 4 --memory-limit 64'
+	$(ADB) shell 'find $(DEVICE_OUTPUT_ROOT)/sleep_unpack -type f -name "*.bin" -print -quit | grep -q .'
 
 # Sleigh language definitions the decompiler needs.
 #
@@ -165,6 +216,6 @@ check-deps:
 	@echo "rizin and rz-ghidra static libraries present"
 
 clean:
-	rm -f $(TARGET) sleigh_data.cpp $(SLEIGH_STAMP)
+	rm -f $(TARGET) $(TEST_TARGET) sleigh_data.cpp $(SLEIGH_STAMP)
 
-.PHONY: clean sleigh-data check-deps
+.PHONY: clean sleigh-data check-deps test-build warning-check analyze-check verify device-test

@@ -3,6 +3,7 @@
 #include "tracer.h"
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -35,6 +36,7 @@
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <thread>
@@ -193,10 +195,8 @@ static constexpr const char *USAGE =
     "                   [--snapshots <n>] [--interval <ms>] [--timeout <sec>]\n"
     "                   [--only <substrings>] [--fast] [--deobf] "
     "[--min-str <n>]\n"
-    "                   [--limit <n>] [--listing <n>] [--relink] "
-    "[--relink-limit <MiB>] "
-    "[--trace-init]\n"
-    "                   [--p <files>] [--rd <depth>] [--threads <n>]\n"
+    "                   [--limit <n>] [--listing <n>] [--trace-init]\n"
+    "                   [--p <files>] [--threads <n>]\n"
     "                   [--rz-analysis off|basic|full]\n"
     "                   [--analysis-timeout <sec>] [--deobf-timeout <sec>]\n"
     "                   [--memory-limit <MiB>] [--image-limit <MiB>]\n"
@@ -684,14 +684,36 @@ std::vector<std::string> split_string(const std::string &s, char delimiter) {
 }
 
 static bool parse_uint64_argument(const char *text, uint64_t *value) {
-  if (!text || !*text || !value || *text == '-')
+  if (!text || !*text || !value)
     return false;
-  errno = 0;
-  char *end = nullptr;
-  unsigned long long parsed = strtoull(text, &end, 10);
-  if (errno == ERANGE || !end || *end != '\0')
+  const char *end = text + strlen(text);
+  uint64_t parsed = 0;
+  const auto result = std::from_chars(text, end, parsed, 10);
+  if (result.ec != std::errc{} || result.ptr != end)
     return false;
-  *value = static_cast<uint64_t>(parsed);
+  *value = parsed;
+  return true;
+}
+
+static bool parse_int_argument(const char *text, int minimum, int maximum,
+                               int *value) {
+  uint64_t parsed = 0;
+  if (!value || minimum < 0 || maximum < minimum ||
+      !parse_uint64_argument(text, &parsed) ||
+      parsed > static_cast<uint64_t>(maximum) ||
+      parsed < static_cast<uint64_t>(minimum))
+    return false;
+  *value = static_cast<int>(parsed);
+  return true;
+}
+
+static bool parse_size_argument(const char *text, size_t minimum,
+                                size_t maximum, size_t *value) {
+  uint64_t parsed = 0;
+  if (!value || maximum < minimum || !parse_uint64_argument(text, &parsed) ||
+      parsed > maximum || parsed < minimum)
+    return false;
+  *value = static_cast<size_t>(parsed);
   return true;
 }
 
@@ -702,15 +724,6 @@ static bool parse_mib_argument(const char *text, uint64_t *bytes) {
     return false;
   *bytes = mib * 1024ull * 1024;
   return true;
-}
-
-RelinkConfig make_default_relink_config() {
-  RelinkConfig cfg{};
-  cfg.max_depth = 8;
-  cfg.max_total_size = 512 * 1024 * 1024;
-  cfg.fix_relocations = true;
-  cfg.inline_plt_calls = true;
-  return cfg;
 }
 
 enum class CandidateKind {
@@ -785,10 +798,18 @@ bool is_garbage(const std::vector<uint8_t> &data) {
 }
 
 bool read_exact(int fd, void *buf, size_t size, uint64_t offset) {
+  if ((size != 0 && !buf) ||
+      offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
+      size > std::numeric_limits<uint64_t>::max() - offset ||
+      offset + size >
+          static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
+    return false;
   uint8_t *p = static_cast<uint8_t *>(buf);
   size_t done = 0;
   while (done < size) {
     ssize_t rd = pread(fd, p + done, size - done, offset + done);
+    if (rd < 0 && errno == EINTR)
+      continue;
     if (rd <= 0)
       return false;
     done += static_cast<size_t>(rd);
@@ -1214,8 +1235,7 @@ static bool read_elf_image_impl(int mem_fd, uint64_t base,
     uint8_t *dest = out.data() + static_cast<size_t>(dst_off);
     for (uint64_t page_off = 0; page_off < seg_size; page_off += 4096) {
       size_t len = std::min<uint64_t>(4096, seg_size - page_off);
-      ssize_t rd = pread(mem_fd, dest + page_off, len, src + page_off);
-      if (rd != static_cast<ssize_t>(len)) {
+      if (!read_exact(mem_fd, dest + page_off, len, src + page_off)) {
         out.clear();
         image_size = 0;
         return false;
@@ -1274,8 +1294,8 @@ std::vector<int> find_pids_by_prefix_all(const std::string &pkg) {
     return pids;
   struct dirent *ent;
   while ((ent = readdir(dir))) {
-    int pid = atoi(ent->d_name);
-    if (pid <= 0)
+    int pid = 0;
+    if (!parse_int_argument(ent->d_name, 1, INT_MAX, &pid))
       continue;
     std::ifstream f("/proc/" + std::string(ent->d_name) + "/cmdline");
     std::string cmd;
@@ -1560,7 +1580,7 @@ static std::vector<uint64_t> find_instances_in_snapshot(
 // and no control-flow structuring, so it could not produce C. That whole path
 // is gone. rizin recovers the functions and the Ghidra decompiler -- both
 // linked into this binary -- turn them into source.
-static void write_function_listing(std::ostream &f,
+static bool write_function_listing(std::ostream &f,
                                    const std::vector<uint8_t> &data,
                                    uint64_t base, size_t limit) {
   // Same session the rest of the report used: a second RzCore over the same
@@ -1568,7 +1588,7 @@ static void write_function_listing(std::ostream &f,
   rzb::Image *img = rzb::shared_image(data, base);
   if (!img) {
     f << "\n=== DECOMPILED ===\nrizin could not load this image.\n";
-    return;
+    return false;
   }
 
   // Prefer functions that carry a recovered name: in a stripped module the
@@ -1593,7 +1613,7 @@ static void write_function_listing(std::ostream &f,
 
   if (targets.empty()) {
     f << "\n=== DECOMPILED ===\nNo functions recovered.\n";
-    return;
+    return true;
   }
 
   f << "\n=== DECOMPILED (" << targets.size() << " functions) ===\n"
@@ -1620,6 +1640,7 @@ static void write_function_listing(std::ostream &f,
   if (failed)
     f << "\n// " << failed << " of " << targets.size()
       << " functions could not be decompiled.\n";
+  return failed == 0;
 }
 
 static bool decompiler_failure_text(const std::string &text) {
@@ -1675,6 +1696,7 @@ bool analyze_dex_to_txt(const std::vector<uint8_t> &data,
   std::ofstream f(path);
   if (!f)
     return false;
+  bool section_failed = false;
   auto close_report = [&]() {
     f.close();
     return static_cast<bool>(f);
@@ -1695,8 +1717,7 @@ bool analyze_dex_to_txt(const std::vector<uint8_t> &data,
   rzb::Image *img = rzb::shared_image(data, base);
   if (!img) {
     f << "\nrizin could not load this image.\n";
-    if (analysis_incomplete &&
-        rzb::analysis_level() != rzb::AnalysisLevel::None)
+    if (analysis_incomplete)
       *analysis_incomplete = true;
     return close_report();
   }
@@ -1834,6 +1855,7 @@ bool analyze_dex_to_txt(const std::vector<uint8_t> &data,
           << (base ? base + m.paddr : m.paddr) << std::dec << "\n";
         std::string source = img->decompile_dex_method(m.vaddr, m.size);
         if (decompiler_failure_text(source)) {
+          section_failed = true;
           f << "// not decompiled: "
             << decompiler_failure_summary(source, img->decompiler_error())
             << "\n";
@@ -1854,9 +1876,9 @@ bool analyze_dex_to_txt(const std::vector<uint8_t> &data,
         << " methods decompiled successfully.\n";
   }
 
-  if (img->analysis_failed()) {
-    f << "\n=== ANALYSIS STATUS ===\nINCOMPLETE: Rizin did not finish the "
-         "requested analysis level.\n";
+  if (section_failed || img->analysis_failed()) {
+    f << "\n=== ANALYSIS STATUS ===\nINCOMPLETE: one or more requested "
+         "analysis/decompilation passes failed or did not finish.\n";
     if (analysis_incomplete)
       *analysis_incomplete = true;
   } else {
@@ -1874,11 +1896,13 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
                     const RuntimeMemorySnapshot *runtime_snapshot,
                     const std::vector<size_t> *writable_snapshot_indices,
                     const AnalysisOptions &ao,
-                    bool *analysis_incomplete = nullptr) {
+                    bool *analysis_incomplete = nullptr,
+                    const std::string *artifact_issue = nullptr) {
   if (analysis_incomplete)
     *analysis_incomplete = false;
   const bool deep = ao.deep;
   const bool trace_init = ao.trace_init;
+  bool section_failed = artifact_issue && !artifact_issue->empty();
   thread_local std::string current_name;
   current_name = name;
   snprintf(g_current_module, sizeof(g_current_module), "%s",
@@ -1892,6 +1916,8 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
   f << "Module: " << name << "\n";
   f << "Base: 0x" << std::hex << base << std::dec << "\n";
   f << "Size: " << data.size() << " bytes\n";
+  if (artifact_issue && !artifact_issue->empty())
+    f << "Artifact status: INCOMPLETE (" << *artifact_issue << ")\n";
 
   const AddrMapView report_addr_map(data);
   auto file_offset_runtime_address = [&](uint64_t file_offset) -> uint64_t {
@@ -2090,6 +2116,12 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
   rzb::Image *analysis_image = rzb::shared_image(data, base);
   const bool rizin_requested =
       rzb::analysis_level() != rzb::AnalysisLevel::None;
+  if (!analysis_image) {
+    section_failed = true;
+    f << "\n=== RIZIN PARSER ===\n"
+         "INCOMPLETE: Rizin could not load this ELF; dependent parse and "
+         "analysis sections are unavailable.\n";
+  }
   if (analysis_image && rizin_requested)
     analysis_image->analyze();
   bool rizin_analysis_complete =
@@ -2147,6 +2179,7 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
     if (status.truncated)
       f << "... [truncated by --limit/string byte budget]\n";
   } catch (...) {
+    section_failed = true;
     f << "\n=== STRINGS (error) ===\n";
   }
 
@@ -2500,13 +2533,17 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
       }
     }
   } catch (...) {
+    section_failed = true;
     f << "\n=== FUNCTION MAP (error) ===\n";
   }
 
   try {
-    if (ao.listing && rizin_work_allowed())
-      write_function_listing(f, data, base, ao.listing);
+    if (ao.listing && rizin_work_allowed() &&
+        !write_function_listing(f, data, base, ao.listing))
+      section_failed = true;
   } catch (...) {
+    section_failed = true;
+    f << "\n=== FUNCTION LISTING (error) ===\n";
   }
 
   g_current_step = "security";
@@ -2578,6 +2615,7 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
         f << "Trace attempt completed with no captured breakpoints\n";
       }
     } catch (...) {
+      section_failed = true;
       f << "\n=== INIT_ARRAY_TRACE ===\n";
       f << "Trace failed with runtime exception\n";
     }
@@ -2789,6 +2827,8 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
           << " more suppressed by --limit)\n";
     }
   } catch (...) {
+    section_failed = true;
+    f << "\n=== PLT (error) ===\n";
   }
 
   g_current_step = "got_dump";
@@ -2811,12 +2851,13 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
           << " more suppressed by --limit)\n";
     }
   } catch (...) {
+    section_failed = true;
+    f << "\n=== GOT (error) ===\n";
   }
 
   g_current_step = "signatures";
-  try {
-    if (!deep || !rizin_work_allowed())
-      throw 0; // --fast: byte signatures are a per-symbol scan, skip them
+  if (deep && rizin_work_allowed()) {
+    try {
     auto &sig_src = func_syms.empty() ? symbols : func_syms;
     size_t sig_count = std::min(sig_src.size(), ao.limit);
     if (sig_count > 0) {
@@ -2845,7 +2886,10 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
       if (emitted)
         f << "\n=== SIGNATURES (" << emitted << ") ===\n" << sigs.str();
     }
-  } catch (...) {
+    } catch (...) {
+      section_failed = true;
+      f << "\n=== SIGNATURES (error) ===\n";
+    }
   }
 
   g_current_step = "enc_key";
@@ -2860,6 +2904,9 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
       f << "  " << hex_bytes(enc_key.data(), enc_key.size()) << "\n";
     }
   } catch (...) {
+    section_failed = true;
+    ensure_crypto_header();
+    f << "[ENCRYPTION_KEY] error\n";
   }
 
   g_current_step = "crypto_scan";
@@ -2889,6 +2936,9 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
           << " more suppressed by --limit)\n";
     }
   } catch (...) {
+    section_failed = true;
+    ensure_crypto_header();
+    f << "[CRYPTO_KEYS] error\n";
   }
 
   // File reconstruction intentionally preserves ELF file layout and therefore
@@ -2996,16 +3046,19 @@ bool analyze_to_txt(const std::vector<uint8_t> &data, const std::string &path,
           f << "... (additional instances suppressed by --limit)\n";
       }
     } catch (...) {
+      section_failed = true;
+      f << "\n=== VTABLE_INSTANCES (error) ===\n";
     }
   }
 
   const bool partial =
-      rzb::analysis_level() != rzb::AnalysisLevel::None &&
-      (!rizin_analysis_complete || !analysis_image ||
-       analysis_image->analysis_failed());
+      section_failed ||
+      (rzb::analysis_level() != rzb::AnalysisLevel::None &&
+       (!rizin_analysis_complete || !analysis_image ||
+        analysis_image->analysis_failed()));
   f << "\n=== ANALYSIS STATUS ===\n"
-    << (partial ? "INCOMPLETE: Rizin did not finish the requested analysis "
-                  "level.\n"
+    << (partial ? "INCOMPLETE: one or more requested analysis passes failed "
+                  "or did not finish.\n"
                 : "COMPLETE for the requested analysis level.\n");
   if (partial && analysis_incomplete)
     *analysis_incomplete = true;
@@ -3594,7 +3647,6 @@ bool cmd_inject(const std::string &pkg, const std::string &so_path) {
     if (!target_gone && !target_group_stopped) {
       RemoteStringResult dlerror = MemoryInjector::remote_dlerror(pid);
       target_gone = dlerror.target_gone;
-      target_group_stopped = dlerror.target_group_stopped;
       if (!dlerror.value.empty())
         std::cout << "    dlerror: " << dlerror.value << "\n";
     }
@@ -3613,24 +3665,18 @@ bool cmd_scan(const std::string &pkg, const std::string &pattern) {
   std::cout << "Target: " << pkg << "\n";
   std::cout << "Pattern: " << pattern << "\n\n";
 
-  auto emit = [](const std::string &msg) { std::cout << msg; };
+  const size_t pattern_bytes = ElfParser::pattern_width(pattern);
+  if (pattern_bytes == 0) {
+    std::cout << "[!] Invalid or empty pattern\n";
+    return false;
+  }
 
+  auto emit = [](const std::string &msg) { std::cout << msg; };
   int pid = wait_for_process(pkg, emit, 0);
   if (pid < 0)
     return false;
 
   auto ranges = Memory::read_maps(pid);
-  size_t pattern_bytes = 0;
-  {
-    std::istringstream tokens(pattern);
-    std::string token;
-    while (tokens >> token)
-      pattern_bytes++;
-  }
-  if (pattern_bytes == 0) {
-    std::cout << "[!] Pattern contains no bytes\n";
-    return false;
-  }
 
   size_t total_matches = 0;
   int mem_fd =
@@ -3744,9 +3790,8 @@ bool cmd_extract(const std::string &pkg, const std::string &func_name,
 
   std::cout << "[6] Extracting function with dependencies (depth=" << max_depth
             << ")...\n";
-  auto result =
-      StaticRelinkerEx::extract_function_with_deps(pid, func_addr, max_depth,
-                                                   max_total_size);
+  auto result = DependencyExtractor::extract_function_with_deps(
+      pid, func_addr, max_depth, max_total_size);
 
   if (result.empty()) {
     std::cout << "[!] Extraction failed\n";
@@ -3799,12 +3844,14 @@ struct Candidate {
   std::string raw_path;
   std::string raw_display_path;
   std::string disk_snapshot_path;
-  std::string disk_snapshot_display_path;
   // For an ELF mapped directly from a stored APK entry, name remains the APK
   // backing path while display_name is the recovered DT_SONAME. The entry's
   // first byte is exactly this page-aligned backing-file offset.
   bool embedded_elf = false;
   uint64_t backing_file_offset = 0;
+  uint32_t device_major = 0;
+  uint32_t device_minor = 0;
+  uint64_t inode = 0;
   // ZIP/VDEX are reconstructed by file offset from this one coherent mmap
   // view while the process is stopped.
   std::vector<MapEntry> file_mappings;
@@ -3812,11 +3859,6 @@ struct Candidate {
   // exact load-bias instance. Same-path linker namespaces must not share BSS.
   std::vector<size_t> writable_snapshot_indices;
   bool captured = false;
-  bool relink_attempted = false;
-  bool relink_succeeded = false;
-  size_t relink_size = 0;
-  uint64_t relink_hash = 0;
-  std::vector<uint8_t> relink_preview;
 };
 
 std::string make_display_name(const std::string &name) {
@@ -4291,25 +4333,30 @@ static bool mapped_elf_layout(int mem_fd, uint64_t header_address,
 static bool capture_exact_backing_file(int pid, const Candidate &candidate,
                                        const std::string &path,
                                        uint64_t maximum) {
+  auto matches_mapping_identity = [&](const struct stat &st) {
+    return candidate.inode != 0 &&
+           static_cast<uint64_t>(st.st_ino) == candidate.inode &&
+           static_cast<uint32_t>(major(st.st_dev)) == candidate.device_major &&
+           static_cast<uint32_t>(minor(st.st_dev)) == candidate.device_minor;
+  };
+
   std::ostringstream map_file;
   map_file << "/proc/" << pid << "/map_files/" << std::hex
            << candidate.mapping_start
            << "-" << candidate.mapping_end;
   int fd = open(map_file.str().c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
-    return false;
-
   struct stat st {};
-  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+  if (fd >= 0 &&
+      (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+       (candidate.inode != 0 && !matches_mapping_identity(st)))) {
     close(fd);
-    return false;
+    fd = -1;
   }
 
-  // Some Android procfs implementations expose map_files through a view whose
-  // apparent size ends at the last mapped PT_LOAD byte.  That omits the ELF
-  // section table. Prefer the process-root path only after proving that it is
-  // the exact same inode as the stopped mapping; a pathname alone is not a
-  // safe baseline because it can be replaced concurrently.
+  // Android commonly denies /proc/<pid>/map_files even to a same-UID shell.
+  // The maps line still pins the mapped inode/device identity. Open the path
+  // through the stopped process's root and accept it only when fstat proves it
+  // is that exact object; a concurrently replaced pathname cannot pass.
   std::string backing_name = normalized_mapping_name(candidate.name);
   if (!backing_name.empty() && backing_name.front() == '/') {
     const std::string rooted =
@@ -4318,8 +4365,9 @@ static bool capture_exact_backing_file(int pid, const Candidate &candidate,
     if (rooted_fd >= 0) {
       struct stat rooted_st {};
       if (fstat(rooted_fd, &rooted_st) == 0 && rooted_st.st_size > 0 &&
-          rooted_st.st_dev == st.st_dev && rooted_st.st_ino == st.st_ino) {
-        close(fd);
+          matches_mapping_identity(rooted_st)) {
+        if (fd >= 0)
+          close(fd);
         fd = rooted_fd;
         st = rooted_st;
       } else {
@@ -4327,6 +4375,8 @@ static bool capture_exact_backing_file(int pid, const Candidate &candidate,
       }
     }
   }
+  if (fd < 0)
+    return false;
   const uint64_t source_offset =
       candidate.embedded_elf ? candidate.backing_file_offset : 0;
   const uint64_t file_size = static_cast<uint64_t>(st.st_size);
@@ -4339,8 +4389,7 @@ static bool capture_exact_backing_file(int pid, const Candidate &candidate,
     // metadata rather than copying the following ZIP entry.
     Elf64_Ehdr eh{};
     if (source_offset > file_size || sizeof(eh) > file_size - source_offset ||
-        pread(fd, &eh, sizeof(eh), source_offset) !=
-            static_cast<ssize_t>(sizeof(eh)) ||
+        !read_exact(fd, &eh, sizeof(eh), source_offset) ||
         memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
         eh.e_ident[EI_CLASS] != ELFCLASS64 ||
         eh.e_ident[EI_DATA] != ELFDATA2LSB ||
@@ -4359,9 +4408,8 @@ static bool capture_exact_backing_file(int pid, const Candidate &candidate,
       const uint64_t table_bytes =
           uint64_t(eh.e_shnum) * sizeof(Elf64_Shdr);
       std::vector<Elf64_Shdr> sections(eh.e_shnum);
-      if (pread(fd, sections.data(), static_cast<size_t>(table_bytes),
-                source_offset + eh.e_shoff) !=
-          static_cast<ssize_t>(table_bytes)) {
+      if (!read_exact(fd, sections.data(), static_cast<size_t>(table_bytes),
+                      source_offset + eh.e_shoff)) {
         close(fd);
         return false;
       }
@@ -4401,8 +4449,7 @@ static bool capture_exact_backing_file(int pid, const Candidate &candidate,
   while (done < wanted) {
     size_t amount =
         static_cast<size_t>(std::min<uint64_t>(chunk.size(), wanted - done));
-    ssize_t rd = pread(fd, chunk.data(), amount, source_offset + done);
-    if (rd != static_cast<ssize_t>(amount)) {
+    if (!read_exact(fd, chunk.data(), amount, source_offset + done)) {
       close(fd);
       out.close();
       unlink(path.c_str());
@@ -4617,7 +4664,6 @@ capture_anonymous_regions(const std::vector<MapEntry> &maps, int mem_fd,
         *truncated = true;
       continue;
     }
-    total += size;
     std::vector<uint8_t> data(size);
     if (!read_exact(mem_fd, data.data(), size, m.start)) {
       if (truncated)
@@ -4627,6 +4673,7 @@ capture_anonymous_regions(const std::vector<MapEntry> &maps, int mem_fd,
     if (std::all_of(data.begin(), data.end(),
                     [](uint8_t b) { return b == 0; }))
       continue;
+    total += size;
     snapshots.push_back({m, std::move(data)});
   }
   return snapshots;
@@ -4662,11 +4709,11 @@ static std::vector<MemoryRegionSnapshot> capture_writable_module_regions(
                           (cursor - m.start))
         part.offset = m.offset + (cursor - m.start);
       std::vector<uint8_t> data(static_cast<size_t>(amount));
-      total += amount;
       if (!read_exact(mem_fd, data.data(), data.size(), cursor)) {
         if (truncated)
           *truncated = true;
       } else {
+        total += amount;
         result.push_back({std::move(part), std::move(data)});
       }
       cursor += amount;
@@ -4846,16 +4893,20 @@ static AnonymousDumpResult dump_anonymous_regions(
     if (header_address < header_vaddr)
       return 0;
     const uint64_t load_bias = header_address - header_vaddr;
-    auto fixed = SoFixer::repair(elf, load_bias);
-    if (!fixed.empty() && ElfParser::is_elf(fixed))
+    bool repaired = false;
+    auto fixed = SoFixer::repair(elf, load_bias, nullptr, &repaired);
+    if (repaired && !fixed.empty() && ElfParser::is_elf(fixed))
       elf.swap(fixed);
+    else if (analysis_incomplete)
+      *analysis_incomplete = true;
 
     std::ostringstream stem;
     stem << "anon_elf_0x" << std::hex << header_address << std::dec << "_s"
          << snapshot;
-    std::string raw_path = raw_dir + "/" + stem.str() + "_fixed.so";
+    const std::string suffix = repaired ? "_fixed.so" : "_raw.so";
+    std::string raw_path = raw_dir + "/" + stem.str() + suffix;
     const std::string raw_display_path =
-        raw_display_dir + "/" + stem.str() + "_fixed.so";
+        raw_display_dir + "/" + stem.str() + suffix;
     if (!write_binary_snapshot(raw_path, elf)) {
       artifacts_ok = false;
       return static_cast<size_t>(file_size);
@@ -5071,7 +5122,6 @@ static size_t default_worker_threads() {
 // tens of seconds per multi-megabyte module.
 struct DumpOptions {
   std::vector<std::string> priority_files;
-  const RelinkConfig *relink_cfg = nullptr; // null: skip static relinking
   std::vector<std::string> only;            // substrings; empty means all
   AnalysisOptions analysis;
   CaptureLimits capture;
@@ -5091,7 +5141,6 @@ int dump_analysis(int pid, const std::string &out,
   if (partial_result)
     *partial_result = false;
   const std::vector<std::string> &priority_files = opt.priority_files;
-  const RelinkConfig *relink_cfg = opt.relink_cfg;
   size_t thread_count = opt.threads;
   ScopedProcessStop snapshot_stop(pid);
   if (!snapshot_stop.attached()) {
@@ -5145,8 +5194,7 @@ int dump_analysis(int pid, const std::string &out,
     if (path.empty())
       continue;
     unsigned char magic[SELFMAG] = {};
-    if (pread(mem_fd, magic, sizeof(magic), r.start) ==
-            static_cast<ssize_t>(sizeof(magic)) &&
+    if (read_exact(mem_fd, magic, sizeof(magic), r.start) &&
         memcmp(magic, ELFMAG, SELFMAG) == 0) {
       mapped_elf_paths.insert(path);
     }
@@ -5170,8 +5218,7 @@ int dump_analysis(int pid, const std::string &out,
         }
         // Only treat as non-ELF if magic check fails
         unsigned char magic[4] = {0};
-        ssize_t magic_rd = pread(mem_fd, magic, sizeof(magic), r.start);
-        if (magic_rd != (ssize_t)sizeof(magic)) {
+        if (!read_exact(mem_fd, magic, sizeof(magic), r.start)) {
           snapshot_incomplete = true;
           continue;
         }
@@ -5271,11 +5318,12 @@ int dump_analysis(int pid, const std::string &out,
       continue;
 
     uint8_t header[kCdexHeaderSize] = {};
-    ssize_t rd = pread(mem_fd, header, sizeof(header), r.start);
-    if (rd < 8)
+    const size_t header_size = std::min(sizeof(header), r.size());
+    if (header_size < 8 ||
+        !read_exact(mem_fd, header, header_size, r.start))
       continue;
     CandidateKind kind =
-        detect_candidate_kind(header, static_cast<size_t>(rd));
+        detect_candidate_kind(header, header_size);
     if (kind == CandidateKind::Unknown)
       continue;
     bool embedded_elf = false;
@@ -5325,20 +5373,18 @@ int dump_analysis(int pid, const std::string &out,
                              &mapped_span))
         continue;
     } else if (kind == CandidateKind::Dex) {
-      if (rd < static_cast<ssize_t>(kDexHeaderSize) &&
-          !read_exact(mem_fd, header, kDexHeaderSize, r.start))
+      if (header_size < kDexHeaderSize)
         continue;
       mapped_span = read_le32(header + 32);
       if (mapped_span < kDexHeaderSize || mapped_span > kMaxDexSize)
         continue;
     } else if (kind == CandidateKind::Odex) {
       uint32_t dex_offset = 0, dex_length = 0;
-      if (!parse_odex_header(header, static_cast<size_t>(rd), &dex_offset,
-                             &dex_length, &mapped_span))
+      if (!parse_odex_header(header, header_size, &dex_offset, &dex_length,
+                             &mapped_span))
         continue;
     } else if (kind == CandidateKind::Cdex) {
-      if (rd < static_cast<ssize_t>(kCdexHeaderSize) &&
-          !read_exact(mem_fd, header, kCdexHeaderSize, r.start))
+      if (header_size < kCdexHeaderSize)
         continue;
       uint32_t cdex_size = 0;
       if (!parse_cdex_header(header, kCdexHeaderSize, &cdex_size))
@@ -5379,6 +5425,9 @@ int dump_analysis(int pid, const std::string &out,
     c.safe_name = make_safe_name(display_name);
     c.embedded_elf = embedded_elf;
     c.backing_file_offset = embedded_elf ? r.offset : 0;
+    c.device_major = r.device_major;
+    c.device_minor = r.device_minor;
+    c.inode = r.inode;
     c.file_mappings = std::move(file_mappings);
     instances_by_path[name].push_back(candidates.size());
     candidates.push_back(c);
@@ -5564,36 +5613,15 @@ int dump_analysis(int pid, const std::string &out,
 
     if (c.kind == CandidateKind::Elf) {
       c.disk_snapshot_path = c.raw_path + ".disk";
-      c.disk_snapshot_display_path = c.raw_display_path + ".disk";
       if (!capture_exact_backing_file(pid, c, c.disk_snapshot_path,
                                       opt.capture.image_bytes)) {
         c.disk_snapshot_path.clear();
-        c.disk_snapshot_display_path.clear();
       }
     }
 
-    if (relink_cfg && c.kind == CandidateKind::Elf) {
-      c.relink_attempted = true;
-      try {
-        auto relinked =
-            StaticRelinkerEx::relink_full(captured, pid, c.base, *relink_cfg);
-        if (!relinked.empty()) {
-          c.relink_succeeded = true;
-          c.relink_size = relinked.size();
-          c.relink_hash = hash_data(relinked);
-          size_t preview = std::min<size_t>(relinked.size(), 512);
-          c.relink_preview.assign(relinked.begin(),
-                                  relinked.begin() + preview);
-        }
-      } catch (...) {
-      }
-      if (!c.relink_succeeded)
-        snapshot_incomplete = true;
-    }
   }
 
   close(mem_fd);
-  mem_fd = -1;
   if (!snapshot_stop.resume()) {
     std::cout << "    [!] Could not resume every target thread after capture\n";
     return -1;
@@ -5677,15 +5705,18 @@ int dump_analysis(int pid, const std::string &out,
                          disk_data);
 
       bool candidate_outputs_ok = true;
+      bool repair_failed = false;
+      std::string repair_issue;
       // SoFixer rebuilds ELF headers; Dalvik containers must retain their exact
       // stopped-epoch bytes for format-aware extraction.
       try {
         if (c.kind == CandidateKind::Elf) {
           const std::vector<uint8_t> *disk_baseline =
               disk_data.empty() ? nullptr : &disk_data;
-          std::vector<uint8_t> fixed =
-              SoFixer::repair(data, c.base, disk_baseline);
-          if (!fixed.empty() && ElfParser::is_elf(fixed) &&
+          bool repaired = false;
+          std::vector<uint8_t> fixed = SoFixer::repair(
+              data, c.base, disk_baseline, &repaired, &repair_issue);
+          if (repaired && !fixed.empty() && ElfParser::is_elf(fixed) &&
               !is_garbage(fixed)) {
             // The repaired image is what makes the dump openable in another
             // tool -- a raw memory image has p_offset values that no longer
@@ -5701,9 +5732,21 @@ int dump_analysis(int pid, const std::string &out,
               data.swap(fixed);
             else
               candidate_outputs_ok = false;
+          } else {
+            repair_failed = true;
           }
         }
       } catch (...) {
+        repair_failed = true;
+        repair_issue = "ELF repair threw an exception";
+      }
+      if (repair_failed) {
+        if (repair_issue.empty())
+          repair_issue = "ELF repair did not produce a validated artifact";
+        analysis_incomplete.store(true);
+        std::lock_guard<std::mutex> lk(print_mu);
+        std::cout << "    [!] " << c.display_name
+                  << ": " << repair_issue << "\n";
       }
       if (!candidate_outputs_ok) {
         worker_failed.store(true);
@@ -5924,7 +5967,8 @@ int dump_analysis(int pid, const std::string &out,
                   c.embedded_elf ? c.display_name : c.name,
                   &runtime_data, disk_data.empty() ? nullptr : &disk_data, pid,
                   &runtime_mu, &runtime_snapshot,
-                  &c.writable_snapshot_indices, opt.analysis, &partial) &&
+                  &c.writable_snapshot_indices, opt.analysis, &partial,
+                  repair_issue.empty() ? nullptr : &repair_issue) &&
               reports_ok;
           if (partial)
             analysis_incomplete.store(true);
@@ -5948,39 +5992,6 @@ int dump_analysis(int pid, const std::string &out,
           }
         }
 
-        if (c.relink_attempted) {
-          std::ofstream tfile(analysis_txt_path, std::ios::app);
-          if (tfile) {
-            tfile << "\n=== RELINK ===\n";
-            if (c.relink_succeeded) {
-              tfile << "epoch=stopped-process-snapshot\n";
-              tfile << "size=" << c.relink_size << " bytes\n";
-              tfile << "hash=0x" << std::hex << c.relink_hash << std::dec
-                    << "\n";
-              if (!c.relink_preview.empty())
-                tfile << "preview[" << c.relink_preview.size()
-                      << "]="
-                      << hex_bytes(c.relink_preview.data(),
-                                   c.relink_preview.size())
-                      << "\n";
-            } else {
-              tfile << "FAILED: live dependency capture was incomplete\n";
-            }
-            tfile.close();
-            if (!tfile)
-              reports_ok = false;
-          } else {
-            reports_ok = false;
-          }
-          std::lock_guard<std::mutex> lk(print_mu);
-          if (c.relink_succeeded)
-            std::cout << "    [RELINK] " << c.display_name
-                      << " captured in stopped epoch ("
-                      << Utils::format_size(c.relink_size) << ")\n";
-          else
-            std::cout << "    [RELINK] Failed for " << c.display_name << "\n";
-          std::cout.flush();
-        }
       }
 
       candidate_outputs_ok = candidate_outputs_ok && reports_ok;
@@ -6062,7 +6073,9 @@ static int open_verified_pidfd(pid_t pid) {
         syscall(SYS_pidfd_send_signal, fd, 0, nullptr, 0));
   } while (rc < 0 && errno == EINTR);
   if (rc != 0) {
+    const int signal_errno = errno;
     close(fd);
+    errno = signal_errno;
     return -1;
   }
   return fd;
@@ -6718,6 +6731,7 @@ static void reap_adopted_children_except(pid_t retained_target) {
   }
 
   pid_t target = fork();
+  const int fork_errno = target < 0 ? errno : 0;
   if (target == 0) {
     close(control_read);
     close(announcement_write);
@@ -6735,8 +6749,9 @@ static void reap_adopted_children_except(pid_t retained_target) {
       _exit(126);
 
     if (launch_cmd && !launch_cmd->empty()) {
-      // Shell launch is an explicit root-authority boundary, but it still must
-      // not inherit unrelated analyzer descriptors or its secret environment.
+      // Shell launch is an explicit caller-authority boundary (normally root
+      // when Hayabusa was invoked through su), but it still must not inherit
+      // unrelated analyzer descriptors or its secret environment.
       int rc;
       do {
         rc = static_cast<int>(
@@ -6765,7 +6780,7 @@ static void reap_adopted_children_except(pid_t retained_target) {
   close(target_gate_read);
   close(target_gate_write);
   if (target < 0) {
-    const LaunchAnnouncement failure{errno ? errno : EAGAIN, -1};
+    const LaunchAnnouncement failure{fork_errno ? fork_errno : EAGAIN, -1};
     (void)write_exact_fd(announcement_write, &failure, sizeof(failure));
     _exit(125);
   }
@@ -6990,6 +7005,7 @@ public:
     }
 
     const pid_t supervisor = fork();
+    const int supervisor_fork_errno = supervisor < 0 ? errno : 0;
     if (supervisor == 0) {
       close(control[1]);
       close(announcement[0]);
@@ -7002,7 +7018,7 @@ public:
     close(gate[0]);
     if (supervisor < 0) {
       result.error_ = "could not fork launch supervisor: " +
-                      std::string(strerror(errno));
+                      std::string(strerror(supervisor_fork_errno));
       close(control[1]);
       close(announcement[0]);
       close(gate[1]);
@@ -7112,19 +7128,16 @@ bool cmd_unpack(const std::string &pkg, int timeout_sec,
     if (launched_pidfd < 0 || !pidfd_signal(launched_pidfd, 0)) {
       if (launched_pidfd >= 0)
         close(launched_pidfd);
-      launched_pidfd = -1;
       std::cout << "[!] could not pin launched target identity\n";
       return false;
     }
     if (!supervised.publish(&launch_guard)) {
       close(launched_pidfd);
-      launched_pidfd = -1;
       std::cout << "[!] another launched process tree is already active\n";
       return false;
     }
     if (!publish_block.restore()) {
       close(launched_pidfd);
-      launched_pidfd = -1;
       std::cout << "[!] could not restore the launch signal mask\n";
       return false;
     }
@@ -7134,14 +7147,12 @@ bool cmd_unpack(const std::string &pkg, int timeout_sec,
     // TRACEFORK/VFORK/CLONE follows any real child a shell command creates.
     if (!ProcessTracer::attach(pid)) {
       close(launched_pidfd);
-      launched_pidfd = -1;
       std::cout << "[!] failed to seize launched target\n";
       return false;
     }
     if (!pidfd_signal(launched_pidfd, 0)) {
       ProcessTracer::detach(pid);
       close(launched_pidfd);
-      launched_pidfd = -1;
       std::cout << "[!] launched target identity changed while attaching\n";
       return false;
     }
@@ -7155,7 +7166,6 @@ bool cmd_unpack(const std::string &pkg, int timeout_sec,
       std::cout << "[!] could not release launch handshake\n";
       ProcessTracer::detach(pid);
       close(launched_pidfd);
-      launched_pidfd = -1;
       return false;
     }
     we_started_it = true;
@@ -7212,8 +7222,8 @@ bool cmd_unpack(const std::string &pkg, int timeout_sec,
       const char *p = line.c_str() + 5;
       while (*p == ' ' || *p == '\t')
         p++;
-      int tgid = atoi(p);
-      return tgid > 0 ? tgid : tid;
+      int tgid = 0;
+      return parse_int_argument(p, 1, INT_MAX, &tgid) ? tgid : tid;
     }
     return tid;
   };
@@ -8194,7 +8204,6 @@ bool cmd_unpack(const std::string &pkg, int timeout_sec,
     (void)pidfd_signal(launched_pidfd, SIGKILL);
     if (launched_pidfd >= 0)
       close(launched_pidfd);
-    launched_pidfd = -1;
     if (!launch_guard.terminate_and_reap()) {
       shutdown_ok = false;
       log << "launch supervisor could not prove descendant teardown\n";
@@ -8255,10 +8264,6 @@ bool cmd_dump(const std::string &pkg, int timeout_sec,
   std::cout << "Threads: " << opt.threads << "\n";
   std::cout << "Mode: "
             << (opt.analysis.deep ? "deep" : "fast (string heuristics off)");
-  if (opt.relink_cfg)
-    std::cout << ", relink on (depth " << opt.relink_cfg->max_depth << ")";
-  else
-    std::cout << ", relink off";
   std::cout << (opt.analysis.trace_init ? ", init-trace on (invasive)" : "")
             << "\n";
   std::cout << "Budgets: Rizin=";
@@ -8545,17 +8550,15 @@ int main(int argc, char *argv[]) {
     for (int i = 4; i < argc; i++) {
       std::string arg = argv[i];
       if (arg == "--i" && i + 1 < argc && cmd == "hook") {
-        inst_count = atoi(argv[++i]);
-        if (inst_count < 1)
-          inst_count = 1;
-        if (inst_count > 200)
-          inst_count = 200;
+        if (!parse_int_argument(argv[++i], 1, 200, &inst_count)) {
+          std::cout << "--i expects an integer in 1..200\n";
+          return 1;
+        }
       } else if (arg == "--d" && i + 1 < argc && cmd == "extract") {
-        max_depth = atoi(argv[++i]);
-        if (max_depth < 1)
-          max_depth = 1;
-        if (max_depth > 32)
-          max_depth = 32;
+        if (!parse_int_argument(argv[++i], 1, 32, &max_depth)) {
+          std::cout << "--d expects an integer in 1..32\n";
+          return 1;
+        }
       } else if (arg == "--size-limit" && i + 1 < argc &&
                  cmd == "extract") {
         uint64_t bytes = 0;
@@ -8594,10 +8597,15 @@ int main(int argc, char *argv[]) {
         launch_cmd_set = true;
         launch_cmd = argv[++i];
       } else if (arg == "--timeout" && i + 1 < argc) {
-        timeout_sec = atoi(argv[++i]);
+        if (!parse_int_argument(argv[++i], 0, INT_MAX, &timeout_sec)) {
+          std::cout << "--timeout expects a non-negative integer\n";
+          return 1;
+        }
       } else if (arg == "--limit" && i + 1 < argc) {
-        long v = strtol(argv[++i], nullptr, 10);
-        limit = (size_t)std::clamp(v, 1L, 100000L);
+        if (!parse_size_argument(argv[++i], 1, 100000, &limit)) {
+          std::cout << "--limit expects an integer in 1..100000\n";
+          return 1;
+        }
       } else if (arg == "--memory-limit" && i + 1 < argc) {
         if (!parse_mib_argument(argv[++i], &region_limit)) {
           std::cout << "--memory-limit expects MiB (0 disables the policy limit)\n";
@@ -8624,15 +8632,14 @@ int main(int argc, char *argv[]) {
     std::string launch_cmd;
     int snapshots = 1;
     int interval_ms = 500;
-    RelinkConfig relink_cfg = make_default_relink_config();
-    bool want_relink = false;
     size_t thread_count = default_worker_threads();
     for (int i = 3; i < argc; i++) {
       std::string arg = argv[i];
       if (arg == "--timeout" && i + 1 < argc) {
-        timeout_sec = atoi(argv[++i]);
-        if (timeout_sec < 0)
-          timeout_sec = 0;
+        if (!parse_int_argument(argv[++i], 0, INT_MAX, &timeout_sec)) {
+          std::cout << "--timeout expects a non-negative integer\n";
+          return 1;
+        }
       } else if (arg == "--p" && i + 1 < argc) {
         opt.priority_files = split_string(argv[++i], ',');
       } else if (arg == "--only" && i + 1 < argc) {
@@ -8642,49 +8649,40 @@ int main(int argc, char *argv[]) {
       } else if (arg == "--trace-init") {
         opt.analysis.trace_init = true;
       } else if (arg == "--listing" && i + 1 < argc) {
-        long v = strtol(argv[++i], nullptr, 10);
-        opt.analysis.listing = (size_t)std::clamp(v, 0L, 100000L);
+        if (!parse_size_argument(argv[++i], 0, 100000,
+                                 &opt.analysis.listing)) {
+          std::cout << "--listing expects an integer in 0..100000\n";
+          return 1;
+        }
       } else if (arg == "--deobf") {
         opt.analysis.deobf = true;
       } else if (arg == "--min-str" && i + 1 < argc) {
-        long v = strtol(argv[++i], nullptr, 10);
-        opt.analysis.min_str = (size_t)std::clamp(v, 3L, 256L);
-      } else if (arg == "--limit" && i + 1 < argc) {
-        long v = strtol(argv[++i], nullptr, 10);
-        opt.analysis.limit = (size_t)std::clamp(v, 1L, 1000000L);
-      } else if (arg == "--relink") {
-        want_relink = true;
-      } else if (arg == "--rd" && i + 1 < argc) {
-        relink_cfg.max_depth = atoi(argv[++i]);
-        if (relink_cfg.max_depth < 1)
-          relink_cfg.max_depth = 1;
-        if (relink_cfg.max_depth > 32)
-          relink_cfg.max_depth = 32;
-      } else if (arg == "--relink-limit" && i + 1 < argc) {
-        uint64_t bytes = 0;
-        if (!parse_mib_argument(argv[++i], &bytes) || bytes == 0 ||
-            bytes > std::numeric_limits<size_t>::max()) {
-          std::cout << "--relink-limit expects a positive addressable MiB count\n";
+        if (!parse_size_argument(argv[++i], 3, 256,
+                                 &opt.analysis.min_str)) {
+          std::cout << "--min-str expects an integer in 3..256\n";
           return 1;
         }
-        relink_cfg.max_total_size = static_cast<size_t>(bytes);
+      } else if (arg == "--limit" && i + 1 < argc) {
+        if (!parse_size_argument(argv[++i], 1, 1000000,
+                                 &opt.analysis.limit)) {
+          std::cout << "--limit expects an integer in 1..1000000\n";
+          return 1;
+        }
       } else if (arg == "--launch") {
         launch = true;
       } else if (arg == "--launch-cmd" && i + 1 < argc) {
         launch_cmd_set = true;
         launch_cmd = argv[++i];
       } else if (arg == "--snapshots" && i + 1 < argc) {
-        snapshots = atoi(argv[++i]);
-        if (snapshots < 1)
-          snapshots = 1;
-        if (snapshots > 64)
-          snapshots = 64;
+        if (!parse_int_argument(argv[++i], 1, 64, &snapshots)) {
+          std::cout << "--snapshots expects an integer in 1..64\n";
+          return 1;
+        }
       } else if (arg == "--interval" && i + 1 < argc) {
-        interval_ms = atoi(argv[++i]);
-        if (interval_ms < 10)
-          interval_ms = 10;
-        if (interval_ms > 60000)
-          interval_ms = 60000;
+        if (!parse_int_argument(argv[++i], 10, 60000, &interval_ms)) {
+          std::cout << "--interval expects milliseconds in 10..60000\n";
+          return 1;
+        }
       } else if (arg == "--rz-analysis" && i + 1 < argc) {
         std::string lvl = argv[++i];
         if (lvl == "off")
@@ -8747,12 +8745,16 @@ int main(int argc, char *argv[]) {
         // An explicit count is honoured as given. The only ceiling is a sanity
         // bound against a typo like `--threads 100000` exhausting thread stacks
         // before any work starts.
-        long v = strtol(argv[++i], nullptr, 10);
-        if (v < 1)
-          v = 1;
-        if (v > 4096)
-          v = 4096;
-        thread_count = static_cast<size_t>(v);
+        if (!parse_size_argument(argv[++i], 1, 4096, &thread_count)) {
+          std::cout << "--threads expects an integer in 1..4096\n";
+          return 1;
+        }
+      } else if (arg == "--relink" || arg == "--relink-limit" ||
+                 arg == "--rd") {
+        std::cerr << arg
+                  << " was removed: its output was not a loadable ELF artifact; "
+                     "use extract --d for bounded function dependencies\n";
+        return 1;
       } else {
         std::cout << USAGE;
         return 1;
@@ -8777,9 +8779,6 @@ int main(int argc, char *argv[]) {
     rizin_limits.pointer_tables = opt.analysis.limit;
     rizin_limits.analysis_targets = opt.analysis.limit;
     rzb::set_analysis_limits(rizin_limits);
-    // Static relinking does per-module remote ptrace work and only adds a hex
-    // preview to the report, so it is opt-in rather than always-on.
-    opt.relink_cfg = want_relink ? &relink_cfg : nullptr;
     return cmd_dump(pkg, timeout_sec, opt, launch, launch_cmd, snapshots,
                     interval_ms)
                ? 0

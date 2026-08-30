@@ -108,14 +108,14 @@ cannot run on the build host as an Android binary.
     -DRizin_DIR="$PWD/../../cross" \
     -DRZ_GHIDRA_STATIC=ON -DBUILD_SLASPECS=OFF \
     -DBUILD_SLEIGH_PLUGIN=ON -DUSE_SYSTEM_ZLIB=OFF
-  ninja -C build-android core_ghidra asm_ghidra analysis_ghidra
+  ninja -C build-android core_ghidra
 )
 ```
 
 ## 5. Sleigh data and the binary
 
 ```bash
-make sleigh-data   # collects AARCH64.sla + cspec/ldefs/pspec (~570 KB)
+make sleigh-data   # embeds AArch64, all Dalvik variants, and JVM specs
 make check-deps
 make
 ```
@@ -131,21 +131,19 @@ dependency graph — is unnecessary: rz-ghidra reads exactly `Rizin::Core` and
 never runs a link step for them. Only the include directories matter. The final
 link is hayabusa's own `Makefile`, which names the archives explicitly.
 
-## Registering the plugins
+## Registering the decompiler plugin
 
-With `CORELIB` defined there is no loader shim, so the plugin structs are
-ordinary symbols and must be registered by hand once per `RzCore`:
+With `CORELIB` defined there is no loader shim, so the plugin struct is an
+ordinary symbol. Hayabusa links only the core decompiler plugin and registers
+it by hand once per `RzCore`; Rizin supplies the disassembly and analysis
+plugins used by the pipeline:
 
 ```c
 extern "C" {
 extern RzCorePlugin rz_core_plugin_ghidra;
-extern RzAsmPlugin rz_asm_plugin_ghidra;
-extern RzAnalysisPlugin rz_analysis_plugin_ghidra;
 }
 
 rz_core_plugin_add(core, &rz_core_plugin_ghidra);
-rz_asm_plugin_add(core->rasm, &rz_asm_plugin_ghidra);
-rz_analysis_plugin_add(core->analysis, &rz_analysis_plugin_ghidra);
 ```
 
 Then point the decompiler at the embedded sleigh data before first use:

@@ -119,6 +119,7 @@ ElfParser::recover_struct_layouts(const std::vector<uint8_t> &data,
         FieldAccess &slot = merged[fa.offset];
         slot.offset = fa.offset;
         slot.width = std::max(slot.width, fa.width);
+        slot.read = slot.read || fa.read;
         slot.written = slot.written || fa.written;
         slot.hits += fa.hits;
       }

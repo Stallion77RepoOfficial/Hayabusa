@@ -10,7 +10,7 @@
 # `Rizin::Core` and `Rizin_PLUGINDIR`. And because every rz-ghidra target is
 # built as a STATIC library, CMake never runs a link step for them -- only the
 # include directories actually matter. hayabusa's own Makefile does the final
-# link and names the archives explicitly, in dependency order.
+# link and names the mutually dependent archives explicitly as one linker group.
 
 set(Rizin_VERSION 0.9.1)
 

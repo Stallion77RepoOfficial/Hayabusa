@@ -2,6 +2,7 @@
 #include "tracer.h"
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -243,49 +244,32 @@ std::vector<MapEntry> Memory::read_maps(int pid) {
   std::string line;
   while (std::getline(maps, line)) {
     unsigned long start = 0, end = 0, offset = 0;
+    unsigned int device_major = 0, device_minor = 0;
+    unsigned long long inode = 0;
     char perms[5] = {0};
     char name[512] = {0};
     // %511[^\n] keeps paths that contain spaces intact.
-    int parsed = sscanf(line.c_str(), "%lx-%lx %4s %lx %*s %*d %511[^\n]",
-                        &start, &end, perms, &offset, name);
-    if (parsed < 4)
+    int parsed = sscanf(line.c_str(),
+                        "%lx-%lx %4s %lx %x:%x %llu %511[^\n]", &start,
+                        &end, perms, &offset, &device_major, &device_minor,
+                        &inode, name);
+    if (parsed < 7)
       continue;
     MapEntry e;
     e.start = start;
     e.end = end;
     e.offset = offset;
+    e.device_major = device_major;
+    e.device_minor = device_minor;
+    e.inode = inode;
     e.perms = perms;
-    e.name = name;
+    e.name = parsed >= 8 ? name : "";
     size_t first = e.name.find_first_not_of(" \t");
     e.name = (first == std::string::npos) ? "" : e.name.substr(first);
     entries.push_back(std::move(e));
   }
   return entries;
 }
-
-std::vector<uint8_t> Memory::dump(int pid, uint64_t addr, size_t size) {
-  std::vector<uint8_t> buf(size, 0);
-  if (size == 0)
-    return buf;
-  int fd = open(("/proc/" + std::to_string(pid) + "/mem").c_str(), O_RDONLY);
-  if (fd < 0)
-    return {};
-  bool any_read = false;
-  for (size_t off = 0; off < size; off += 4096) {
-    size_t len = std::min((size_t)4096, size - off);
-    ssize_t rd = pread(fd, buf.data() + off, len, addr + off);
-    if (rd > 0)
-      any_read = true;
-    if (rd > 0 && static_cast<size_t>(rd) < len) {
-      memset(buf.data() + off + rd, 0, len - static_cast<size_t>(rd));
-    }
-  }
-  close(fd);
-  if (!any_read)
-    return {};
-  return buf;
-}
-
 
 std::string Utils::format_size(size_t bytes) {
   const char *u[] = {"B", "KB", "MB", "GB"};
@@ -1070,16 +1054,21 @@ static size_t iterate_symbols(const std::vector<uint8_t> &data,
 // external GOT value from its ASLR-resolved address is intentionally forbidden.
 static bool repair_elf_from_disk_baseline(
     const std::vector<uint8_t> &runtime, const std::vector<uint8_t> &disk,
-    std::vector<uint8_t> *out) {
-  if (!out)
+    std::vector<uint8_t> *out, std::string *failure_reason) {
+  auto reject = [&](const char *reason) {
+    if (failure_reason)
+      *failure_reason = reason;
     return false;
+  };
+  if (!out)
+    return reject("missing repair output");
   out->clear();
 
   Elf64ProgramHeaders runtime_ph, disk_ph;
   if (!parse_elf64_program_headers(runtime, &runtime_ph) ||
       !parse_elf64_program_headers(disk, &disk_ph) ||
       runtime_ph.entries.size() != disk_ph.entries.size())
-    return false;
+    return reject("runtime/disk program-header validation failed");
 
   const Elf64_Ehdr &rh = runtime_ph.header;
   const Elf64_Ehdr &dh = disk_ph.header;
@@ -1089,11 +1078,11 @@ static bool repair_elf_from_disk_baseline(
       rh.e_entry != dh.e_entry || rh.e_phoff != dh.e_phoff ||
       rh.e_flags != dh.e_flags || rh.e_ehsize != dh.e_ehsize ||
       rh.e_phentsize != dh.e_phentsize || rh.e_phnum != dh.e_phnum)
-    return false;
+    return reject("runtime/disk ELF identity mismatch");
   for (size_t i = 0; i < runtime_ph.entries.size(); ++i)
     if (memcmp(&runtime_ph.entries[i], &disk_ph.entries[i],
                sizeof(Elf64_Phdr)) != 0)
-      return false;
+      return reject("runtime/disk segment layout mismatch");
 
   // Extended section numbering is deliberately not guessed here.  A normal
   // Android shared object has a bounded, ordinary ELF64 section table.
@@ -1102,7 +1091,7 @@ static bool repair_elf_from_disk_baseline(
       dh.e_shstrndx >= dh.e_shnum || dh.e_shoff > disk.size() ||
       dh.e_shnum > (disk.size() - static_cast<size_t>(dh.e_shoff)) /
                        sizeof(Elf64_Shdr))
-    return false;
+    return reject("disk section-header table is invalid");
   std::vector<Elf64_Shdr> sections(dh.e_shnum);
   for (size_t i = 0; i < sections.size(); ++i) {
     memcpy(&sections[i], disk.data() + static_cast<size_t>(dh.e_shoff) +
@@ -1111,19 +1100,19 @@ static bool repair_elf_from_disk_baseline(
     const Elf64_Shdr &sh = sections[i];
     if (sh.sh_type != SHT_NOBITS &&
         !byte_range_fits(disk.size(), sh.sh_offset, sh.sh_size))
-      return false;
+      return reject("disk section range is invalid");
   }
   const Elf64_Shdr &shstr = sections[dh.e_shstrndx];
   if (shstr.sh_type != SHT_STRTAB || shstr.sh_size == 0 ||
       !byte_range_fits(disk.size(), shstr.sh_offset, shstr.sh_size))
-    return false;
+    return reject("disk section-name table is invalid");
 
   const Elf64_Phdr *dynamic = nullptr;
   for (const auto &ph : disk_ph.entries) {
     if (ph.p_type != PT_DYNAMIC)
       continue;
     if (dynamic)
-      return false;
+      return reject("multiple dynamic segments are unsupported");
     dynamic = &ph;
   }
   if (!dynamic || dynamic->p_filesz < sizeof(Elf64_Dyn) ||
@@ -1133,7 +1122,7 @@ static bool repair_elf_from_disk_baseline(
       !byte_range_fits(disk.size(), dynamic->p_offset, dynamic->p_filesz) ||
       memcmp(runtime.data() + dynamic->p_offset,
              disk.data() + dynamic->p_offset, dynamic->p_filesz) != 0)
-    return false;
+    return reject("runtime/disk dynamic table mismatch");
 
   struct RelocTuple {
     uint64_t address = 0, size = 0, entry = 0;
@@ -1215,10 +1204,10 @@ static bool repair_elf_from_disk_baseline(
     }
   }
   if (!terminated || !tags_valid)
-    return false;
+    return reject("dynamic tags are unterminated or duplicated");
   if (have_symtab != have_syment ||
       (have_syment && syment != sizeof(Elf64_Sym)))
-    return false;
+    return reject("dynamic symbol-table metadata is incomplete");
 
   auto complete_tuple = [](const RelocTuple &tuple, uint64_t entry_size) {
     const bool any = tuple.have_address || tuple.have_size || tuple.have_entry;
@@ -1233,13 +1222,13 @@ static bool repair_elf_from_disk_baseline(
       ((relr.have_address || relr.have_size || relr.have_entry) &&
        (android_relr.have_address || android_relr.have_size ||
         android_relr.have_entry)))
-    return false;
+    return reject("dynamic relocation metadata is incomplete");
   const bool any_plt = have_jmprel || have_pltrelsz || have_pltrel;
   if (any_plt &&
       (!have_jmprel || !have_pltrelsz || !have_pltrel ||
        pltrelsz == 0 || pltrelsz % sizeof(Elf64_Rela) != 0 ||
        pltrel != DT_RELA))
-    return false;
+    return reject("PLT relocation metadata is incomplete");
 
   auto mapped_range = [&](uint64_t vaddr, uint64_t length,
                           uint64_t *file_offset,
@@ -1277,7 +1266,7 @@ static bool repair_elf_from_disk_baseline(
   if ((rela.have_address &&
        !table_offset(rela.address, rela.size, &rela_off)) ||
       (any_plt && !table_offset(jmprel, pltrelsz, &jmprel_off)))
-    return false;
+    return reject("runtime/disk RELA table mismatch");
   const RelocTuple *active_relr = nullptr;
   if (relr.have_address)
     active_relr = &relr;
@@ -1285,7 +1274,7 @@ static bool repair_elf_from_disk_baseline(
     active_relr = &android_relr;
   if (active_relr &&
       !table_offset(active_relr->address, active_relr->size, &relr_off))
-    return false;
+    return reject("runtime/disk RELR table mismatch");
 
   std::vector<uint8_t> fixed = disk;
   for (const auto &ph : runtime_ph.entries) {
@@ -1293,7 +1282,7 @@ static bool repair_elf_from_disk_baseline(
       continue;
     if (!byte_range_fits(runtime.size(), ph.p_offset, ph.p_filesz) ||
         !byte_range_fits(fixed.size(), ph.p_offset, ph.p_filesz))
-      return false;
+      return reject("runtime load segment is truncated");
     memcpy(fixed.data() + ph.p_offset, runtime.data() + ph.p_offset,
            ph.p_filesz);
   }
@@ -1392,16 +1381,23 @@ static bool repair_elf_from_disk_baseline(
         }
       }
       const uint64_t width = relocation_width(type);
-      if (width == 0)
+      if (width == 0) {
+        if (failure_reason)
+          *failure_reason = "unsupported AArch64 relocation type " +
+                            std::to_string(type);
         return false;
+      }
       if (!restore_target(relocation.r_offset, width))
         return false;
     }
     return true;
   };
   if ((rela.have_address && !restore_rela_table(rela_off, rela.size)) ||
-      (any_plt && !restore_rela_table(jmprel_off, pltrelsz)))
+      (any_plt && !restore_rela_table(jmprel_off, pltrelsz))) {
+    if (failure_reason && failure_reason->empty())
+      *failure_reason = "relocation target restoration failed";
     return false;
+  }
 
   if (active_relr) {
     uint64_t cursor = 0;
@@ -1414,11 +1410,11 @@ static bool repair_elf_from_disk_baseline(
         if ((entry & 7u) != 0 || (cursor != 0 && entry < cursor) ||
             !restore_target(entry, sizeof(Elf64_Addr)) ||
             !checked_add_u64(entry, sizeof(Elf64_Addr), &cursor))
-          return false;
+          return reject("invalid RELR direct entry");
         ++restored;
       } else {
         if (cursor == 0)
-          return false;
+          return reject("RELR bitmap has no base entry");
         for (unsigned bit = 1; bit < 64; ++bit) {
           if ((entry & (uint64_t{1} << bit)) == 0)
             continue;
@@ -1426,14 +1422,14 @@ static bool repair_elf_from_disk_baseline(
           if (!checked_mul_u64(bit - 1, sizeof(Elf64_Addr), &delta) ||
               !checked_add_u64(cursor, delta, &target) ||
               !restore_target(target, sizeof(Elf64_Addr)))
-            return false;
+            return reject("invalid RELR bitmap target");
           if (++restored > 10000000)
-            return false;
+            return reject("RELR restoration budget exceeded");
         }
         uint64_t advance = 0;
         if (!checked_mul_u64(63, sizeof(Elf64_Addr), &advance) ||
             !checked_add_u64(cursor, advance, &cursor))
-          return false;
+          return reject("RELR cursor overflow");
       }
     }
   }
@@ -1450,7 +1446,9 @@ static bool repair_elf_from_disk_baseline(
 template <int Bits>
 static std::vector<uint8_t> repair_elf(const std::vector<uint8_t> &data,
                                        uint64_t base_addr,
-                                       const std::vector<uint8_t> *disk) {
+                                       const std::vector<uint8_t> *disk,
+                                       bool *repaired,
+                                       std::string *failure_reason) {
   using E = ElfTypes<Bits>;
   using Ehdr = typename E::Ehdr;
   using Phdr = typename E::Phdr;
@@ -1467,8 +1465,12 @@ static std::vector<uint8_t> repair_elf(const std::vector<uint8_t> &data,
 
   if (disk) {
     std::vector<uint8_t> restored;
-    if (repair_elf_from_disk_baseline(data, *disk, &restored))
+    if (repair_elf_from_disk_baseline(data, *disk, &restored,
+                                      failure_reason)) {
+      if (repaired)
+        *repaired = true;
       return restored;
+    }
     // A supplied baseline is either authoritative or rejected. Falling back
     // to heuristic GOT reconstruction would turn a validation failure into a
     // plausible-looking but incorrect ELF.
@@ -2180,15 +2182,31 @@ static std::vector<uint8_t> repair_elf(const std::vector<uint8_t> &data,
   ehdr.e_shstrndx = 17;
   ehdr.e_shentsize = sizeof(Shdr);
   memcpy(fixed.data(), &ehdr, sizeof(ehdr));
+  if (repaired)
+    *repaired = true;
   return fixed;
 }
 
 std::vector<uint8_t> SoFixer::repair(const std::vector<uint8_t> &data,
                                      uint64_t base_addr,
-                                     const std::vector<uint8_t> *disk) {
-  if (data.size() < 5)
+                                     const std::vector<uint8_t> *disk,
+                                     bool *repaired,
+                                     std::string *failure_reason) {
+  bool local_repaired = false;
+  bool *repair_status = repaired ? repaired : &local_repaired;
+  *repair_status = false;
+  if (failure_reason)
+    failure_reason->clear();
+  if (data.size() < 5) {
+    if (failure_reason)
+      *failure_reason = "input is too small to be an ELF image";
     return data;
-  return repair_elf<64>(data, base_addr, disk);
+  }
+  std::vector<uint8_t> result =
+      repair_elf<64>(data, base_addr, disk, repair_status, failure_reason);
+  if (!*repair_status && failure_reason && failure_reason->empty())
+    *failure_reason = "ELF reconstruction rejected the input";
+  return result;
 }
 
 #ifndef PT_GNU_EH_FRAME
@@ -2310,727 +2328,31 @@ namespace {
 
 constexpr size_t kMaxMangledSymbolBytes = 4096;
 constexpr size_t kMaxDemangledOutputBytes = 16U * 1024U;
-constexpr size_t kMaxDemangleComponentBytes = 1024;
-constexpr size_t kMaxDemangleComponents = 128;
-constexpr size_t kMaxDemangleParameters = 256;
-constexpr size_t kMaxDemangleNesting = 32;
-constexpr size_t kMaxDemangleRecursion = 8;
-
-static bool is_decimal_digit(char c) {
-  return c >= '0' && c <= '9';
-}
-
-static bool is_ascii_lower(char c) { return c >= 'a' && c <= 'z'; }
-static bool is_ascii_upper(char c) { return c >= 'A' && c <= 'Z'; }
-
-// Parse a source-name length without ever forming cursor + length.  The local
-// cursor is committed only on success, so every caller can fail closed without
-// trying to recover from a half-consumed hostile decimal field.
-static bool parse_demangle_length(const std::string &input, size_t *cursor,
-                                  size_t *length) {
-  if (!cursor || !length || *cursor >= input.size() ||
-      !is_decimal_digit(input[*cursor]))
-    return false;
-
-  size_t p = *cursor;
-  size_t value = 0;
-  while (p < input.size() && is_decimal_digit(input[p])) {
-    const size_t digit = static_cast<size_t>(input[p] - '0');
-    if (value > (kMaxDemangleComponentBytes - digit) / 10)
-      return false;
-    value = value * 10 + digit;
-    ++p;
-  }
-  if (value == 0 || value > input.size() - p)
-    return false;
-  *cursor = p;
-  *length = value;
-  return true;
-}
-
-static bool append_demangled(std::string *output, const std::string &piece) {
-  if (!output || output->size() > kMaxDemangledOutputBytes ||
-      piece.size() > kMaxDemangledOutputBytes - output->size())
-    return false;
-  output->append(piece);
-  return true;
-}
-
-static std::string demangle_symbol_fallback_impl(const std::string &mangled,
-                                                 size_t recursion,
-                                                 bool *valid);
-
-static std::string demangle_symbol_fallback(const std::string &mangled) {
-  bool valid = false;
-  std::string result = demangle_symbol_fallback_impl(mangled, 0, &valid);
-  return valid ? result : mangled;
-}
 
 } // namespace
 
-// Itanium demangling is handed to libc++abi, which implements the whole ABI
-// including substitutions and nested names. The hand-rolled parser below is
-// kept only as a fallback for inputs __cxa_demangle rejects; on its own it
-// mangled real signatures into nonsense such as
-// "PurchaseItem(N const &, S, _, ShopItem)".
+// libc++abi owns the Itanium grammar. If it rejects a symbol, preserve the
+// original spelling instead of inventing a plausible but incorrect signature.
 std::string ElfParser::demangle_symbol(const std::string &mangled) {
-  if (mangled.size() > kMaxMangledSymbolBytes)
+  if (mangled.size() > kMaxMangledSymbolBytes || mangled.size() <= 2 ||
+      mangled[0] != '_' || mangled[1] != 'Z')
     return mangled;
-  if (mangled.size() > 2 && mangled[0] == '_' && mangled[1] == 'Z') {
-    int status = 0;
-    char *out = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
-    if (status == 0 && out) {
-      const size_t length = strnlen(out, kMaxDemangledOutputBytes + 1);
-      std::string s;
-      if (length <= kMaxDemangledOutputBytes)
-        s.assign(out, length);
-      free(out);
-      out = nullptr;
-      if (!s.empty())
-        return s;
-    }
+
+  int status = 0;
+  char *out = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+  if (status != 0 || !out) {
     if (out)
       free(out);
-  }
-  return demangle_symbol_fallback(mangled);
-}
-
-namespace {
-
-static std::string demangle_symbol_fallback_impl(const std::string &mangled,
-                                                 size_t recursion,
-                                                 bool *valid) {
-  if (valid)
-    *valid = false;
-  if (mangled.empty() || mangled.size() > kMaxMangledSymbolBytes ||
-      recursion > kMaxDemangleRecursion)
-    return mangled;
-
-  auto finish = [&](std::string output) {
-    if (output.size() > kMaxDemangledOutputBytes)
-      return mangled;
-    if (valid)
-      *valid = true;
-    return output;
-  };
-
-  if (mangled.find("_GLOBAL__") == 0) {
-    if (mangled.find("_GLOBAL__I_") == 0)
-      return finish("[global constructor] " + mangled.substr(11));
-    if (mangled.find("_GLOBAL__D_") == 0)
-      return finish("[global destructor] " + mangled.substr(11));
-    if (mangled.find("_GLOBAL__sub_I_") == 0)
-      return finish("[static init] " + mangled.substr(15));
-    return finish(mangled);
-  }
-
-  if (mangled.find("_ZGV") == 0) {
-    bool inner_valid = false;
-    std::string inner = demangle_symbol_fallback_impl(
-        "_Z" + mangled.substr(4), recursion + 1, &inner_valid);
-    return inner_valid ? finish("[guard variable] " + inner) : mangled;
-  }
-
-  if (mangled.find("_ZTV") == 0) {
-    bool inner_valid = false;
-    std::string inner = demangle_symbol_fallback_impl(
-        "_Z" + mangled.substr(4), recursion + 1, &inner_valid);
-    return inner_valid ? finish("[vtable] " + inner) : mangled;
-  }
-
-  if (mangled.find("_ZTI") == 0) {
-    bool inner_valid = false;
-    std::string inner = demangle_symbol_fallback_impl(
-        "_Z" + mangled.substr(4), recursion + 1, &inner_valid);
-    return inner_valid ? finish("[typeinfo] " + inner) : mangled;
-  }
-
-  if (mangled.find("_ZTS") == 0) {
-    bool inner_valid = false;
-    std::string inner = demangle_symbol_fallback_impl(
-        "_Z" + mangled.substr(4), recursion + 1, &inner_valid);
-    return inner_valid ? finish("[typeinfo name] " + inner) : mangled;
-  }
-
-  if (mangled.find("_ZTh") == 0 || mangled.find("_ZTv") == 0) {
-    size_t pos = 4;
-    while (pos < mangled.size() && (is_decimal_digit(mangled[pos]) ||
-                                    mangled[pos] == 'n' || mangled[pos] == '_'))
-      pos++;
-    if (pos < mangled.size()) {
-      bool inner_valid = false;
-      std::string inner = demangle_symbol_fallback_impl(
-          "_Z" + mangled.substr(pos), recursion + 1, &inner_valid);
-      if (inner_valid)
-        return finish("[virtual thunk] " + inner);
-    }
     return mangled;
   }
 
-  if (mangled.find("_ZTc") == 0)
-    return mangled;
-
-  if (mangled[0] != '_')
-    return finish(mangled);
-  if (mangled.size() < 3 || mangled[1] != 'Z')
-    return finish(mangled);
-
+  const size_t length = strnlen(out, kMaxDemangledOutputBytes + 1);
   std::string result;
-  size_t pos = 2;
-  bool is_const_method = false;
-  bool is_volatile_method = false;
-  bool malformed = false;
-  bool nested_name = false;
-  bool nested_name_closed = true;
-  std::vector<std::string> components;
-
-  while (pos < mangled.size()) {
-    if (mangled[pos] == 'K') {
-      is_const_method = true;
-      pos++;
-    } else if (mangled[pos] == 'V') {
-      is_volatile_method = true;
-      pos++;
-    } else {
-      break;
-    }
-  }
-
-  if (pos < mangled.size() && mangled[pos] == 'N') {
-    nested_name = true;
-    nested_name_closed = false;
-    pos++;
-    while (
-        pos < mangled.size() &&
-        (mangled[pos] == 'K' || mangled[pos] == 'V' || mangled[pos] == 'r')) {
-      if (mangled[pos] == 'K')
-        is_const_method = true;
-      pos++;
-    }
-  }
-
-  auto parse_operator = [](const std::string &m, size_t &p) -> std::string {
-    if (p + 2 > m.size())
-      return "";
-    std::string op = m.substr(p, 2);
-    p += 2;
-    if (op == "nw")
-      return "operator new";
-    if (op == "na")
-      return "operator new[]";
-    if (op == "dl")
-      return "operator delete";
-    if (op == "da")
-      return "operator delete[]";
-    if (op == "ps")
-      return "operator+";
-    if (op == "ng")
-      return "operator-";
-    if (op == "ad")
-      return "operator&";
-    if (op == "de")
-      return "operator*";
-    if (op == "co")
-      return "operator~";
-    if (op == "pl")
-      return "operator+";
-    if (op == "mi")
-      return "operator-";
-    if (op == "ml")
-      return "operator*";
-    if (op == "dv")
-      return "operator/";
-    if (op == "rm")
-      return "operator%";
-    if (op == "an")
-      return "operator&";
-    if (op == "or")
-      return "operator|";
-    if (op == "eo")
-      return "operator^";
-    if (op == "aS")
-      return "operator=";
-    if (op == "pL")
-      return "operator+=";
-    if (op == "mI")
-      return "operator-=";
-    if (op == "mL")
-      return "operator*=";
-    if (op == "dV")
-      return "operator/=";
-    if (op == "rM")
-      return "operator%=";
-    if (op == "aN")
-      return "operator&=";
-    if (op == "oR")
-      return "operator|=";
-    if (op == "eO")
-      return "operator^=";
-    if (op == "ls")
-      return "operator<<";
-    if (op == "rs")
-      return "operator>>";
-    if (op == "lS")
-      return "operator<<=";
-    if (op == "rS")
-      return "operator>>=";
-    if (op == "eq")
-      return "operator==";
-    if (op == "ne")
-      return "operator!=";
-    if (op == "lt")
-      return "operator<";
-    if (op == "gt")
-      return "operator>";
-    if (op == "le")
-      return "operator<=";
-    if (op == "ge")
-      return "operator>=";
-    if (op == "ss")
-      return "operator<=>";
-    if (op == "nt")
-      return "operator!";
-    if (op == "aa")
-      return "operator&&";
-    if (op == "oo")
-      return "operator||";
-    if (op == "pp")
-      return "operator++";
-    if (op == "mm")
-      return "operator--";
-    if (op == "cm")
-      return "operator,";
-    if (op == "pm")
-      return "operator->*";
-    if (op == "pt")
-      return "operator->";
-    if (op == "cl")
-      return "operator()";
-    if (op == "ix")
-      return "operator[]";
-    if (op == "qu")
-      return "operator?";
-    if (op == "cv")
-      return "operator (type)";
-    if (op == "li")
-      return "operator \"\"";
-    p -= 2;
-    return "";
-  };
-
-  std::function<std::string(void)> parse_name = [&]() -> std::string {
-    if (pos >= mangled.size())
-      return "";
-
-    if (mangled[pos] == 'C' && pos + 1 < mangled.size() &&
-        is_decimal_digit(mangled[pos + 1])) {
-      pos += 2;
-      if (!components.empty())
-        return components.back();
-      return "[constructor]";
-    }
-
-    if (mangled[pos] == 'D' && pos + 1 < mangled.size() &&
-        is_decimal_digit(mangled[pos + 1])) {
-      pos += 2;
-      if (!components.empty())
-        return "~" + components.back();
-      return "[destructor]";
-    }
-
-    if (pos + 2 <= mangled.size()) {
-      std::string op = parse_operator(mangled, pos);
-      if (!op.empty())
-        return op;
-    }
-
-    if (mangled[pos] == 'S') {
-      pos++;
-      if (pos < mangled.size()) {
-        char c = mangled[pos];
-        if (c == 't') {
-          pos++;
-          return "std";
-        }
-        if (c == 'a') {
-          pos++;
-          return "std::allocator";
-        }
-        if (c == 'b') {
-          pos++;
-          return "std::basic_string";
-        }
-        if (c == 's') {
-          pos++;
-          return "std::string";
-        }
-        if (c == 'i') {
-          pos++;
-          return "std::istream";
-        }
-        if (c == 'o') {
-          pos++;
-          return "std::ostream";
-        }
-        if (c == 'd') {
-          pos++;
-          return "std::iostream";
-        }
-        if (c == '_') {
-          pos++;
-          return "[subst]";
-        }
-        if (is_decimal_digit(c) || is_ascii_upper(c)) {
-          while (pos < mangled.size() && mangled[pos] != '_')
-            pos++;
-          if (pos >= mangled.size()) {
-            malformed = true;
-            return "";
-          }
-          pos++;
-          return "[subst]";
-        }
-      }
-      malformed = true;
-      return "";
-    }
-
-    if (!is_decimal_digit(mangled[pos]))
-      return "";
-
-    size_t len = 0;
-    if (!parse_demangle_length(mangled, &pos, &len)) {
-      malformed = true;
-      return "";
-    }
-
-    std::string name = mangled.substr(pos, len);
-    pos += len;
-
-    if (pos < mangled.size() && mangled[pos] == 'I') {
-      pos++;
-      std::string targs;
-      size_t depth = 1;
-      size_t argument_count = 0;
-      while (pos < mangled.size() && depth > 0) {
-        const char c = mangled[pos];
-        if (c == 'I') {
-          if (depth >= kMaxDemangleNesting) {
-            malformed = true;
-            return "";
-          }
-          ++depth;
-          ++pos;
-          continue;
-        }
-        if (c == 'E') {
-          --depth;
-          ++pos;
-          continue;
-        }
-        if (c == 'P' || c == 'R' || c == 'K') {
-          ++pos;
-          continue;
-        }
-
-        std::string argument;
-        if (c == 'i')
-          argument = "int";
-        else if (c == 'f')
-          argument = "float";
-        else if (c == 'd')
-          argument = "double";
-        else if (c == 'b')
-          argument = "bool";
-        else if (c == 'c')
-          argument = "char";
-        else if (c == 'v')
-          argument = "void";
-
-        if (!argument.empty()) {
-          ++pos;
-        } else if (is_decimal_digit(c)) {
-          size_t tlen = 0;
-          if (!parse_demangle_length(mangled, &pos, &tlen)) {
-            malformed = true;
-            return "";
-          }
-          argument = mangled.substr(pos, tlen);
-          pos += tlen;
-        } else {
-          malformed = true;
-          return "";
-        }
-
-        if (++argument_count > kMaxDemangleParameters ||
-            !append_demangled(&targs,
-                              targs.empty() ? argument : ", " + argument)) {
-          malformed = true;
-          return "";
-        }
-      }
-      if (depth != 0 ||
-          !append_demangled(&name,
-                            targs.empty() ? "<...>" : "<" + targs + ">") ||
-          name.size() > kMaxDemangleComponentBytes) {
-        malformed = true;
-        return "";
-      }
-    }
-
-    return name;
-  };
-
-  while (pos < mangled.size()) {
-    if (mangled[pos] == 'E') {
-      if (!nested_name) {
-        malformed = true;
-        break;
-      }
-      pos++;
-      nested_name_closed = true;
-      break;
-    }
-    if (!is_decimal_digit(mangled[pos]) && mangled[pos] != 'C' &&
-        mangled[pos] != 'D' &&
-        mangled[pos] != 'S' &&
-        !(pos + 2 <= mangled.size() && is_ascii_lower(mangled[pos]) &&
-          is_ascii_lower(mangled[pos + 1]))) {
-      break;
-    }
-    const size_t before = pos;
-    std::string comp = parse_name();
-    if (comp.empty()) {
-      if (pos != before)
-        malformed = true;
-      break;
-    }
-    if (pos <= before) {
-      malformed = true;
-      break;
-    }
-    if (comp != "[subst]") {
-      if (components.size() >= kMaxDemangleComponents ||
-          comp.size() > kMaxDemangleComponentBytes) {
-        malformed = true;
-        break;
-      }
-      components.push_back(comp);
-    }
-  }
-
-  if (nested_name && !nested_name_closed)
-    malformed = true;
-  if (components.empty())
-    malformed = true;
-  for (size_t i = 0; i < components.size(); i++) {
-    if (!append_demangled(&result,
-                          (i > 0 ? "::" : "") + components[i])) {
-      malformed = true;
-      break;
-    }
-  }
-
-  std::string params;
-  auto parse_type = [&]() -> std::string {
-    if (pos >= mangled.size())
-      return "";
-    std::string prefix;
-    size_t qualifier_count = 0;
-    while (pos < mangled.size()) {
-      char c = mangled[pos];
-      if (c == 'P') {
-        prefix += "*";
-        pos++;
-      } else if (c == 'R') {
-        prefix += "&";
-        pos++;
-      } else if (c == 'O') {
-        prefix += "&&";
-        pos++;
-      } else if (c == 'K') {
-        prefix = "const " + prefix;
-        pos++;
-      } else if (c == 'V') {
-        prefix = "volatile " + prefix;
-        pos++;
-      } else if (c == 'r') {
-        prefix = "restrict " + prefix;
-        pos++;
-      } else
-        break;
-      if (++qualifier_count > kMaxDemangleNesting ||
-          prefix.size() > kMaxDemangleComponentBytes) {
-        malformed = true;
-        return "";
-      }
-    }
-    if (pos >= mangled.size()) {
-      malformed = true;
-      return "";
-    }
-    char c = mangled[pos++];
-    std::string base;
-    switch (c) {
-    case 'v':
-      base = "void";
-      break;
-    case 'w':
-      base = "wchar_t";
-      break;
-    case 'b':
-      base = "bool";
-      break;
-    case 'c':
-      base = "char";
-      break;
-    case 'a':
-      base = "signed char";
-      break;
-    case 'h':
-      base = "unsigned char";
-      break;
-    case 's':
-      base = "short";
-      break;
-    case 't':
-      base = "unsigned short";
-      break;
-    case 'i':
-      base = "int";
-      break;
-    case 'j':
-      base = "unsigned int";
-      break;
-    case 'l':
-      base = "long";
-      break;
-    case 'm':
-      base = "unsigned long";
-      break;
-    case 'x':
-      base = "long long";
-      break;
-    case 'y':
-      base = "unsigned long long";
-      break;
-    case 'n':
-      base = "__int128";
-      break;
-    case 'o':
-      base = "unsigned __int128";
-      break;
-    case 'f':
-      base = "float";
-      break;
-    case 'd':
-      base = "double";
-      break;
-    case 'e':
-      base = "long double";
-      break;
-    case 'g':
-      base = "__float128";
-      break;
-    case 'z':
-      base = "...";
-      break;
-    case 'D':
-      if (pos < mangled.size()) {
-        char d = mangled[pos++];
-        if (d == 'n')
-          base = "decltype(nullptr)";
-        else if (d == 'a')
-          base = "auto";
-        else if (d == 'c')
-          base = "decltype(auto)";
-        else if (d == 'i')
-          base = "char32_t";
-        else if (d == 's')
-          base = "char16_t";
-        else if (d == 'u')
-          base = "char8_t";
-        else
-          malformed = true;
-      } else
-        malformed = true;
-      break;
-    case 'u': {
-      size_t len = 0;
-      if (!parse_demangle_length(mangled, &pos, &len)) {
-        malformed = true;
-        break;
-      }
-      base = mangled.substr(pos, len);
-      pos += len;
-      break;
-    }
-    default:
-      if (is_decimal_digit(c)) {
-        pos--;
-        size_t len = 0;
-        if (!parse_demangle_length(mangled, &pos, &len)) {
-          malformed = true;
-          break;
-        }
-        base = mangled.substr(pos, len);
-        pos += len;
-      } else {
-        malformed = true;
-      }
-      break;
-    }
-    if (malformed || base.empty()) {
-      malformed = true;
-      return "";
-    }
-    std::string parsed = prefix.empty() ? base : base + " " + prefix;
-    if (parsed.size() > kMaxDemangleComponentBytes) {
-      malformed = true;
-      return "";
-    }
-    return parsed;
-  };
-
-  size_t parameter_count = 0;
-  while (pos < mangled.size() && mangled[pos] != 'E') {
-    const size_t before = pos;
-    std::string ptype = parse_type();
-    if (ptype.empty() || pos <= before) {
-      malformed = true;
-      break;
-    }
-    if (++parameter_count > kMaxDemangleParameters) {
-      malformed = true;
-      break;
-    }
-    if (ptype == "void" && params.empty()) {
-      if (pos != mangled.size())
-        malformed = true;
-      break;
-    }
-    if (!append_demangled(&params,
-                          params.empty() ? ptype : ", " + ptype)) {
-      malformed = true;
-      break;
-    }
-  }
-
-  if (pos != mangled.size())
-    malformed = true;
-  if (!malformed && !result.empty()) {
-    if (!append_demangled(&result, "(" + params + ")") ||
-        (is_const_method && !append_demangled(&result, " const")) ||
-        (is_volatile_method && !append_demangled(&result, " volatile"))) {
-      malformed = true;
-    }
-  }
-
-  return malformed || result.empty() ? mangled : finish(result);
+  if (length <= kMaxDemangledOutputBytes)
+    result.assign(out, length);
+  free(out);
+  return result.empty() ? mangled : result;
 }
-
-} // namespace
-
 bool ElfParser::is_objc_method(const std::string &symbol) {
   if (symbol.size() < 4)
     return false;
@@ -3071,17 +2393,15 @@ static bool looks_like_text(const std::string &s) {
   if (s.size() < 12)
     return false;
 
-  size_t letters = 0, digits = 0, punct = 0, spaces = 0;
+  size_t letters = 0, punct = 0, spaces = 0;
   size_t max_run = 0, run = 1;
   for (size_t i = 0; i < s.size(); i++) {
     unsigned char c = static_cast<unsigned char>(s[i]);
     if (isalpha(c))
       letters++;
-    else if (isdigit(c))
-      digits++;
     else if (c == ' ')
       spaces++;
-    else
+    else if (!isdigit(c))
       punct++;
     if (i && s[i] == s[i - 1]) {
       if (++run > max_run)
@@ -3098,7 +2418,6 @@ static bool looks_like_text(const std::string &s) {
     return false;
   if (punct + spaces > s.size() / 2)
     return false;
-  (void)digits;
 
   // Require a pronounceable core: at least one vowel and one 4+ letter word.
   size_t word = 0, best_word = 0;
@@ -3214,11 +2533,13 @@ ElfParser::find_encrypted_strings(const std::vector<uint8_t> &data,
   return results;
 }
 
-static uint64_t find_dynamic_entry(const std::vector<uint8_t> &data,
-                                   int64_t tag) {
+static bool find_dynamic_entry(const std::vector<uint8_t> &data, int64_t tag,
+                               uint64_t *value) {
+  if (!value)
+    return false;
   Elf64ProgramHeaders program_headers;
   if (!parse_elf64_program_headers(data, &program_headers))
-    return 0;
+    return false;
   for (const auto &ph : program_headers.entries) {
     if (ph.p_type != PT_DYNAMIC)
       continue;
@@ -3232,11 +2553,13 @@ static uint64_t find_dynamic_entry(const std::vector<uint8_t> &data,
       memcpy(&dyn, data.data() + ph.p_offset + j * sizeof(dyn), sizeof(dyn));
       if (dyn.d_tag == DT_NULL)
         break;
-      if (dyn.d_tag == tag)
-        return dyn.d_un.d_val;
+      if (dyn.d_tag == tag) {
+        *value = dyn.d_un.d_val;
+        return true;
+      }
     }
   }
-  return 0;
+  return false;
 }
 
 bool ElfParser::has_relro(const std::vector<uint8_t> &data) {
@@ -3253,8 +2576,13 @@ bool ElfParser::has_relro(const std::vector<uint8_t> &data) {
 bool ElfParser::has_full_relro(const std::vector<uint8_t> &data) {
   if (!has_relro(data))
     return false;
-  uint64_t flags = find_dynamic_entry(data, DT_FLAGS);
-  return (flags & 0x8) != 0;
+  uint64_t value = 0;
+  if (find_dynamic_entry(data, DT_BIND_NOW, &value))
+    return true;
+  if (find_dynamic_entry(data, DT_FLAGS, &value) && (value & DF_BIND_NOW) != 0)
+    return true;
+  return find_dynamic_entry(data, DT_FLAGS_1, &value) &&
+         (value & DF_1_NOW) != 0;
 }
 
 
@@ -3262,8 +2590,9 @@ std::vector<uint64_t>
 ElfParser::get_init_array(const std::vector<uint8_t> &data) {
   std::vector<uint64_t> funcs;
 
-  uint64_t init_arr = find_dynamic_entry(data, DT_INIT_ARRAY);
-  uint64_t init_sz = find_dynamic_entry(data, DT_INIT_ARRAYSZ);
+  uint64_t init_arr = 0, init_sz = 0;
+  find_dynamic_entry(data, DT_INIT_ARRAY, &init_arr);
+  find_dynamic_entry(data, DT_INIT_ARRAYSZ, &init_sz);
 
   if (init_arr == 0 || init_sz == 0)
     return funcs;
@@ -3289,8 +2618,9 @@ std::vector<uint64_t>
 ElfParser::get_fini_array(const std::vector<uint8_t> &data) {
   std::vector<uint64_t> funcs;
 
-  uint64_t fini_arr = find_dynamic_entry(data, DT_FINI_ARRAY);
-  uint64_t fini_sz = find_dynamic_entry(data, DT_FINI_ARRAYSZ);
+  uint64_t fini_arr = 0, fini_sz = 0;
+  find_dynamic_entry(data, DT_FINI_ARRAY, &fini_arr);
+  find_dynamic_entry(data, DT_FINI_ARRAYSZ, &fini_sz);
 
   if (fini_arr == 0 || fini_sz == 0)
     return funcs;
@@ -3346,19 +2676,24 @@ static bool parse_pattern(const std::string &pattern,
       bytes.push_back(0);
       mask.push_back(false);
     } else {
-      try {
-        unsigned long v = std::stoul(token, nullptr, 16);
-        if (v > 0xFF)
-          return false;
-        uint8_t b = static_cast<uint8_t>(v);
-        bytes.push_back(b);
-        mask.push_back(true);
-      } catch (...) {
+      unsigned int value = 0;
+      const char *begin = token.data();
+      const char *end = begin + token.size();
+      const auto parsed = std::from_chars(begin, end, value, 16);
+      if (token.size() > 2 || parsed.ec != std::errc{} ||
+          parsed.ptr != end || value > 0xff)
         return false;
-      }
+      bytes.push_back(static_cast<uint8_t>(value));
+      mask.push_back(true);
     }
   }
   return !bytes.empty();
+}
+
+size_t ElfParser::pattern_width(const std::string &pattern) {
+  std::vector<uint8_t> bytes;
+  std::vector<bool> mask;
+  return parse_pattern(pattern, bytes, mask) ? bytes.size() : 0;
 }
 
 std::vector<PatternMatch>
@@ -3499,7 +2834,7 @@ size_t ElfParser::write_rtti(std::ostream &out,
     // bytes like 0xd61f0220 ("br x17").
     uint64_t typeinfo_addr = 0;
     auto read_ptr_at = [&](uint64_t off, uint64_t *out) -> bool {
-      if (off + ptr_size > data.size())
+      if (!out || off > data.size() || ptr_size > data.size() - off)
         return false;
       memcpy(out, data.data() + off, ptr_size);
       return true;
@@ -3514,15 +2849,17 @@ size_t ElfParser::write_rtti(std::ostream &out,
       return vaddr_to_offset(data, rel, p);
     };
     uint64_t cand = 0;
-    if (read_ptr_at(vtable_off + ptr_size, &cand) && resolves(cand)) {
-      typeinfo_addr = cand;
-    } else if (vtable_off >= ptr_size * 2 &&
-               read_ptr_at(vtable_off - ptr_size * 2, &cand) &&
-               resolves(cand)) {
+    bool have_typeinfo =
+        vtable_off <= std::numeric_limits<uint64_t>::max() - ptr_size &&
+        read_ptr_at(vtable_off + ptr_size, &cand) && resolves(cand);
+    if (!have_typeinfo && vtable_off >= ptr_size * 2) {
       // Fallback for images where the recorded address is the vtable pointer
       // an object holds rather than the start of the vtable object.
-      typeinfo_addr = cand;
+      have_typeinfo = read_ptr_at(vtable_off - ptr_size * 2, &cand) &&
+                      resolves(cand);
     }
+    if (have_typeinfo)
+      typeinfo_addr = cand;
 
     size_t vtable_bytes = static_cast<size_t>(s->size);
     if (vtable_bytes == 0 && i + 1 < sorted.size()) {
@@ -4177,34 +3514,31 @@ size_t RuntimeAnalyzer::trace_init_array(
   std::vector<uint8_t> actual;
   if (identity_matches) {
     size_t verified = 0;
-    if (identity_matches) {
-      try {
-        actual.resize(4096);
-      } catch (...) {
-        identity_matches = false;
-      }
-      for (const auto &ph : program_headers.entries) {
-        if (!identity_matches || verified >= actual.size())
-          break;
-        if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
-          continue;
-        size_t amount = static_cast<size_t>(std::min<uint64_t>(
-            ph.p_filesz, actual.size() - verified));
-        if (ph.p_offset > expected_image.size() ||
-            amount > expected_image.size() - ph.p_offset ||
-            ph.p_vaddr > std::numeric_limits<uint64_t>::max() - base ||
-            !ProcessTracer::read_memory(pid, base + ph.p_vaddr,
-                                        actual.data(), amount) ||
-            memcmp(actual.data(), expected_image.data() + ph.p_offset,
-                   amount) != 0) {
-          identity_matches = false;
-          break;
-        }
-        verified += amount;
-      }
-      identity_matches =
-          identity_matches && verified >= sizeof(Elf64_Ehdr);
+    try {
+      actual.resize(4096);
+    } catch (...) {
+      identity_matches = false;
     }
+    for (const auto &ph : program_headers.entries) {
+      if (!identity_matches || verified >= actual.size())
+        break;
+      if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
+        continue;
+      size_t amount = static_cast<size_t>(std::min<uint64_t>(
+          ph.p_filesz, actual.size() - verified));
+      if (ph.p_offset > expected_image.size() ||
+          amount > expected_image.size() - ph.p_offset ||
+          ph.p_vaddr > std::numeric_limits<uint64_t>::max() - base ||
+          !ProcessTracer::read_memory(pid, base + ph.p_vaddr, actual.data(),
+                                      amount) ||
+          memcmp(actual.data(), expected_image.data() + ph.p_offset, amount) !=
+              0) {
+        identity_matches = false;
+        break;
+      }
+      verified += amount;
+    }
+    identity_matches = identity_matches && verified >= sizeof(Elf64_Ehdr);
   }
   if (!identity_matches || signal_window.interrupted()) {
     g_trace_init_status = signal_window.interrupted()
@@ -5126,6 +4460,7 @@ ElfParser::find_high_entropy_regions(const std::vector<uint8_t> &data,
 
   size_t step = std::max<size_t>(1, block_size / 2);
   uint64_t region_start = 0;
+  uint64_t region_end = 0;
   bool in_high_entropy = false;
   double max_entropy = 0;
 
@@ -5140,12 +4475,13 @@ ElfParser::find_high_entropy_regions(const std::vector<uint8_t> &data,
       } else {
         max_entropy = std::max(max_entropy, entropy);
       }
+      region_end = i + block_size;
     } else if (in_high_entropy) {
       if (results.size() >= max_results)
         return results;
       EntropyInfo info;
       info.offset = region_start;
-      info.size = i - region_start;
+      info.size = static_cast<size_t>(region_end - region_start);
       info.entropy = max_entropy;
       info.likely_encrypted = (max_entropy > 7.5);
       info.likely_compressed = (max_entropy > 7.0 && max_entropy <= 7.5);
@@ -5159,7 +4495,7 @@ ElfParser::find_high_entropy_regions(const std::vector<uint8_t> &data,
       return results;
     EntropyInfo info;
     info.offset = region_start;
-    info.size = data.size() - region_start;
+    info.size = static_cast<size_t>(region_end - region_start);
     info.entropy = max_entropy;
     info.likely_encrypted = (max_entropy > 7.5);
     info.likely_compressed = (max_entropy > 7.0 && max_entropy <= 7.5);

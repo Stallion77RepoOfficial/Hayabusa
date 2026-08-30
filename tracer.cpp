@@ -374,12 +374,13 @@ static bool resolve_child_event_before_detach(int parent_tgid, int parent_tid) {
 static StopWaitResult stop_and_wait_for_detach(int tgid, int tid) {
   errno = 0;
   if (ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) < 0) {
-    if (errno == ESRCH && !thread_is_member(tgid, tid))
+    const int interrupt_errno = errno;
+    if (interrupt_errno == ESRCH && !thread_is_member(tgid, tid))
       return StopWaitResult::Gone;
     // EIO commonly means a seized tracee is already in a ptrace-stop whose
     // wait status has not been consumed yet. Poll it below instead of adding a
     // target-visible signal.
-    if (errno != EIO)
+    if (interrupt_errno != EIO)
       return StopWaitResult::Failed;
   }
 
@@ -2405,18 +2406,15 @@ bool ProcessTracer::interrupt(int tid) {
 // Syscall number and arguments at a PTRACE_SYSCALL stop.
 bool ProcessTracer::get_syscall(int pid, uint64_t *nr, uint64_t *args,
                                 size_t n) {
-  {
-    user_regs_struct_64 regs{};
-    struct iovec iov = {&regs, sizeof(regs)};
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
-      return false;
-    if (nr)
-      *nr = regs.regs[8];
-    for (size_t i = 0; i < n && i < 8; i++)
-      args[i] = regs.regs[i];
-    return true;
-  }
-  return false;
+  user_regs_struct_64 regs{};
+  struct iovec iov = {&regs, sizeof(regs)};
+  if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    return false;
+  if (nr)
+    *nr = regs.regs[8];
+  for (size_t i = 0; i < n && i < 8; i++)
+    args[i] = regs.regs[i];
+  return true;
 }
 
 bool ProcessTracer::get_syscall_stop(int pid, SyscallStopInfo *info) {
@@ -2802,10 +2800,14 @@ bool ProcessTracer::release_auto_attached_child(int child, int signal,
 
 // pid of the thread/process just created, at a clone/fork event stop.
 bool ProcessTracer::event_child(int pid, int *child) {
+  if (!child)
+    return false;
   unsigned long msg = 0;
   if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg) < 0)
     return false;
-  *child = (int)msg;
+  if (msg == 0 || msg > static_cast<unsigned long>(INT_MAX))
+    return false;
+  *child = static_cast<int>(msg);
   return true;
 }
 
@@ -3885,199 +3887,9 @@ RemoteCallResult FunctionHooker::inject_library(
   return MemoryInjector::remote_dlopen(pid, lib_path, RTLD_NOW);
 }
 
-std::vector<RelinkEntry>
-StaticRelinker::find_external_calls(const std::vector<uint8_t> &data,
-                                    uint64_t base) {
-  (void)base;
-  std::vector<RelinkEntry> entries;
-  constexpr uint64_t kMaxDynamicBytes = 1ULL << 20;
-
-  Elf64ProgramHeaders elf;
-  if (!parse_elf64_program_headers(data, &elf))
-    return entries;
-
-  size_t dyn_off = 0;
-  size_t dyn_size = 0;
-  bool found_dynamic = false;
-  for (const Elf64_Phdr &ph : elf.entries) {
-    if (ph.p_type != PT_DYNAMIC)
-      continue;
-    if (ph.p_filesz < sizeof(Elf64_Dyn) ||
-        ph.p_filesz > kMaxDynamicBytes || ph.p_offset > data.size() ||
-        ph.p_filesz > data.size() - static_cast<size_t>(ph.p_offset)) {
-      return entries;
-    }
-    dyn_off = static_cast<size_t>(ph.p_offset);
-    dyn_size = static_cast<size_t>(ph.p_filesz);
-    found_dynamic = true;
-    break;
-  }
-  if (!found_dynamic)
-    return entries;
-
-  uint64_t jmprel = 0;
-  uint64_t pltrelsz = 0;
-  uint64_t symtab = 0;
-  uint64_t strtab = 0;
-  uint64_t strtab_size = 0;
-  uint64_t syment_size = 0;
-  uint64_t relaent_size = 0;
-  uint64_t pltrel_kind = 0;
-  bool saw_null = false;
-  for (size_t offset = 0; offset <= dyn_size - sizeof(Elf64_Dyn);
-       offset += sizeof(Elf64_Dyn)) {
-    Elf64_Dyn dyn{};
-    memcpy(&dyn, data.data() + dyn_off + offset, sizeof(dyn));
-    if (dyn.d_tag == DT_NULL) {
-      saw_null = true;
-      break;
-    }
-    switch (dyn.d_tag) {
-    case DT_JMPREL:
-      jmprel = dyn.d_un.d_ptr;
-      break;
-    case DT_PLTRELSZ:
-      pltrelsz = dyn.d_un.d_val;
-      break;
-    case DT_PLTREL:
-      pltrel_kind = dyn.d_un.d_val;
-      break;
-    case DT_RELAENT:
-      relaent_size = dyn.d_un.d_val;
-      break;
-    case DT_SYMTAB:
-      symtab = dyn.d_un.d_ptr;
-      break;
-    case DT_SYMENT:
-      syment_size = dyn.d_un.d_val;
-      break;
-    case DT_STRTAB:
-      strtab = dyn.d_un.d_ptr;
-      break;
-    case DT_STRSZ:
-      strtab_size = dyn.d_un.d_val;
-      break;
-    }
-  }
-  if (!saw_null || jmprel == 0 || pltrelsz == 0 || symtab == 0 ||
-      strtab == 0 || strtab_size == 0 || pltrel_kind != DT_RELA ||
-      (relaent_size != 0 && relaent_size != sizeof(Elf64_Rela)) ||
-      (syment_size != 0 && syment_size != sizeof(Elf64_Sym))) {
-    return entries;
-  }
-
-  auto vaddr_to_off = [&](uint64_t vaddr, uint64_t &out) -> bool {
-    for (const Elf64_Phdr &ph : elf.entries) {
-      if (ph.p_type != PT_LOAD || vaddr < ph.p_vaddr)
-        continue;
-      const uint64_t delta = vaddr - ph.p_vaddr;
-      if (delta >= ph.p_filesz)
-        continue;
-      uint64_t offset = 0;
-      if (!checked_u64_add(ph.p_offset, delta, &offset) ||
-          offset >= data.size()) {
-        return false;
-      }
-      out = offset;
-      return true;
-    }
-    // Some callers may provide an already flattened in-memory image rather
-    // than file layout. Retain the old direct-offset fallback, but only after
-    // a valid PT_LOAD mapping has had the first chance to resolve the vaddr.
-    if (vaddr < data.size()) {
-      out = vaddr;
-      return true;
-    }
-    return false;
-  };
-
-  uint64_t jmprel_off = 0, symtab_off = 0, strtab_off = 0;
-  if (!vaddr_to_off(jmprel, jmprel_off) || !vaddr_to_off(symtab, symtab_off) ||
-      !vaddr_to_off(strtab, strtab_off))
-    return entries;
-
-  if (jmprel_off > data.size() ||
-      pltrelsz > data.size() - static_cast<size_t>(jmprel_off) ||
-      pltrelsz % sizeof(Elf64_Rela) != 0 || strtab_off > data.size() ||
-      strtab_size > data.size() - static_cast<size_t>(strtab_off) ||
-      symtab_off >= data.size()) {
-    return entries;
-  }
-
-  const size_t count = static_cast<size_t>(pltrelsz / sizeof(Elf64_Rela));
-  for (size_t i = 0; i < count; i++) {
-    const size_t rel_off = static_cast<size_t>(jmprel_off) +
-                           i * sizeof(Elf64_Rela);
-    Elf64_Rela rela{};
-    memcpy(&rela, data.data() + rel_off, sizeof(rela));
-    const uint32_t sym_idx = ELF64_R_SYM(rela.r_info);
-    const size_t available_symbols =
-        (data.size() - static_cast<size_t>(symtab_off)) / sizeof(Elf64_Sym);
-    if (sym_idx >= available_symbols)
-      continue;
-    const size_t sym_off = static_cast<size_t>(symtab_off) +
-                           static_cast<size_t>(sym_idx) * sizeof(Elf64_Sym);
-    Elf64_Sym symbol{};
-    memcpy(&symbol, data.data() + sym_off, sizeof(symbol));
-    if (symbol.st_name == 0 || symbol.st_name >= strtab_size)
-      continue;
-
-    const size_t name_off = static_cast<size_t>(strtab_off) + symbol.st_name;
-    const size_t name_limit = static_cast<size_t>(
-        std::min<uint64_t>(strtab_size - symbol.st_name,
-                           data.size() - name_off));
-    const void *name_end = memchr(data.data() + name_off, '\0', name_limit);
-    if (!name_end)
-      continue;
-    const auto *name_begin =
-        reinterpret_cast<const char *>(data.data() + name_off);
-    const auto *name_finish = static_cast<const char *>(name_end);
-    if (name_begin == name_finish)
-      continue;
-
-    RelinkEntry entry;
-    entry.call_site = rela.r_offset;
-    entry.target_addr = 0;
-    entry.symbol_name.assign(name_begin, name_finish);
-    entries.push_back(entry);
-  }
-  return entries;
-}
-
-bool StaticRelinker::resolve_symbol(int pid, const std::string &name,
-                                    uint64_t *addr) {
-  std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
-  std::string line;
-  std::set<std::string> checked;
-  while (std::getline(maps, line)) {
-    if (line.find(".so") == std::string::npos)
-      continue;
-    if (line.find("r-xp") == std::string::npos &&
-        line.find("r--p") == std::string::npos)
-      continue;
-    size_t path_pos = line.find('/');
-    if (path_pos == std::string::npos)
-      continue;
-    size_t space_pos = line.find(' ', path_pos);
-    std::string path = line.substr(path_pos, space_pos - path_pos);
-    size_t slash = path.rfind('/');
-    std::string lib =
-        (slash != std::string::npos) ? path.substr(slash + 1) : path;
-    if (checked.count(lib))
-      continue;
-    checked.insert(lib);
-    uint64_t a = FunctionHooker::find_remote_symbol(pid, lib, name);
-    if (a != 0) {
-      *addr = a;
-      return true;
-    }
-  }
-  return false;
-}
-
 std::vector<uint8_t> StaticRelinker::embed_function(int pid, uint64_t addr,
                                                     size_t max_size) {
-  // max_size is a policy limit supplied by the relink/extract caller.  With no
+  // max_size is a policy limit supplied by the extraction caller. With no
   // explicit value retain a generous standalone API default, but read in small
   // chunks so ordinary functions do not allocate that complete window.
   static constexpr size_t kDefaultMaxFunctionSize = 16U * 1024U * 1024U;
@@ -4342,11 +4154,14 @@ quiesce_remote_call_thread(int tgid, int tid, uint64_t stub_addr,
 
   bool interrupt_pending = false;
   errno = 0;
-  if (ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) >= 0) {
+  const long interrupt_result =
+      ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr);
+  const int interrupt_errno = interrupt_result < 0 ? errno : 0;
+  if (interrupt_result >= 0) {
     interrupt_pending = true;
-  } else if (errno == ESRCH && !thread_is_member(tgid, tid)) {
+  } else if (interrupt_errno == ESRCH && !thread_is_member(tgid, tid)) {
     return RemoteQuiesceResult::Gone;
-  } else if (errno != EIO) {
+  } else if (interrupt_errno != EIO) {
     return RemoteQuiesceResult::Failed;
   }
 
@@ -5044,10 +4859,17 @@ static bool remote_mprotect_pages(int pid, uint64_t addr, size_t len,
 // takes a different path and does not. Data writes still use the faster
 // process_vm_writev -- only code goes through here.
 static bool poke_words(int pid, uint64_t addr, const void *data, size_t len) {
+  if (len == 0)
+    return true;
+  if (!data || len > std::numeric_limits<uint64_t>::max() - addr)
+    return false;
   const uint8_t *src = static_cast<const uint8_t *>(data);
   const size_t W = sizeof(long);
+  const uint64_t limit = addr + len;
+  if (limit > std::numeric_limits<uint64_t>::max() - (W - 1))
+    return false;
   uint64_t start = addr & ~(uint64_t)(W - 1);
-  uint64_t end = (addr + len + W - 1) & ~(uint64_t)(W - 1);
+  uint64_t end = (limit + W - 1) & ~(uint64_t)(W - 1);
 
   for (uint64_t p = start; p < end; p += W) {
     errno = 0;
@@ -5059,7 +4881,7 @@ static bool poke_words(int pid, uint64_t addr, const void *data, size_t len) {
     // Splice in whatever part of this word the caller's range covers.
     for (size_t i = 0; i < W; i++) {
       uint64_t byte_addr = p + i;
-      if (byte_addr >= addr && byte_addr < addr + len)
+      if (byte_addr >= addr && byte_addr < limit)
         buf[i] = src[byte_addr - addr];
     }
     memcpy(&word, buf, W);
@@ -5271,16 +5093,10 @@ bool MemoryInjector::install_inline_hook(int pid, uint64_t target,
   std::vector<uint8_t> tramp(tramp_size, 0);
   memcpy(tramp.data(), relocated.data(), patch_size);
 
-  if (true) {
-    uint64_t ret_addr = target + patch_size;
-    uint32_t jmp_back[] = {0x58000050, 0xD61F0200}; // ldr x16,#8 ; br x16
-    memcpy(tramp.data() + patch_size, jmp_back, 8);
-    memcpy(tramp.data() + patch_size + 8, &ret_addr, 8);
-  } else {
-    uint32_t ret_addr = (uint32_t)(target + patch_size);
-    uint32_t jmp_back[] = {0xE51FF004, ret_addr}; // ldr pc,[pc,#-4]
-    memcpy(tramp.data() + patch_size, jmp_back, 8);
-  }
+  uint64_t ret_addr = target + patch_size;
+  uint32_t jmp_back[] = {0x58000050, 0xD61F0200}; // ldr x16,#8 ; br x16
+  memcpy(tramp.data() + patch_size, jmp_back, 8);
+  memcpy(tramp.data() + patch_size + 8, &ret_addr, 8);
 
   if (write_generated_executable_checked(pid, info->trampoline_addr,
                                          tramp.data(), tramp_size) !=
@@ -5292,15 +5108,9 @@ bool MemoryInjector::install_inline_hook(int pid, uint64_t target,
   }
 
   std::vector<uint8_t> patch(patch_size);
-  if (true) {
-    uint32_t hook_jmp[] = {0x58000050, 0xD61F0200};
-    memcpy(patch.data(), hook_jmp, 8);
-    memcpy(patch.data() + 8, &hook, 8);
-  } else {
-    uint32_t hook32 = (uint32_t)hook;
-    uint32_t hook_jmp[] = {0xE51FF004, hook32};
-    memcpy(patch.data(), hook_jmp, 8);
-  }
+  uint32_t hook_jmp[] = {0x58000050, 0xD61F0200};
+  memcpy(patch.data(), hook_jmp, 8);
+  memcpy(patch.data() + 8, &hook, 8);
 
   ExecutableWriteResult patch_result = write_executable_checked(
       pid, target, patch.data(), patch_size);
@@ -5491,15 +5301,9 @@ uint64_t MemoryInjector::read_logging_hook(int pid, const LoggingHook &hook,
 
 
   uint64_t count = 0;
-  if (true) {
-    if (!ProcessTracer::read_memory(pid, hook.record_addr, &count, 8))
-      return 0;
-  } else {
-    uint32_t c32 = 0;
-    if (!ProcessTracer::read_memory(pid, hook.record_addr, &c32, 4))
-      return 0;
-    count = c32;
-  }
+  if (!ProcessTracer::read_memory(pid, hook.record_addr, &count,
+                                  sizeof(count)))
+    return 0;
   if (!out)
     return count;
 
@@ -5507,14 +5311,9 @@ uint64_t MemoryInjector::read_logging_hook(int pid, const LoggingHook &hook,
   uint64_t base = hook.record_addr + (8);
   for (size_t i = 0; i < n; i++) {
     CallRecord rec{};
-    if (true) {
-      ProcessTracer::read_memory(pid, base + i * 32, rec.args, 32);
-    } else {
-      uint32_t a[4] = {0, 0, 0, 0};
-      ProcessTracer::read_memory(pid, base + i * 16, a, 16);
-      for (int k = 0; k < 4; k++)
-        rec.args[k] = a[k];
-    }
+    if (!ProcessTracer::read_memory(pid, base + i * 32, rec.args,
+                                    sizeof(rec.args)))
+      break;
     out->push_back(rec);
   }
   return count;
@@ -5645,16 +5444,6 @@ static ExecutableWriteResult write_generated_executable_checked(
   return write_executable_checked_impl(pid, target, data, size, true);
 }
 
-bool MemoryInjector::write_executable(int pid, uint64_t target,
-                                      const void *data, size_t size) {
-  return write_executable_checked(pid, target, data, size) ==
-         ExecutableWriteResult::WrittenVerified;
-}
-
-
-
-
-
 uint64_t MemoryInjector::find_linker_function(int pid,
                                               const std::string &func_name) {
   uint64_t addr =
@@ -5667,124 +5456,16 @@ uint64_t MemoryInjector::find_linker_function(int pid,
 
 std::string MemoryInjector::read_string_remote(int pid, uint64_t addr,
                                                size_t max_len) {
+  constexpr size_t kMaxRemoteStringBytes = 1U << 20;
+  if (max_len == 0 || max_len > kMaxRemoteStringBytes ||
+      max_len == std::numeric_limits<size_t>::max())
+    return "";
   std::vector<char> buf(max_len + 1, 0);
   if (!ProcessTracer::read_memory(pid, addr, buf.data(), max_len))
     return "";
 
   buf[max_len] = 0;
   return std::string(buf.data());
-}
-
-
-std::vector<uint8_t>
-StaticRelinkerEx::relink_full(const std::vector<uint8_t> &elf_data, int pid,
-                              uint64_t base_addr, const RelinkConfig &config) {
-  std::vector<uint8_t> result = elf_data;
-
-  EmbedContext ctx;
-  ctx.pid = pid;
-  ctx.base_addr = base_addr;
-  ctx.total_embedded_size = 0;
-  ctx.current_depth = 0;
-
-  auto lib_ranges = ProcessTracer::get_library_ranges(pid);
-  Elf64ProgramHeaders self_program_headers;
-  if (parse_elf64_program_headers(elf_data, &self_program_headers)) {
-    for (const auto &ph : self_program_headers.entries) {
-      if (ph.p_type != PT_LOAD || ph.p_memsz == 0)
-        continue;
-      uint64_t load_start = 0, load_end = 0;
-      if (!checked_u64_add(base_addr, ph.p_vaddr, &load_start) ||
-          !checked_u64_add(load_start, ph.p_memsz, &load_end))
-        continue;
-      for (const auto &range : lib_ranges) {
-        if (range.start < load_end && range.end > load_start) {
-          ctx.self_library = range.name;
-          break;
-        }
-      }
-      if (!ctx.self_library.empty())
-        break;
-    }
-  }
-
-  auto calls = StaticRelinker::find_external_calls(elf_data, base_addr);
-
-  const size_t max_size =
-      config.max_total_size > 0 ? config.max_total_size : (512U * 1024U * 1024U);
-
-  size_t align = 16;
-  uint64_t embed_offset = result.size();
-  while (embed_offset % align)
-    embed_offset++;
-  result.resize(embed_offset);
-
-  std::map<uint64_t, uint64_t> embedded_addrs;
-  std::function<void(uint64_t, int)> embed_recursive;
-
-  embed_recursive = [&](uint64_t addr, int depth) {
-    if (depth >= config.max_depth)
-      return;
-    if (result.size() >= max_size)
-      return;
-    if (embedded_addrs.count(addr))
-      return;
-
-    std::string lib = ProcessTracer::find_library_for_address(lib_ranges, addr);
-    if (lib == ctx.self_library)
-      return;
-    std::string lib_base = lib;
-    size_t lib_slash = lib_base.rfind('/');
-    if (lib_slash != std::string::npos)
-      lib_base = lib_base.substr(lib_slash + 1);
-
-    if (!config.exclude_libs.empty() &&
-        (config.exclude_libs.count(lib) || config.exclude_libs.count(lib_base)))
-      return;
-    if (!config.include_only_libs.empty() &&
-        !config.include_only_libs.count(lib) &&
-        !config.include_only_libs.count(lib_base))
-      return;
-
-    auto code = StaticRelinker::embed_function(pid, addr,
-                                               max_size - result.size());
-    if (code.empty() || code.size() < 8)
-      return;
-
-    uint64_t local_offset = result.size();
-    embedded_addrs[addr] = local_offset;
-    result.insert(result.end(), code.begin(), code.end());
-    while (result.size() % align)
-      result.push_back(0);
-
-    auto sub_calls =
-        InstructionDecoder::scan_calls(code.data(), code.size(), addr);
-    for (const auto &c : sub_calls) {
-      if (c.target_address == 0 || c.target_address == addr)
-        continue;
-      uint64_t target = c.target_address;
-      if (config.inline_plt_calls) {
-        uint64_t resolved =
-            InstructionDecoder::resolve_plt(pid, c.target_address);
-        if (resolved != 0)
-          target = resolved;
-      }
-      embed_recursive(target, depth + 1);
-    }
-  };
-
-  for (const auto &entry : calls) {
-    uint64_t target = 0;
-    if (StaticRelinker::resolve_symbol(pid, entry.symbol_name, &target)) {
-      embed_recursive(target, 0);
-    }
-  }
-
-  if (config.fix_relocations) {
-    patch_relocations(result, embedded_addrs, base_addr);
-  }
-
-  return result;
 }
 
 struct EmbeddedFunctionInfo {
@@ -5840,9 +5521,9 @@ static void patch_embedded_calls(std::vector<uint8_t> &blob, int pid,
 }
 
 std::vector<uint8_t>
-StaticRelinkerEx::extract_function_with_deps(int pid, uint64_t addr,
-                                             int max_depth,
-                                             size_t max_total_size) {
+DependencyExtractor::extract_function_with_deps(int pid, uint64_t addr,
+                                                int max_depth,
+                                                size_t max_total_size) {
   if (max_depth < 0)
     max_depth = 0;
 
@@ -6403,33 +6084,6 @@ static void append_rsa_candidates(const std::vector<uint8_t> &data,
     keys->push_back(std::move(info));
     off = end - 1;
   }
-}
-
-bool StaticRelinkerEx::patch_relocations(
-    std::vector<uint8_t> &data, const std::map<uint64_t, uint64_t> &addr_map,
-    uint64_t base_addr) {
-
-  for (size_t i = 0; i + 4 <= data.size(); i += 4) {
-    uint32_t inst = read_le32(data.data() + i);
-    uint64_t call_vaddr = 0;
-    if (!file_offset_to_vaddr(data, i, call_vaddr))
-      continue;
-
-    {
-      if ((inst & 0xFC000000) == 0x94000000) {
-        int32_t offset = inst & 0x03FFFFFF;
-        if (offset & 0x02000000)
-          offset |= 0xFC000000;
-        uint64_t target_remote =
-            base_addr + call_vaddr + static_cast<int64_t>(offset) * 4;
-        auto it = addr_map.find(target_remote);
-        if (it != addr_map.end())
-          patch_call_site(data, i, it->second);
-      }
-    }
-  }
-
-  return true;
 }
 
 std::vector<CryptoKeyInfo>

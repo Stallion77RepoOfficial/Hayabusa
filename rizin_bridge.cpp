@@ -10,12 +10,15 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <limits>
 #include <set>
+#include <system_error>
 #include <vector>
 #include <cstdlib>
 #include <dirent.h>
@@ -35,7 +38,7 @@
 #endif
 
 extern "C" {
-// With CORELIB defined, rz-ghidra exports its plugins as ordinary symbols
+// With CORELIB defined, rz-ghidra exports its plugin as an ordinary symbol
 // instead of wrapping them in the RzLibStruct the dynamic loader looks for.
 extern RzCorePlugin rz_core_plugin_ghidra;
 extern RzAnnotatedCode *rz_ghidra_decompile_annotated_code(RzCore *core,
@@ -44,6 +47,30 @@ extern RzAnnotatedCode *rz_ghidra_decompile_annotated_code(RzCore *core,
 
 namespace rzb {
 namespace {
+
+bool write_all_fd(int fd, const void *data, size_t size) {
+  if (size != 0 && !data)
+    return false;
+  const uint8_t *bytes = static_cast<const uint8_t *>(data);
+  size_t done = 0;
+  while (done < size) {
+    const ssize_t amount = write(fd, bytes + done, size - done);
+    if (amount < 0 && errno == EINTR)
+      continue;
+    if (amount <= 0)
+      return false;
+    done += static_cast<size_t>(amount);
+  }
+  return true;
+}
+
+bool fsync_retry(int fd) {
+  int result;
+  do {
+    result = fsync(fd);
+  } while (result < 0 && errno == EINTR);
+  return result == 0;
+}
 
 // rz_core_new() and the open transaction touch process-wide registries. The
 // caller also serialises the complete report transaction because Rizin's
@@ -133,7 +160,12 @@ void unpack_sleigh() {
   {
     char have[32] = {};
     int fd = open(complete_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    ssize_t rd = fd >= 0 ? read(fd, have, sizeof(have)) : -1;
+    ssize_t rd = -1;
+    if (fd >= 0) {
+      do {
+        rd = read(fd, have, sizeof(have));
+      } while (rd < 0 && errno == EINTR);
+    }
     if (fd >= 0)
       close(fd);
     if (rd == static_cast<ssize_t>(want.size()) &&
@@ -167,20 +199,16 @@ void unpack_sleigh() {
       unlock();
       return;
     }
-    size_t done = 0;
-    while (done < files[i].size) {
-      ssize_t wr = write(fd, files[i].bytes + done, files[i].size - done);
-      if (wr <= 0) {
-        fprintf(stderr, "[sleigh] write %s: %s\n", temp.c_str(),
-                strerror(errno));
-        close(fd);
-        unlink(temp.c_str());
-        unlock();
-        return;
-      }
-      done += static_cast<size_t>(wr);
+    if (!write_all_fd(fd, files[i].bytes, files[i].size)) {
+      const int write_errno = errno;
+      fprintf(stderr, "[sleigh] write %s: %s\n", temp.c_str(),
+              strerror(write_errno));
+      close(fd);
+      unlink(temp.c_str());
+      unlock();
+      return;
     }
-    bool publish_ok = fsync(fd) == 0;
+    bool publish_ok = fsync_retry(fd);
     if (close(fd) != 0)
       publish_ok = false;
     if (publish_ok && rename(temp.c_str(), path.c_str()) != 0)
@@ -200,15 +228,12 @@ void unpack_sleigh() {
   int sfd = open(complete_temp.c_str(),
                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
   bool complete_ok = sfd >= 0;
-  if (complete_ok &&
-      write(sfd, want.data(), want.size()) !=
-          static_cast<ssize_t>(want.size()))
+  if (complete_ok && !write_all_fd(sfd, want.data(), want.size()))
     complete_ok = false;
-  if (complete_ok && fsync(sfd) != 0)
+  if (complete_ok && !fsync_retry(sfd))
     complete_ok = false;
   if (sfd >= 0 && close(sfd) != 0)
     complete_ok = false;
-  sfd = -1;
   if (complete_ok &&
       rename(complete_temp.c_str(), complete_path.c_str()) != 0)
     complete_ok = false;
@@ -454,7 +479,8 @@ std::unique_ptr<Image> Image::open(const std::vector<uint8_t> &data,
   if (data.size() < 64)
     return nullptr;
 
-  std::unique_ptr<Image> img(new Image);
+  std::unique_ptr<Image> img;
+  img.reset(new Image);
   img->p->base = base;
   // The public contract says the setting applies to images opened afterwards.
   // Snapshot it here so a later global change cannot turn a parse-only image
@@ -486,9 +512,9 @@ std::unique_ptr<Image> Image::open(const std::vector<uint8_t> &data,
 
   register_plugins(img->p->core);
 
-  // Point the Ghidra plugins at the sleigh data before anything can ask them to
-  // disassemble. asm_ghidra and analysis_ghidra look this up lazily, and with
-  // no language definition to load they fault rather than decline.
+  // Point the Ghidra decompiler at the Sleigh data before its first request.
+  // The core plugin resolves the target language lazily and cannot decompile
+  // without the embedded language definition.
   const std::string &home = sleigh_home();
   if (!home.empty())
     rz_config_set(img->p->core->config, "ghidra.sleighhome", home.c_str());
@@ -536,17 +562,17 @@ std::unique_ptr<Image> Image::open(const std::vector<uint8_t> &data,
         syscall(SYS_memfd_create, "hayabusa-rizin", MFD_CLOEXEC));
     if (fd < 0)
       return false;
-    size_t done = 0;
-    while (done < bytes.size()) {
-      ssize_t wr = write(fd, bytes.data() + done, bytes.size() - done);
-      if (wr <= 0) {
-        close(fd);
-        return false;
-      }
-      done += static_cast<size_t>(wr);
+    if (!write_all_fd(fd, bytes.data(), bytes.size())) {
+      const int write_errno = errno;
+      close(fd);
+      errno = write_errno;
+      return false;
     }
     *out_fd = fd;
-    *out_path = "/proc/self/fd/" + std::to_string(fd);
+    // Rizin's fd:// plugin consumes the already-open descriptor directly.
+    // Routing a memfd back through the ordinary pathname plugin as
+    // /proc/self/fd/N fails on Android even though the same ELF is valid.
+    *out_path = "fd://" + std::to_string(fd);
     return true;
   };
 
@@ -1506,6 +1532,25 @@ Image::materialised_constants(uint64_t func_addr, size_t max_insns) {
 
   uint64_t reg[32] = {};
   bool live[32] = {};
+  auto parse_mnemonic_number = [](const char *text, uint64_t *value) {
+    if (!text || !value)
+      return false;
+    while (isspace(static_cast<unsigned char>(*text)))
+      ++text;
+    int base = 10;
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+      base = 16;
+      text += 2;
+    }
+    const char *end = text;
+    while ((base == 16 && isxdigit(static_cast<unsigned char>(*end))) ||
+           (base == 10 && isdigit(static_cast<unsigned char>(*end))))
+      ++end;
+    if (end == text)
+      return false;
+    const auto parsed = std::from_chars(text, end, *value, base);
+    return parsed.ec == std::errc() && parsed.ptr == end;
+  };
 
   uint64_t pc = func_addr;
   size_t off = 0;
@@ -1527,19 +1572,22 @@ Image::materialised_constants(uint64_t func_addr, size_t max_insns) {
               !strncmp(m, "mov ", 4))) {
       const char *r = strpbrk(m, "xw");
       if (r && r[1] >= '0' && r[1] <= '9') {
-        unsigned idx = (unsigned)atoi(r + 1);
+        uint64_t parsed_idx = 0;
         const char *imm = strchr(m, '#');
         if (!imm)
           imm = strstr(m, ", 0x");
-        if (imm && idx < 32) {
-          unsigned long long v = strtoull(imm + (*imm == '#' ? 1 : 2), nullptr, 0);
-          unsigned shift = 0;
-          if (const char *ls = strstr(m, "lsl"))
-            shift = (unsigned)strtoul(ls + 3, nullptr, 0);
+        uint64_t value = 0;
+        uint64_t shift = 0;
+        const char *ls = strstr(m, "lsl");
+        if (imm && parse_mnemonic_number(r + 1, &parsed_idx) &&
+            parsed_idx < 32 &&
+            parse_mnemonic_number(imm + (*imm == '#' ? 1 : 2), &value) &&
+            (!ls || parse_mnemonic_number(ls + 3, &shift)) && shift < 64) {
+          const unsigned idx = static_cast<unsigned>(parsed_idx);
           if (!strncmp(m, "movk", 4) && live[idx])
-            reg[idx] |= (uint64_t)v << shift;
+            reg[idx] |= value << shift;
           else
-            reg[idx] = (uint64_t)v << shift;
+            reg[idx] = value << shift;
           live[idx] = true;
         }
       }
@@ -1670,7 +1718,8 @@ std::vector<Image::FieldAccess> Image::field_accesses(uint64_t func_addr) {
         parse_x0_disp(op.mnemonic, &disp)) {
       FieldAccess &fa = by_offset[disp];
       fa.offset = disp;
-      fa.width = access_width(op.mnemonic);
+      fa.width = std::max(fa.width, access_width(op.mnemonic));
+      fa.read = fa.read || t == InsnType::Load;
       fa.written = fa.written || t == InsnType::Store;
       fa.hits++;
     }

@@ -3,4 +3,5 @@ third_party/
 __pycache__/
 *.py[cod]
 hayabusa
+hayabusa_tests
 sleigh_data.cpp

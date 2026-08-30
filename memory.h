@@ -76,8 +76,13 @@ inline bool parse_elf64_program_headers(const uint8_t *data, size_t size,
     const auto &ph = parsed.entries[i];
     if (ph.p_type != PT_LOAD)
       continue;
-    if (ph.p_filesz > ph.p_memsz || ph.p_offset > size ||
-        ph.p_filesz > size - static_cast<size_t>(ph.p_offset) ||
+    // A pure-BSS PT_LOAD has no file range to validate. Android's linker may
+    // place its conventional p_offset beyond a truncated memory snapshot even
+    // though p_filesz is zero and no byte is read from that offset.
+    if (ph.p_filesz > ph.p_memsz ||
+        (ph.p_filesz != 0 &&
+         (ph.p_offset > size ||
+          ph.p_filesz > size - static_cast<size_t>(ph.p_offset))) ||
         ph.p_vaddr > std::numeric_limits<uint64_t>::max() - ph.p_memsz) {
       return false;
     }
@@ -96,9 +101,12 @@ parse_elf64_program_headers(const std::vector<uint8_t> &data,
 // One line of /proc/<pid>/maps. Single source of truth for map parsing --
 // Memory::read_maps() is the only parser in the codebase.
 struct MapEntry {
-  uint64_t start;
-  uint64_t end;
-  uint64_t offset;
+  uint64_t start = 0;
+  uint64_t end = 0;
+  uint64_t offset = 0;
+  uint32_t device_major = 0;
+  uint32_t device_minor = 0;
+  uint64_t inode = 0;
   std::string perms;
   std::string name;
 
@@ -199,7 +207,6 @@ struct AESKeyInfo {
 class Memory {
 public:
   static std::vector<MapEntry> read_maps(int pid);
-  static std::vector<uint8_t> dump(int pid, uint64_t addr, size_t size);
 };
 
 class Utils {
@@ -337,6 +344,9 @@ public:
 
   static std::vector<PatternMatch>
   pattern_scan(const std::vector<uint8_t> &data, const std::string &pattern);
+  // Returns the exact byte width of a valid pattern, or zero when invalid.
+  // Streaming callers use this to retain enough overlap between chunks.
+  static size_t pattern_width(const std::string &pattern);
 
   static std::string generate_signature(const std::vector<uint8_t> &data,
                                         uint64_t offset, size_t length = 32);
@@ -383,7 +393,9 @@ class SoFixer {
 public:
   static std::vector<uint8_t> repair(const std::vector<uint8_t> &data,
                                      uint64_t base_addr,
-                                     const std::vector<uint8_t> *disk = nullptr);
+                                     const std::vector<uint8_t> *disk = nullptr,
+                                     bool *repaired = nullptr,
+                                     std::string *failure_reason = nullptr);
 };
 
 class RuntimeAnalyzer {

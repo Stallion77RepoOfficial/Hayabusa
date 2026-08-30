@@ -236,6 +236,7 @@ public:
   struct FieldAccess {
     uint64_t offset = 0;
     uint32_t width = 0;
+    bool read = false;
     bool written = false;
     uint32_t hits = 0;
   };

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Turn the AArch64 sleigh data files into a C++ translation unit.
+"""Turn selected Sleigh language files into a C++ translation unit.
 
 The Ghidra decompiler loads its language definition from disk at runtime. That
 would mean shipping a directory next to the binary, which defeats the point of
-static linking, so the files are compiled in instead and unpacked to a scratch
-directory on first use. AArch64 alone is about 570 KB, which is cheap enough to
-carry.
+static linking, so the AArch64, Dalvik, and JVM files are compiled in instead
+and unpacked to a scratch directory on first use.
 
 Usage: embed_sleigh.py <sleigh-dir> <output.cpp>
 """

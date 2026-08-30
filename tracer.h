@@ -116,21 +116,6 @@ struct CallInfo {
   std::string symbol_name;
 };
 
-struct RelinkEntry {
-  uint64_t call_site;
-  uint64_t target_addr;
-  std::string symbol_name;
-};
-
-struct EmbedContext {
-  int pid;
-  uint64_t base_addr;
-  std::string self_library;
-  std::set<uint64_t> embedded_addresses;
-  size_t total_embedded_size;
-  int current_depth;
-};
-
 namespace InstructionDecoder {
 
 DecodedInstruction decode(uint32_t inst, uint64_t address);
@@ -254,9 +239,6 @@ class StaticRelinker {
 public:
   static std::vector<uint8_t> embed_function(int pid, uint64_t addr,
                                              size_t max_size = 0);
-  static bool resolve_symbol(int pid, const std::string &name, uint64_t *addr);
-  static std::vector<RelinkEntry>
-  find_external_calls(const std::vector<uint8_t> &data, uint64_t base);
 };
 
 struct RemoteCallResult {
@@ -335,35 +317,16 @@ public:
   static ExecutableWriteResult
   write_executable_checked(int pid, uint64_t target, const void *data,
                            size_t size);
-  static bool write_executable(int pid, uint64_t target, const void *data,
-                               size_t size);
 
   static uint64_t find_linker_function(int pid, const std::string &func_name);
   static std::string read_string_remote(int pid, uint64_t addr, size_t max_len);
 };
 
-struct RelinkConfig {
-  int max_depth;
-  size_t max_total_size;
-  bool fix_relocations;
-  bool inline_plt_calls;
-  std::set<std::string> exclude_libs;
-  std::set<std::string> include_only_libs;
-};
-
-class StaticRelinkerEx {
+class DependencyExtractor {
 public:
-  static std::vector<uint8_t> relink_full(const std::vector<uint8_t> &elf_data,
-                                          int pid, uint64_t base_addr,
-                                          const RelinkConfig &config);
-
   static std::vector<uint8_t>
   extract_function_with_deps(int pid, uint64_t addr, int max_depth = 8,
                              size_t max_total_size = 512U * 1024U * 1024U);
-
-  static bool patch_relocations(std::vector<uint8_t> &data,
-                                const std::map<uint64_t, uint64_t> &addr_map,
-                                uint64_t base_addr);
 };
 
 struct CryptoKeyInfo {
